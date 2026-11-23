@@ -1,0 +1,14 @@
+{
+  "admin/services/ps-accel": {
+    "title": "PS Accel 串流增强",
+    "order": 65,
+    "action": {
+      "type": "view",
+      "path": "ps-accel/settings"
+    },
+    "depends": {
+      "acl": ["luci-app-ps-accel"],
+      "uci": {"ps_accel": true}
+    }
+  }
+}

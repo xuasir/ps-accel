@@ -1,0 +1,397 @@
+import importlib.util
+import json
+from pathlib import Path
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+
+SOURCE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SOURCE))
+import portal_openwrt as port
+
+
+class PortTests(unittest.TestCase):
+    def setUp(self):
+        original_stat = Path.stat
+        def fake_namespace_stat(path, *args, **kwargs):
+            if str(path) == '/proc/self/ns/net':
+                return MagicMock(st_dev=1, st_ino=2)
+            return original_stat(path, *args, **kwargs)
+        stat_patch = patch.object(port.Path, 'stat', fake_namespace_stat)
+        stat_patch.start()
+        self.addCleanup(stat_patch.stop)
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        for name, value in [('RUNTIME', self.root / 'run'), ('PERSIST', self.root / 'etc'),
+                            ('SYSNET', self.root / 'sys'), ('HANDLE', self.root / 'netns'),
+                            ('ENGINE_LOCK', self.root / 'engine.lock')]:
+            p = patch.object(port, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        port.RUNTIME.mkdir()
+        port.PERSIST.mkdir()
+        bridge = port.SYSNET / 'br-lan'
+        (bridge / 'bridge').mkdir(parents=True)
+        (bridge / 'mtu').write_text('1500')
+        self.settings = port.Settings('br-lan', '192.168.1.250/24', '192.168.1.100', '192.168.1.101')
+        self.addCleanup(self.temp.cleanup)
+
+    def fake_command(self, *args, check=True):
+        if args[:3] == ('ip', '-j', '-4'):
+            return subprocess.CompletedProcess(args, 0, '[]', '')
+        if args[:4] == ('ip', 'netns', 'add', port.NS):
+            port.HANDLE.touch()
+        if args[:4] == ('ip', 'link', 'add', port.HOST):
+            link = port.SYSNET / port.HOST
+            link.mkdir()
+            (link / 'ifindex').write_text('123')
+            (link / 'ifalias').write_text(port.ALIAS)
+        return subprocess.CompletedProcess(args, 0, '', '')
+
+    def prepare_owned(self):
+        with patch.object(port, 'command', side_effect=self.fake_command), patch.object(port, 'ns_command'):
+            port.setup(self.settings)
+        self.assertTrue(port.owned())
+
+    def test_valid_and_invalid_network_configuration(self):
+        self.assertEqual(self.settings.validate(), self.settings)
+        for change in ({'bridge': 'br-lan;reboot'}, {'address': '192.168.1.250'},
+                       {'portal_ip': '192.168.2.2'}, {'portal_ip': '192.168.1.250'},
+                       {'ps5_ip': '192.168.1.0'}, {'address': '192.168.1.255/24'},
+                       {'profile': '999'}, {'ps5_ip': '127.0.0.1'},
+                       {'address': '0.1.1.5/8', 'ps5_ip': '0.1.1.2', 'portal_ip': '0.1.1.3'}):
+            values = port.asdict(self.settings)
+            values.update(change)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                port.Settings(**values).validate()
+
+    def test_exclusive_lock_blocks_concurrent_configuration(self):
+        with port.exclusive():
+            with self.assertRaisesRegex(RuntimeError, 'active'):
+                with port.exclusive():
+                    self.fail('Concurrent command entered')
+
+    def test_setup_isolates_forwarding_and_probes_before_ip_assignment(self):
+        events = []
+        def cmd(*args, **kw):
+            events.append(args)
+            return self.fake_command(*args, **kw)
+        def ns(*args):
+            events.append(('namespace',) + args)
+        with patch.object(port, 'command', side_effect=cmd), patch.object(port, 'ns_command', side_effect=ns):
+            port.setup(self.settings)
+        self.assertTrue(port.owned())
+        init = next(i for i, a in enumerate(events) if '_init' in a)
+        probe = next(i for i, a in enumerate(events) if '_probe' in a)
+        assign = next(i for i, a in enumerate(events) if a[:5] == ('ip', '-n', port.NS, 'addr', 'add'))
+        self.assertLess(init, probe)
+        self.assertLess(probe, assign)
+        self.assertFalse(any('sysctl' in a or 'iptables' in a or 'nft' in a for a in events))
+        self.assertFalse(any('default' in a for a in events))
+
+    def test_setup_failure_rolls_back_without_assigning_address(self):
+        with patch.object(port, 'command', side_effect=self.fake_command) as cmd:
+            with patch.object(port, 'ns_command', side_effect=[None, RuntimeError('IP conflict')]):
+                with self.assertRaisesRegex(RuntimeError, 'IP conflict'):
+                    port.setup(self.settings)
+        calls = [c.args for c in cmd.call_args_list]
+        self.assertIn(('ip', 'link', 'delete', port.HOST), calls)
+        self.assertIn(('ip', 'netns', 'delete', port.NS), calls)
+        self.assertFalse(any('addr' in c and 'add' in c for c in calls))
+        self.assertFalse((port.RUNTIME / 'namespace.json').exists())
+
+    def test_router_address_conflict_stops_before_any_network_mutation(self):
+        data = '[{"addr_info":[{"local":"192.168.1.250"}]}]'
+        with patch.object(port, 'command', return_value=MagicMock(stdout=data)) as cmd:
+            with self.assertRaisesRegex(RuntimeError, 'already assigned'):
+                port.setup(self.settings)
+        self.assertEqual(cmd.call_count, 1)
+
+    def test_foreign_namespace_never_removed(self):
+        port.HANDLE.touch()
+        with patch.object(port, 'command') as cmd:
+            with self.assertRaisesRegex(RuntimeError, 'ownership'):
+                port.teardown()
+            cmd.assert_not_called()
+
+    def test_guardian_keeps_ethernet_path_alive(self):
+        self.prepare_owned()
+        with patch.object(port, 'pids', return_value=[123]), patch.object(port, 'command') as cmd:
+            with self.assertRaisesRegex(RuntimeError, 'processes remain'):
+                port.teardown()
+            cmd.assert_not_called()
+
+    def test_repairs_before_deleting_namespace(self):
+        self.prepare_owned()
+        (port.RUNTIME / 'restore-state.json').write_text('{}')
+        events = []
+        with patch.object(port, 'pids', return_value=[]), patch.object(port.time, 'sleep'):
+            with patch.object(port, 'ns_command', side_effect=lambda *a: events.append('repair')):
+                with patch.object(port, 'teardown', side_effect=lambda: events.append('delete')):
+                    port.repair_existing()
+        self.assertEqual(events, ['repair', 'delete'])
+
+    def test_failed_repair_preserves_namespace_and_lock(self):
+        self.prepare_owned()
+        (port.RUNTIME / 'restore-state.json').write_text('{}')
+        port.ENGINE_LOCK.write_text('123')
+        with patch.object(port, 'pids', return_value=[]), patch.object(port.time, 'sleep'):
+            with patch.object(port, 'ns_command', side_effect=RuntimeError('adapter down')):
+                with self.assertRaisesRegex(RuntimeError, 'adapter down'):
+                    port.repair_existing()
+        self.assertTrue(port.HANDLE.exists())
+        self.assertTrue(port.ENGINE_LOCK.exists())
+
+    def test_namespace_delete_failure_can_resume_after_link_was_deleted(self):
+        self.prepare_owned()
+        (port.RUNTIME / 'restore-state.json').write_text('{}')
+        attempts = []
+        def command(*args, **kwargs):
+            attempts.append(args)
+            if args == ('ip', 'link', 'delete', port.HOST):
+                shutil.rmtree(port.SYSNET / port.HOST)
+            if args == ('ip', 'netns', 'delete', port.NS):
+                if attempts.count(args) == 1:
+                    raise subprocess.CalledProcessError(1, args, stderr='namespace busy')
+                port.HANDLE.unlink()
+            return subprocess.CompletedProcess(args, 0, '', '')
+        with patch.object(port, 'pids', return_value=[]), patch.object(port.time, 'sleep'):
+            with patch.object(port, 'ns_command') as repair, patch.object(port, 'command', side_effect=command):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    port.repair_existing()
+                self.assertTrue(port.HANDLE.exists())
+                self.assertFalse((port.SYSNET / port.HOST).exists())
+                self.assertTrue((port.RUNTIME / 'namespace.json').exists())
+                port.repair_existing()
+        self.assertEqual(repair.call_count, 1)
+        self.assertFalse(port.HANDLE.exists())
+        self.assertFalse((port.RUNTIME / 'namespace.json').exists())
+        self.assertEqual(attempts.count(('ip', 'link', 'delete', port.HOST)), 1)
+
+    def test_owned_link_only_can_be_cleaned_after_namespace_removal(self):
+        self.prepare_owned()
+        port.HANDLE.unlink()
+        with patch.object(port, 'command') as command, patch.object(port, 'pids') as pids:
+            port.repair_existing()
+        command.assert_called_once_with('ip', 'link', 'delete', port.HOST)
+        pids.assert_not_called()
+        self.assertFalse((port.RUNTIME / 'namespace.json').exists())
+
+    def test_partial_cleanup_refuses_a_replaced_namespace(self):
+        self.prepare_owned()
+        shutil.rmtree(port.SYSNET / port.HOST)
+        replacement = self.root / 'replacement-namespace'
+        replacement.touch()
+        replacement.replace(port.HANDLE)
+        with patch.object(port, 'command') as command:
+            with self.assertRaisesRegex(RuntimeError, 'ownership'):
+                port.repair_existing()
+        command.assert_not_called()
+        self.assertTrue(port.HANDLE.exists())
+
+    def test_link_only_cleanup_refuses_a_replaced_interface(self):
+        self.prepare_owned()
+        port.HANDLE.unlink()
+        (port.SYSNET / port.HOST / 'ifindex').write_text('999')
+        with patch.object(port, 'command') as command:
+            with self.assertRaisesRegex(RuntimeError, 'ownership'):
+                port.repair_existing()
+        command.assert_not_called()
+
+    def test_marker_delete_failure_is_retryable_after_resources_are_gone(self):
+        self.prepare_owned()
+        marker = port.RUNTIME / 'namespace.json'
+        original_unlink = Path.unlink
+        def unlink(path, *args, **kwargs):
+            if path == marker:
+                raise OSError('marker busy')
+            return original_unlink(path, *args, **kwargs)
+        def command(*args, **kwargs):
+            if args == ('ip', 'link', 'delete', port.HOST):
+                shutil.rmtree(port.SYSNET / port.HOST)
+            if args == ('ip', 'netns', 'delete', port.NS):
+                port.HANDLE.unlink()
+            return subprocess.CompletedProcess(args, 0, '', '')
+        with patch.object(port, 'pids', return_value=[]), patch.object(port, 'command', side_effect=command):
+            with patch.object(Path, 'unlink', unlink):
+                with self.assertRaisesRegex(OSError, 'marker busy'):
+                    port.repair_existing()
+        self.assertTrue(marker.exists())
+        with patch.object(port, 'command') as command:
+            port.repair_existing()
+        command.assert_not_called()
+        self.assertFalse(marker.exists())
+
+    def test_setup_cleanup_failure_keeps_ownership_for_a_retry(self):
+        def command(*args, **kwargs):
+            if args == ('ip', 'link', 'delete', port.HOST):
+                return subprocess.CompletedProcess(args, 1, '', 'link busy')
+            if args == ('ip', 'netns', 'delete', port.NS):
+                port.HANDLE.unlink()
+            return self.fake_command(*args, **kwargs)
+        with patch.object(port, 'command', side_effect=command):
+            with patch.object(port, 'ns_command', side_effect=RuntimeError('probe failed')):
+                with self.assertRaisesRegex(RuntimeError, 'probe failed'):
+                    port.setup(self.settings)
+        self.assertTrue((port.RUNTIME / 'namespace.json').exists())
+        with patch.object(port, 'command') as command:
+            port.repair_existing()
+        command.assert_called_once_with('ip', 'link', 'delete', port.HOST)
+
+    def test_setup_link_creation_error_keeps_the_created_namespace_identity(self):
+        def command(*args, **kwargs):
+            if args[:4] == ('ip', 'link', 'add', port.HOST):
+                raise RuntimeError('veth creation failed')
+            if args == ('ip', 'netns', 'delete', port.NS):
+                return subprocess.CompletedProcess(args, 1, '', 'namespace busy')
+            return self.fake_command(*args, **kwargs)
+        with patch.object(port, 'command', side_effect=command):
+            with self.assertRaisesRegex(RuntimeError, 'veth creation failed'):
+                port.setup(self.settings)
+        self.assertTrue(port.resource_ownership()['namespace_owned'])
+        with patch.object(port, 'pids', return_value=[]), patch.object(port, 'command') as command:
+            port.repair_existing()
+        command.assert_called_once_with('ip', 'netns', 'delete', port.NS)
+
+    def test_partial_cleanup_retains_resources_until_recovery_is_confirmed(self):
+        self.prepare_owned()
+        shutil.rmtree(port.SYSNET / port.HOST)
+        (port.RUNTIME / 'recovery-required').touch()
+        with patch.object(port, 'pids', return_value=[]), patch.object(port, 'command') as command:
+            with self.assertRaisesRegex(RuntimeError, '恢复所需'):
+                port.repair_existing()
+        command.assert_not_called()
+        self.assertTrue(port.HANDLE.exists())
+
+    def test_foreign_engine_lock_never_removed(self):
+        port.ENGINE_LOCK.write_text('999')
+        (port.RUNTIME / 'engine-pid').write_text('123')
+        with self.assertRaisesRegex(RuntimeError, 'different relay'):
+            port.clear_engine_lock()
+        self.assertEqual(port.ENGINE_LOCK.read_text(), '999')
+        port.ENGINE_LOCK.write_text('123')
+        port.clear_engine_lock()
+        self.assertFalse(port.ENGINE_LOCK.exists())
+
+    def test_internal_operations_refuse_host_namespace(self):
+        stat = MagicMock(st_dev=1, st_ino=2)
+        port.atomic(port.RUNTIME / 'namespace.json', {'handle': [1, 2], 'host_handle': [1, 2]})
+        with patch.object(port.Path, 'stat', return_value=stat):
+            with self.assertRaisesRegex(RuntimeError, 'outside'):
+                port.internal('_init', MagicMock())
+
+    def test_active_run_refused_before_baseline_or_failed_recovery(self):
+        with patch.object(port, 'setup') as setup:
+            with self.assertRaises(FileNotFoundError):
+                port.supervise(self.settings, 'run')
+            (port.RUNTIME / 'recovery-required').touch()
+            with self.assertRaisesRegex(RuntimeError, 'recovery'):
+                port.supervise(self.settings, 'baseline')
+            setup.assert_not_called()
+
+    def test_runtime_receipt_survives_reboot_and_binds_port_settings(self):
+        import portal_auto as engine
+        cfg = {'network': self.settings.engine(), 'profile': '65',
+               'ps5_mac': '02:00:00:00:00:02', 'portal_mac': '02:00:00:00:00:03'}
+        port.atomic(port.PERSIST / 'auto-config.json', cfg)
+        receipt = {'fingerprint': engine.fingerprint(cfg), 'forwarded_out': 3, 'restored': True}
+        port.atomic(port.PERSIST / 'baseline.json',
+                    {'port_fingerprint': port.port_fingerprint(self.settings), 'upstream': receipt})
+        port.verify_baseline(self.settings)
+        self.assertTrue(engine.baseline_valid(cfg, port.RUNTIME))
+        other = port.Settings('br-other', self.settings.address, self.settings.ps5_ip, self.settings.portal_ip)
+        with self.assertRaisesRegex(RuntimeError, 'different code/configuration'):
+            port.verify_baseline(other)
+
+    def test_term_is_forwarded_to_exact_child_and_recovery_finishes(self):
+        child = MagicMock(pid=123)
+        child.poll.return_value = None
+        child.wait.side_effect = lambda: signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None) or 0
+        with patch.object(port, 'verify_baseline'), patch.object(port, 'setup'):
+            with patch.object(port.subprocess, 'Popen', return_value=child):
+                with patch.object(port, 'pids', return_value=[]), patch.object(port, 'owned', return_value=False):
+                    with patch.object(port, 'repair_existing') as repair:
+                        self.assertEqual(port.supervise(self.settings, 'run'), 0)
+        child.send_signal.assert_called_once_with(signal.SIGTERM)
+        repair.assert_called_once()
+
+    def test_cancelled_baseline_does_not_save_a_success_receipt(self):
+        child = MagicMock(pid=123)
+        child.poll.return_value = None
+        child.wait.side_effect = lambda: signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None) or 0
+        (port.PERSIST / 'baseline.json').write_text('{}')
+        (port.RUNTIME / 'auto-baseline.json').write_text('{}')
+        with patch.object(port, 'setup'), patch.object(port.subprocess, 'Popen', return_value=child):
+            with patch.object(port, 'pids', return_value=[]), patch.object(port, 'owned', return_value=False):
+                with patch.object(port, 'repair_existing'):
+                    self.assertEqual(port.supervise(self.settings, 'baseline'), 0)
+        self.assertFalse((port.PERSIST / 'baseline.json').exists())
+        self.assertFalse((port.RUNTIME / 'auto-baseline.json').exists())
+
+    def test_failed_control_metadata_write_terminates_spawned_engine(self):
+        child = MagicMock(pid=123)
+        child.poll.return_value = None
+        child.wait.return_value = 0
+        with patch.object(port, 'setup'), patch.object(port, 'verify_baseline'):
+            with patch.object(port.subprocess, 'Popen', return_value=child):
+                with patch.object(port, 'atomic', side_effect=OSError('control storage unavailable')):
+                    with patch.object(port, 'owned', return_value=False):
+                        with self.assertRaisesRegex(OSError, 'control storage unavailable'):
+                            port.supervise(self.settings, 'run')
+        child.send_signal.assert_called_once_with(signal.SIGTERM)
+        child.wait.assert_called_once_with(timeout=90)
+
+    def test_stop_during_setup_waits_for_setup_then_cleans_up(self):
+        def interrupt(_settings):
+            signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None)
+        with patch.object(port, 'setup', side_effect=interrupt), patch.object(port.subprocess, 'Popen') as spawn:
+            with patch.object(port, 'owned', return_value=True), patch.object(port, 'pids', return_value=[]):
+                with patch.object(port, 'repair_existing') as repair:
+                    self.assertEqual(port.supervise(self.settings, 'baseline'), 0)
+        spawn.assert_not_called()
+        repair.assert_called_once()
+
+
+class PackageTests(unittest.TestCase):
+    def test_package_and_bundle_integrity(self):
+        import gzip
+        import hashlib
+        import io
+        import tarfile
+        import build
+        with tempfile.TemporaryDirectory() as td, patch.object(build, 'OUT', Path(td)):
+            ipk, bundle = build.build()
+            with tarfile.open(ipk, 'r:gz') as outer:
+                self.assertEqual(set(outer.getnames()), {'./debian-binary', './control.tar.gz', './data.tar.gz'})
+                with tarfile.open(fileobj=io.BytesIO(outer.extractfile('./data.tar.gz').read())) as data:
+                    names = data.getnames()
+                    self.assertIn('./usr/lib/ps-accel/portal_auto.py', names)
+                    self.assertIn('./usr/lib/ps-accel/portal_openwrt.py', names)
+                    self.assertIn('./usr/lib/ps-accel/portal_luci.py', names)
+                    self.assertIn('./usr/lib/ps-accel/telemetry.py', names)
+                    self.assertIn('./www/luci-static/resources/view/ps-accel/settings.js', names)
+                    self.assertEqual(data.getmember('./www/luci-static/resources/view/ps-accel/settings.js').mode, 0o644)
+                    self.assertEqual(data.getmember('./usr/libexec/rpcd/ps-accel').mode, 0o755)
+                    self.assertEqual(data.getmember('./usr/lib/ps-accel').mode, 0o700)
+                    self.assertEqual(data.getmember('./etc/config/ps_accel').mode, 0o600)
+                    self.assertIn(b"option enabled '0'", data.extractfile('./etc/config/ps_accel').read())
+                    self.assertFalse(any('auto-config.json' in n or 'baseline.json' in n or '.venv' in n for n in names))
+                with tarfile.open(fileobj=io.BytesIO(outer.extractfile('./control.tar.gz').read())) as ctrl:
+                    text = ctrl.extractfile('./control').read().decode()
+                    self.assertIn('Architecture: all', text)
+                    self.assertIn('scapy, ip-full, kmod-veth, libpcap', text)
+                    for n in ('preinst', 'postinst', 'prerm', 'postrm'):
+                        subprocess.run(['sh', '-n'], input=ctrl.extractfile('./' + n).read(), check=True)
+            with tarfile.open(bundle, 'r:gz') as tar:
+                base = './ps-accel-openwrt/'
+                manifest = json.loads(tar.extractfile(base + 'MANIFEST.json').read())
+                for n, expected in manifest.items():
+                    self.assertEqual(hashlib.sha256(tar.extractfile(base + n).read()).hexdigest(), expected)
+
+
+if __name__ == '__main__':
+    unittest.main()

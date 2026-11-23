@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+release-assets/
+config.json
+auto-config.json
+auto-runtime/
+experiments/
+*.pcap
+*.pcapng
+*.log
+.env

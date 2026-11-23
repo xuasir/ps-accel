@@ -1,0 +1,45 @@
+name: PS Accel OpenWrt
+on:
+  push:
+    branches-ignore: ['release/test']
+    paths: ['openwrt/**', '.github/workflows/**', '.gitignore']
+  pull_request:
+    paths: ['openwrt/**', '.github/workflows/**', '.gitignore']
+  workflow_dispatch:
+  workflow_call:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -r openwrt/requirements.txt
+      - run: python -m unittest discover -s openwrt/tests -v
+      - run: node --test openwrt/tests/test_luci_ui.mjs
+      - name: Check shell and LuCI syntax
+        run: |
+          sh -n openwrt/install.sh
+          sh -n openwrt/uninstall.sh
+          sh -n openwrt/files/ps-accel
+          sh -n openwrt/files/ps-accel.init
+          sh -n openwrt/luci/root/usr/libexec/rpcd/ps-accel
+          node --check openwrt/luci/htdocs/luci-static/resources/view/ps-accel/settings.js
+      - run: python openwrt/build.py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ps-accel-openwrt
+          path: |
+            openwrt/release-assets/*.ipk
+            openwrt/release-assets/*.tar.gz
+            openwrt/release-assets/SHA256SUMS
+          if-no-files-found: error

@@ -1,0 +1,31 @@
+# Local reference repository and nested Git metadata
+**/.git
+
+# macOS and editor files
+.DS_Store
+._*
+.idea/
+.vscode/
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Dependencies and generated artifacts
+node_modules/
+target/
+dist/
+/openwrt/release-assets/
+
+# Local secrets, logs and captures
+.env
+.env.*
+!.env.example
+*.log
+*.pcap
+*.pcapng

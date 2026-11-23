@@ -1,0 +1,15 @@
+{
+  "luci-app-ps-accel": {
+    "description": "配置 PS Accel 串流增强与导出诊断摘要",
+    "read": {
+      "ubus": {
+        "ps-accel": ["status", "details", "logs", "diagnostics"]
+      }
+    },
+    "write": {
+      "ubus": {
+        "ps-accel": ["configure", "profile", "baseline", "trial", "start", "stop", "repair", "doctor"]
+      }
+    }
+  }
+}

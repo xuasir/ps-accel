@@ -1,0 +1,83 @@
+name: PS Accel Release
+
+on:
+  push:
+    branches: ['release/test']
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    uses: ./.github/workflows/openwrt.yml
+
+  publish:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Prepare release metadata
+        id: release
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          sys.path.insert(0, 'openwrt')
+          from build import VERSION
+          from profiles import APP_VERSION
+
+          if VERSION.split('-', 1)[0] != APP_VERSION:
+              raise SystemExit('安装包版本与应用版本需要保持一致。')
+
+          ref_name = os.environ['GITHUB_REF_NAME']
+          if os.environ['GITHUB_REF_TYPE'] == 'tag':
+              expected_tag = f'v{APP_VERSION}'
+              if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', ref_name) or ref_name != expected_tag:
+                  raise SystemExit(f'正式版 tag 必须与应用版本一致：{expected_tag}，收到：{ref_name}')
+              tag = ref_name
+              name = f'PS Accel {tag}'
+              prerelease = 'false'
+          else:
+              run_number = os.environ['GITHUB_RUN_NUMBER']
+              short_sha = os.environ['GITHUB_SHA'][:7]
+              tag = f'test-{run_number}-{short_sha}'
+              name = f'PS Accel 测试版 {short_sha}（构建 #{run_number}）'
+              prerelease = 'true'
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'tag={tag}\nname={name}\nprerelease={prerelease}\nversion={VERSION}\n')
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: ps-accel-openwrt
+          path: release-assets
+      - name: Verify package checksums
+        working-directory: release-assets
+        run: sha256sum --check SHA256SUMS
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.release.outputs.name }}
+          prerelease: ${{ steps.release.outputs.prerelease == 'true' }}
+          make_latest: ${{ steps.release.outputs.prerelease == 'true' && 'false' || 'true' }}
+          generate_release_notes: true
+          body: |
+            安装包版本：`${{ steps.release.outputs.version }}`。
+            来源提交：`${{ github.sha }}`。
+
+            `*.ipk` 适用于 opkg，`*.tar.gz` 提供通用脚本安装包，`SHA256SUMS` 用于校验下载文件。
+          files: |
+            release-assets/*.ipk
+            release-assets/*.tar.gz
+            release-assets/SHA256SUMS
+          fail_on_unmatched_files: true

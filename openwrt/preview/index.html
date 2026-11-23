@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PS Accel · OpenWrt 控制台预览</title>
+<style>
+html{background:#101214;color:#edf0f4;color-scheme:dark}body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;font-size:14px;line-height:1.5;padding:24px}.preview-note{max-width:1180px;margin:0 auto 18px;color:#a8b09d;border:1px solid #30382b;background:#1d2417;border-radius:10px;padding:12px 15px;font-size:12px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}.preview-actions{display:flex;align-items:center;gap:12px}.preview-note button{background:none;border:0;color:inherit;cursor:pointer;font:inherit;text-decoration:underline}.preview-note select{font:inherit;color:inherit;background:transparent;border:1px solid #596448;border-radius:5px;padding:3px 6px;max-width:160px}.preview-alert{padding:13px;margin:12px auto;max-width:1150px;background:#432929;color:#ffd0d0;border-radius:10px}html.light{background:#f4f6f8;color:#19212e;color-scheme:light}html.light .preview-note{background:#eef5d6;color:#657145;border-color:#d4e2ba}@media(max-width:600px){body{padding:16px 12px}.preview-note{font-size:10px;padding:10px 12px}}
+</style>
+<div class="preview-note"><span>界面预览 · 演示数据 · 操作改变模拟状态，演示流程已缩短</span><div class="preview-actions"><select id="recording" aria-label="演示记录状态"><option value="normal">正常记录</option><option value="delayed">模拟采样延迟</option><option value="failed">模拟写入异常</option></select><select id="recovery" aria-label="演示恢复状态"><option value="normal">正常恢复</option><option value="cleanup">模拟清理失败</option><option value="query">模拟状态查询失败</option></select><button id="theme" type="button">切换浅色</button></div></div>
+<main id="app"></main>
+<script>
+window.E = function(tag, attrs, children) {
+ if (typeof attrs === 'string' || Array.isArray(attrs) || attrs instanceof Node) { children = attrs; attrs = {}; }
+ var element = document.createElement(tag);
+ Object.keys(attrs || {}).forEach(function(key) {
+  if (typeof attrs[key] === 'function') element.addEventListener(key, attrs[key]);
+  else element.setAttribute(key, attrs[key]);
+ });
+ function append(child) {
+  if (Array.isArray(child)) child.forEach(append);
+  else if (child instanceof Node) element.appendChild(child);
+  else if (child !== undefined && child !== null) element.appendChild(document.createTextNode(String(child)));
+ }
+ append(children);
+ return element;
+};
+var profileData = [ ['35','轻量 · 优先留出无线余量'], ['45','均衡 · 逐步提升画质'],
+ ['65','推荐 · 已有方案的起点'], ['100','高清 · 适合余量充足的链路'], ['200','实验 · 建议逐档验证'] ];
+var state = {
+ ok: true, config: { bridge:'br-lan',address:'10.0.0.250/24',ps5_ip:'10.0.0.100',portal_ip:'10.0.0.101',profile:'65' },
+ configured:true, bridges:['br-lan'], autostart:false, running:false, mode:'active', recovery_required:false,
+ baseline_saved:true, baseline_valid:true, baseline_reason:'设备、网桥与代码校验通过', modified:7,
+ last_modified:null, counts:{forwarded_out:28146}, control_mbps:0, uptime_seconds:0, foreign_relay:false,
+ recovery_errors:[], job:{id:'preview-initial',state:'complete',action:'baseline',busy:false},
+ observability:{status_fresh:true,write_errors:0,dropped_logs:0,coalesced_snapshots:0,last_error:''},
+ environment:{version:'0.1.2',model:'FastRhino R66S',architecture:'aarch64',kernel:'6.12.115',
+ firmware:'OpenWrt 25.12-SNAPSHOT',target:'rockchip/armv8',package_manager:'apk',host_forwarding:'1'},
+ profiles:profileData.map(function(item){return {value:item[0],label:item[0]+' Mbps',description:item[1],target_mbps:Number(item[0]),experimental:item[0]==='200'};}),
+ log:'[演示] LAN 网桥 br-lan 就绪\n[演示] PS5 与 Portal 设备配对完成\n[演示] BASELINE READY: connect Portal now\n[演示] 已保存连接测试，设备、网桥与代码校验通过',
+ events:'2026-11-23 14:20:18 INFO 已修改新连接请求，目标码率=65 Mbps\n2026-11-23 14:22:06 INFO 已完成设备网络恢复'
+};
+var runningSince = 0, instance, jobSequence = 0;
+function detailsRevision() {
+ return JSON.stringify([state.config,state.baseline_valid,state.autostart]);
+}
+function job(action, values) {
+ state.job = Object.assign({id:'preview-'+(++jobSequence),state:'complete',action:action,busy:false},values || {});
+ return state.job.id;
+}
+window.rpc = { declare:function(spec) { return function() {
+ var args = Array.prototype.slice.call(arguments);
+ return new Promise(function(resolve) {
+  window.setTimeout(function() {
+   if (spec.method === 'status') {
+    if (state.running) {
+     state.uptime_seconds = Math.floor((Date.now()-runningSince)/1000);
+     state.control_mbps = [0.018,0.024,0.021,0.029,0.017,0.026][Math.floor(state.uptime_seconds/3)%6];
+     state.counts.forwarded_out += 73;
+    }
+    state.sample_time = state.observability.status_fresh ? new Date().toISOString() : null;
+    var dynamic=JSON.parse(JSON.stringify(state));
+    ['config','configured','bridges','autostart','baseline_saved','baseline_valid','baseline_reason',
+     'environment','profiles','log','events'].forEach(function(key){delete dynamic[key];});
+    dynamic.details_revision=detailsRevision();dynamic.state_known=state.state_known!==false;
+    resolve(dynamic); return;
+   }
+   if (spec.method === 'details') {
+    var detail={ok:true,details_revision:detailsRevision(),details_warnings:[]};
+    ['config','configured','bridges','autostart','baseline_saved','baseline_valid','baseline_reason',
+     'environment','profiles'].forEach(function(key){detail[key]=state[key];});
+    resolve(JSON.parse(JSON.stringify(detail)));return;
+   }
+   if (spec.method === 'logs') {
+    resolve({ok:true,kind:args[0],text:state[args[0]] || ''});return;
+   }
+   if (spec.method === 'profile') {
+    var restarting = state.running, previousProfile = state.config.profile;
+    var profileId = job('profile',{state:'running',busy:true,restarted:restarting,
+     previous_profile:previousProfile,phase:restarting?'stopping':'saving'});
+    state.running=false;state.control_mbps=0;
+    state.log='[演示] '+(restarting?'正在停止旧中继并恢复网络。':'正在保存码率。');
+    window.setTimeout(function() {
+     if (state.job.id !== profileId || !state.job.busy) return;
+     state.config.profile=args[0];state.job.phase=restarting?'starting':'ready';
+     state.log+='\n[演示] 已保存 '+args[0]+' Mbps，连接测试记录保留。';
+     if (!restarting) {state.job.busy=false;state.job.state='complete';state.job.applied_profile=args[0];return;}
+     window.setTimeout(function() {
+      if (state.job.id !== profileId || !state.job.busy) return;
+      state.running=true;state.mode='active';runningSince=Date.now();
+      state.job.busy=false;state.job.state='complete';state.job.phase='ready';state.job.applied_profile=args[0];
+      state.log+='\n[演示] 中继已自动重启，请重新连接 Portal。';
+      state.events+='\n'+new Date().toLocaleString('zh-CN')+' INFO [演示] 新档位已就绪，目标码率='+args[0]+' Mbps';
+     },2500);
+    },1500);
+   }
+   if (spec.method === 'start') {
+    state.running=true; state.autostart=!!args[0];state.mode='active';runningSince=Date.now();state.modified++;job('start');
+    state.events+='\n'+new Date().toLocaleString('zh-CN')+' INFO [演示] 已修改新连接请求，目标码率='+state.config.profile+' Mbps';
+   }
+   if (spec.method === 'stop') {
+    var cancelledAction=state.job.busy?state.job.action:null;
+    state.running=false;state.control_mbps=0;job(cancelledAction || 'stop',cancelledAction?{state:'cancelled'}:{});
+    state.recovery_required=false;state.cleanup_pending=false;
+    state.log='[演示] 中继已停止，网络恢复完成。';
+   }
+   if (spec.method === 'configure') {
+    ['bridge','address','ps5_ip','portal_ip','profile'].forEach(function(key,i){state.config[key]=args[i];});
+    state.configured=true;state.baseline_valid=false;state.baseline_saved=false;state.baseline_reason='尚未完成连接测试';job('configure');
+    state.log='[演示] 设备配对完成，请开始连接测试。';
+   }
+   if (spec.method === 'baseline' || spec.method === 'trial') {
+    state.running=true;state.mode=spec.method==='baseline'?'baseline':'active';runningSince=Date.now();
+    var testId=job(spec.method,{state:'running',busy:true});state.log='[演示] '+(spec.method==='baseline'?'BASELINE READY':'AUTO READY')+'\n[演示] 请重新连接 Portal。';
+    window.setTimeout(function(){
+     if (!state.running || state.job.id !== testId) return;
+     state.running=false;job(spec.method);
+     if (spec.method==='baseline') {state.baseline_valid=true;state.baseline_saved=true;state.baseline_reason='设备、网桥与代码校验通过';}
+     state.log+='\n[演示] 测试已完成，网络恢复完成。';
+    },5000);
+   }
+   if (spec.method === 'doctor') {job('doctor');state.log='[演示] Python / Scapy / libpcap：检查通过\n[演示] 主路由 IPv4 转发：1\n[演示] 目标平台：rockchip/armv8\n[演示] 网络恢复路径：就绪';}
+   if (spec.method === 'repair') {job('repair');state.recovery_required=false;state.cleanup_pending=false;state.log='[演示] 网络恢复完成。';}
+   if (spec.method === 'diagnostics') {
+    resolve({ok:true,generated_at:new Date().toISOString(),environment:state.environment,
+     network:{bridge:state.config.bridge,paired:true},service:{running:state.running,modified:state.modified},
+     baseline:{valid:state.baseline_valid},profile:state.config.profile,observability:state.observability,preview:true});return;
+   }
+   resolve({ok:true});
+  },120);
+ });
+}; } };
+window.view = { extend:function(object) { return object; } };
+window.L = { hasViewPermission:function() { return true; } };
+window.ui = { createHandlerFn:function(object, fn, name) { return function(event) { return fn.call(object,name,event); }; },
+ addNotification:function(_,element) {element.className='preview-alert';document.getElementById('app').prepend(element);} };
+window.poll = { add:function(fn, seconds) { window.setInterval(fn,seconds*1000); } };
+fetch('../luci/htdocs/luci-static/resources/view/ps-accel/settings.js').then(function(response){return response.text();}).then(function(source){
+ instance = new Function(source)();
+ return instance.load().then(function(data){document.getElementById('app').appendChild(instance.render(data));});
+}).catch(function(error){document.getElementById('app').textContent=error.message;});
+document.getElementById('theme').addEventListener('click',function(){
+ var light=document.documentElement.classList.toggle('light');
+ this.textContent=light?'切换深色':'切换浅色';
+ if(instance) instance.root.setAttribute('data-theme',light?'light':'dark');
+});
+document.getElementById('recording').addEventListener('change',function(){
+ var delayed=this.value==='delayed', failed=this.value==='failed';
+ state.observability={status_fresh:!delayed,write_errors:failed?3:0,dropped_logs:failed?2:0,
+  coalesced_snapshots:delayed?12:0,last_error:failed?'[演示] 日志写入失败':''};
+ if(instance) instance.update(JSON.parse(JSON.stringify(state)));
+});
+document.getElementById('recovery').addEventListener('change',function(){
+ state.state_known=this.value!=='query';
+ state.status_warnings=this.value==='query'?['[演示] 进程状态查询超时']:[];
+ state.cleanup_pending=this.value==='cleanup';state.recovery_required=this.value==='cleanup';
+ if(this.value==='cleanup') {
+  state.running=false;state.control_mbps=0;
+  job('stop',{state:'failed',error:'[演示] 中继已停止，网络空间删除失败。'});
+  state.log='[演示] 清理中断，保留归属记录。点击“恢复网络”从中断处继续。';
+ }
+ if(instance) instance.update(JSON.parse(JSON.stringify(state)));
+});
+</script>
+</html>
