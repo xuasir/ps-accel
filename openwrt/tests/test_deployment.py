@@ -22,7 +22,9 @@ class DeploymentTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        # Exercise /tmp/ destination rewriting on every host, including macOS.
+        self.root = Path(temp.name) / 'tmp'
+        self.root.mkdir()
 
     def portable_fixture(self):
         with patch.object(build, 'OUT', self.root / 'out'):
@@ -39,13 +41,18 @@ class DeploymentTests(unittest.TestCase):
         # Redirect only fixed filesystem destinations into a temporary fake router.
         for name in ('install.sh', 'uninstall.sh'):
             text = (folder / name).read_text()
-            text = text.replace('cp -R "$HERE/luci/root/." /',
-                                'cp -R "$HERE/luci/root/." "' + str(target) + '/"')
             text = re.sub(r'/(?:var/run|etc|usr|www|tmp)(?=/|[\s\'\"])',
                           lambda match: str(target) + match.group(), text)
+            # Insert the bare root destination after rewriting the fixed paths.
+            text = text.replace('cp -R "$HERE/luci/root/." /',
+                                'cp -R "$HERE/luci/root/." "' + str(target) + '/"')
             (folder / name).write_text(text)
         (folder / 'files/ps-accel').write_text('#!/bin/sh\necho "service $*" >> "$PS_ACCEL_TEST_LOG"\n')
         (folder / 'files/ps-accel.init').write_text('#!/bin/sh\necho "init $*" >> "$PS_ACCEL_TEST_LOG"\n')
+        (folder / 'files/ps-accel-observe').write_text('#!/bin/sh\necho "observer $*" >> "$PS_ACCEL_TEST_LOG"\n')
+        (folder / 'files/ps-accel-observe.init').write_text('#!/bin/sh\necho "observer-init $*" >> "$PS_ACCEL_TEST_LOG"\n')
+        (folder / 'files/ps-accel-policy').write_text('#!/bin/sh\necho "policy $*" >> "$PS_ACCEL_TEST_LOG"\n')
+        (folder / 'files/ps-accel-policy.init').write_text('#!/bin/sh\necho "policy-init $*" >> "$PS_ACCEL_TEST_LOG"\n')
         manifest_path = folder / 'MANIFEST.json'
         manifest = json.loads(manifest_path.read_text())
         for name in manifest:
@@ -72,6 +79,11 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(installed.returncode, 0, installed.stderr.decode())
         self.assertTrue((target / 'usr/lib/ps-accel/profiles.py').exists())
         self.assertTrue((target / 'usr/lib/ps-accel/telemetry.py').exists())
+        self.assertTrue((target / 'usr/lib/ps-accel/portal_observe.py').exists())
+        self.assertTrue((target / 'usr/lib/ps-accel/portal_policy.py').exists())
+        self.assertTrue((target / 'usr/lib/ps-accel/psportal_adapter.lua').exists())
+        self.assertEqual((target / 'etc/ps-accel/observability.json').stat().st_mode & 0o777, 0o600)
+        self.assertTrue((target / 'etc/init.d/ps-accel-observe').exists())
         self.assertEqual((target / 'etc/config/ps_accel').stat().st_mode & 0o777, 0o600)
         config = (target / 'etc/config/ps_accel').read_bytes()
         removed = subprocess.run(['sh', str(folder / 'uninstall.sh')], env=env, capture_output=True)
@@ -80,6 +92,14 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual((target / 'etc/config/ps_accel').read_bytes(), config)
         log = (self.root / 'commands.log').read_text()
         self.assertIn('service stop', log)
+        self.assertIn('observer-init enable', log)
+        self.assertIn('observer-init start', log)
+        self.assertIn('observer-init stop', log)
+        self.assertIn('policy detach', log)
+        self.assertIn('policy-init stop', log)
+        self.assertFalse((target / 'etc/init.d/ps-accel-policy').exists())
+        self.assertFalse((target / 'etc/init.d/ps-accel-observe').exists())
+        self.assertTrue((target / 'etc/ps-accel/observability.json').exists())
         self.assertNotIn('apk add', log)
         self.assertNotIn('opkg install', log)
 
@@ -114,6 +134,10 @@ class DeploymentTests(unittest.TestCase):
         self.assertTrue((root / 'www/luci-static/resources/view/ps-accel/settings.js').exists())
         self.assertTrue((root / 'usr/lib/ps-accel/profiles.py').exists())
         self.assertTrue((root / 'usr/lib/ps-accel/telemetry.py').exists())
+        self.assertTrue((root / 'usr/lib/ps-accel/domain_tracker.py').exists())
+        self.assertTrue((root / 'usr/lib/ps-accel/psportal_adapter.lua').exists())
+        self.assertEqual((root / 'etc/init.d/ps-accel-policy').stat().st_mode & 0o777, 0o755)
+        self.assertEqual((root / 'etc/init.d/ps-accel-observe').stat().st_mode & 0o777, 0o755)
         self.assertEqual((root / 'usr/libexec/rpcd/ps-accel').stat().st_mode & 0o777, 0o755)
         self.assertEqual((root / 'usr/lib/ps-accel').stat().st_mode & 0o777, 0o700)
         self.assertFalse((root / 'usr/lib/ps-accel/build.py').exists())

@@ -13,8 +13,20 @@ fi
 if [ -x /etc/init.d/ps-accel ]; then
 	/etc/init.d/ps-accel disable
 fi
+if [ -x /etc/init.d/ps-accel-observe ]; then
+	/etc/init.d/ps-accel-observe stop
+	/etc/init.d/ps-accel-observe disable
+fi
 [ ! -e /var/run/netns/ps-accel ] || { echo 'Recovery namespace remains. Files retained.' >&2; exit 1; }
-rm -f /usr/sbin/ps-accel /etc/init.d/ps-accel
+if [ -x /usr/sbin/ps-accel-policy ]; then
+	/usr/sbin/ps-accel-policy detach
+fi
+if [ -x /etc/init.d/ps-accel-policy ]; then
+	/etc/init.d/ps-accel-policy stop
+	/etc/init.d/ps-accel-policy disable
+fi
+rm -f /usr/sbin/ps-accel-policy /etc/init.d/ps-accel-policy
+rm -f /usr/sbin/ps-accel /etc/init.d/ps-accel /usr/sbin/ps-accel-observe /etc/init.d/ps-accel-observe
 rm -rf /usr/lib/ps-accel
 rm -f /usr/libexec/rpcd/ps-accel
 rm -f /usr/share/rpcd/acl.d/luci-app-ps-accel.json

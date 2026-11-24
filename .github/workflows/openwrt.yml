@@ -23,6 +23,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev lua5.1
       - run: python -m pip install -r openwrt/requirements.txt
       - run: python -m unittest discover -s openwrt/tests -v
       - run: node --test openwrt/tests/test_luci_ui.mjs
@@ -32,8 +34,13 @@ jobs:
           sh -n openwrt/uninstall.sh
           sh -n openwrt/files/ps-accel
           sh -n openwrt/files/ps-accel.init
+          sh -n openwrt/files/ps-accel-observe
+          sh -n openwrt/files/ps-accel-observe.init
+          sh -n openwrt/files/ps-accel-policy
+          sh -n openwrt/files/ps-accel-policy.init
           sh -n openwrt/luci/root/usr/libexec/rpcd/ps-accel
           node --check openwrt/luci/htdocs/luci-static/resources/view/ps-accel/settings.js
+          luac5.1 -p openwrt/psportal_adapter.lua openwrt/tests/test_policy_adapter.lua
       - run: python openwrt/build.py
       - uses: actions/upload-artifact@v4
         with:
@@ -41,5 +48,6 @@ jobs:
           path: |
             openwrt/release-assets/*.ipk
             openwrt/release-assets/*.tar.gz
+            openwrt/release-assets/ps-accel-console-*.html
             openwrt/release-assets/SHA256SUMS
           if-no-files-found: error

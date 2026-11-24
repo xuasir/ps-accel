@@ -163,9 +163,10 @@ class LuCITests(unittest.TestCase):
     def test_rpc_acl_has_no_arbitrary_file_or_command_access(self):
         acl = json.loads((SOURCE / 'luci/root/usr/share/rpcd/acl.d/luci-app-ps-accel.json').read_text())
         rights = acl['luci-app-ps-accel']
-        self.assertEqual(rights['read'], {'ubus': {'ps-accel': ['status', 'details', 'logs', 'diagnostics']}})
+        readable = ['status', 'details', 'devices', 'logs', 'diagnostics', 'proxy_diagnostics', 'domains', 'psportal_status', 'psportal_preview']
+        self.assertEqual(rights['read'], {'ubus': {'ps-accel': readable}})
         self.assertEqual(set(rights['write']), {'ubus'})
-        self.assertEqual(set(rights['write']['ubus']['ps-accel']), set(api.METHODS) - {'status', 'details', 'logs', 'diagnostics'})
+        self.assertEqual(set(rights['write']['ubus']['ps-accel']), set(api.METHODS) - set(readable))
 
 
 if __name__ == '__main__':

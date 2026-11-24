@@ -19,6 +19,7 @@ import portal_active_probe as probe
 import portal_auto_platform as net
 from profiles import PROFILES
 from telemetry import Telemetry
+from observability import new_incident
 
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger('portal-auto')
@@ -50,7 +51,7 @@ def config(path):
 def fingerprint(c):
     binding = {key: value for key, value in c.items() if key != 'profile'}
     digest = hashlib.sha256(json.dumps(binding, sort_keys=True).encode())
-    for name in ('portal_auto.py', 'portal_auto_platform.py', 'portal_active_probe.py', 'portal_windows_network.py', 'protocol.py', 'profiles.py', 'telemetry.py'):
+    for name in ('portal_auto.py', 'portal_auto_platform.py', 'portal_active_probe.py', 'portal_windows_network.py', 'protocol.py', 'profiles.py', 'telemetry.py', 'observability.py'):
         digest.update((ROOT / name).read_bytes())
     return digest.hexdigest()
 
@@ -108,7 +109,7 @@ def pipe_reader(pipe, messages, ready_line=False):
         messages.put(False)
 
 
-def guardian(runtime, parent):
+def guardian(runtime, parent, preferences=None):
     state = json.loads((runtime / 'restore-state.json').read_text())
     lock = net.Lock(runtime, existing=True)
     owner = net.Parent(parent)
@@ -136,8 +137,11 @@ def guardian(runtime, parent):
             (runtime / 'recovery-required').unlink(missing_ok=True)
         lock.close(parent, repaired=not errors)
         try:
-            reports = Telemetry(runtime)
+            reports = (Telemetry(runtime) if preferences is None else
+                       Telemetry(runtime, preferences=preferences, persist=preferences.parent))
             reports.recovery({'time': utc(), 'parent': parent, 'reason': reason, 'errors': errors})
+            if errors:
+                reports.incident(new_incident('guardian', '; '.join(errors), reports.preferences.value.tag))
             reports.close()
         except Exception:
             pass
@@ -154,7 +158,7 @@ def health_worker(results):
         results.put(str(exc))
 
 
-def run(c, runtime, active=True, seconds=None, generation=''):
+def run(c, runtime, active=True, seconds=None, generation='', preferences=None):
     if (runtime / 'recovery-required').exists():
         raise RuntimeError('Previous relay recovery is unconfirmed. Run repair before restarting.')
     if active and not baseline_valid(c, runtime):
@@ -166,7 +170,8 @@ def run(c, runtime, active=True, seconds=None, generation=''):
     lock = net.Lock(runtime)
     telemetry = None
     try:
-        telemetry = Telemetry(runtime)
+        telemetry = (Telemetry(runtime) if preferences is None else
+                     Telemetry(runtime, preferences=preferences, persist=preferences.parent))
         LOG.addHandler(telemetry.handler)
     except Exception:
         pass
@@ -190,14 +195,19 @@ def run(c, runtime, active=True, seconds=None, generation=''):
         (runtime / 'recovery-required').write_text(str(os.getpid()))
         filt = f'ether dst {state["own_mac"]} and ether src {state["portal_mac"]} and ip and src host {net.PORTAL} and dst host {net.PS5}'
         rx, tx = net.open_socket(filt), net.open_socket()
-        guard = subprocess.Popen([sys.executable, '-u', str(ROOT / 'portal_auto.py'), 'guardian',
-                                  '--runtime', str(runtime), '--parent', str(os.getpid())],
+        guard_args = [sys.executable, '-u', str(ROOT / 'portal_auto.py'), 'guardian',
+                      '--runtime', str(runtime), '--parent', str(os.getpid())]
+        if preferences is not None:
+            guard_args += ['--preferences', str(preferences)]
+        guard = subprocess.Popen(guard_args,
                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE, **net.spawn_options())
         ready = queue.Queue()
         threading.Thread(target=pipe_reader, args=(guard.stdout, ready, True), daemon=True).start()
         if ready.get(timeout=10) != b'GUARD_READY':
             raise RuntimeError('Recovery guardian failed before redirection')
         atomic_json(runtime / 'engine-ready.json', {'pid': os.getpid(), 'generation': generation, 'ready': True})
+        LOG.info('中继就绪，模式=%s，目标码率=%s Mbps', 'active' if active else 'baseline',
+                 c['profile'], extra={'essential': True})
         print('AUTO READY' if active else 'BASELINE READY: connect Portal now and check picture/controls.', flush=True)
         next_arp = next_beat = next_status = 0
         next_health = time.monotonic() + 30
@@ -239,7 +249,7 @@ def run(c, runtime, active=True, seconds=None, generation=''):
                 if telemetry is not None:
                     telemetry.snapshot(snapshot)
                 last_rate_time, last_rate_bytes = now, counts['forwarded_bytes']
-                next_status = now + 2
+                next_status = now + (telemetry.snapshot_interval if telemetry is not None else 10)
             frame = net.receive(rx)
             if not frame:
                 continue
@@ -259,7 +269,12 @@ def run(c, runtime, active=True, seconds=None, generation=''):
                         seen.popitem(last=False)
                     counts['unique_modified_startups'] += 1
                     last_mutation = utc()
-                    LOG.info('已修改新连接请求，目标码率=%s Mbps', c['profile'])
+                    LOG.info('已修改新连接请求，目标码率=%s Mbps', c['profile'], extra={'essential': True})
+    except Exception as exc:
+        LOG.error('中继运行失败：%s', str(exc), extra={'essential': True})
+        if telemetry is not None:
+            telemetry.incident(new_incident('relay', str(exc), telemetry.preferences.value.tag))
+        raise
     finally:
         if guard is not None:
             try:
@@ -287,6 +302,11 @@ def run(c, runtime, active=True, seconds=None, generation=''):
                    'uptime_seconds': round(time.monotonic() - started, 1), 'control_mbps': 0}
         if telemetry is not None:
             telemetry.snapshot(snapshot)
+            if errors:
+                LOG.error('中继恢复失败：%s', '; '.join(errors), extra={'essential': True})
+                telemetry.incident(new_incident('recovery', '; '.join(errors), telemetry.preferences.value.tag))
+            else:
+                LOG.info('中继已停止，恢复完成，转发包数=%s', counts['forwarded_out'], extra={'essential': True})
             LOG.removeHandler(telemetry.handler)
             telemetry.close()
         if errors:
@@ -323,6 +343,7 @@ def main():
     parser.add_argument('--seconds', type=int)
     parser.add_argument('--parent', type=int)
     parser.add_argument('--generation', default='')
+    parser.add_argument('--preferences', type=Path)
     args = parser.parse_args()
     runtime = args.runtime.resolve()
     if args.command == 'status':
@@ -343,7 +364,7 @@ def main():
         print('Stop requested. Allow up to 35 seconds for recovery; check status.')
         return 0
     if args.command == 'guardian':
-        return guardian(runtime, args.parent)
+        return guardian(runtime, args.parent, args.preferences)
     if args.command == 'configure':
         if sys.platform == 'win32':
             interface = choose_windows_interface()
@@ -382,7 +403,7 @@ def main():
     c = config(args.config)
     return 0 if run(c, runtime, active=args.command == 'run',
                     seconds=(60 if args.command == 'baseline' else args.seconds),
-                    generation=args.generation) is not None else 1
+                    generation=args.generation, preferences=args.preferences) is not None else 1
 
 
 if __name__ == '__main__':

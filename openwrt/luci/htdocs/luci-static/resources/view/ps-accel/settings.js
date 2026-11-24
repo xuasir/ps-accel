@@ -6,21 +6,64 @@
 
 var callStatus = rpc.declare({ object: 'ps-accel', method: 'status', expect: {} });
 var callDetails = rpc.declare({ object: 'ps-accel', method: 'details', expect: {} });
+var callDevices = rpc.declare({ object: 'ps-accel', method: 'devices', expect: {} });
+var callDeviceSave = rpc.declare({ object: 'ps-accel', method: 'device_save',
+ params: [ 'bridge', 'portal_ip', 'ps5_ip' ], expect: {} });
 var callLogs = rpc.declare({ object: 'ps-accel', method: 'logs', params: [ 'kind' ], expect: {} });
 var callConfigure = rpc.declare({ object: 'ps-accel', method: 'configure',
  params: [ 'bridge', 'address', 'ps5_ip', 'portal_ip', 'profile' ], expect: {} });
 var callProfile = rpc.declare({ object: 'ps-accel', method: 'profile', params: [ 'profile' ], expect: {} });
 var callStart = rpc.declare({ object: 'ps-accel', method: 'start', params: [ 'autostart' ], expect: {} });
 var callDiagnostics = rpc.declare({ object: 'ps-accel', method: 'diagnostics', expect: {} });
+var callProxyDiagnostics = rpc.declare({ object: 'ps-accel', method: 'proxy_diagnostics', expect: {} });
+var callLogging = rpc.declare({ object: 'ps-accel', method: 'logging', params: [ 'mode', 'domains', 'tag' ], expect: {} });
+var callDomains = rpc.declare({ object: 'ps-accel', method: 'domains', params: [ 'incident' ], expect: {} });
+var callIncident = rpc.declare({ object: 'ps-accel', method: 'incident', params: [ 'note' ], expect: {} });
+var policyFields = [ 'portal', 'ps5', 'node', 'domains', 'ports', 'exclusions' ];
+var callPolicyStatus = rpc.declare({ object: 'ps-accel', method: 'psportal_status', expect: {} });
+var callPolicyPreview = rpc.declare({ object: 'ps-accel', method: 'psportal_preview', params: policyFields, expect: {} });
+var callPolicySave = rpc.declare({ object: 'ps-accel', method: 'psportal_save', params: policyFields, expect: {} });
+var callPolicyApply = rpc.declare({ object: 'ps-accel', method: 'psportal_apply',
+ params: policyFields.concat([ 'token', 'confirm_restart' ]), expect: {} });
+var callPolicyDisable = rpc.declare({ object: 'ps-accel', method: 'psportal_disable', expect: {} });
+var callPolicyProbe = rpc.declare({ object: 'ps-accel', method: 'psportal_probe', expect: {} });
 var calls = {};
 [ 'baseline', 'trial', 'stop', 'repair', 'doctor' ].forEach(function(name) {
  calls[name] = rpc.declare({ object: 'ps-accel', method: name, expect: {} });
 });
-var actionNames = { configure: '设备检测', profile: '应用码率', baseline: '连接测试',
- trial: '试运行', start: '启动中继', stop: '停止中继', repair: '网络恢复', doctor: '环境检查' };
+var actionNames = { device_save: '确认设备', configure: '检查码率配置', profile: '应用码率', baseline: '连接测试',
+ trial: '试运行', start: '启动码率增强', stop: '停止任务', repair: '网络恢复', doctor: '环境检查',
+ psportal_apply: '启用透明代理', psportal_disable: '停用透明代理', psportal_probe: '检测出口连通性' };
 var profilePhases = { stopping: '正在恢复旧连接', saving: '正在保存新码率',
  starting: '正在启动新档位', rollback: '正在恢复原档位',
  waiting_exit: '正在等待进程退出', repairing: '正在恢复与清理网络' };
+var evidenceNames = { new_domain: '首次发现', dns_query: 'DNS 查询', dns_ok: 'DNS 解析完成',
+ dns_empty: 'DNS 无地址响应', dns_truncated: 'DNS 响应截断', dns_error: 'DNS 错误',
+ dns_timeout: 'DNS 观测超时', tcp_ok: 'TCP 握手响应', tcp_reset: 'TCP 建连被重置',
+ tcp_timeout: 'TCP 建连观测超时', tls_sni: 'TLS 域名可见', unreachable: '网络不可达响应' };
+function localTime(value) {
+ if (!value) return '—';
+ var date = new Date(value);
+ return isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN', { hour12: false });
+}
+function jobFeature(action) {
+ return action && action.indexOf('psportal_') === 0 ? 'proxy' : action === 'device_save' ? 'devices' : 'bitrate';
+}
+function policyHosts(text) {
+ return (text || '').split('\n').map(function(name) { return name.trim().toLowerCase().replace(/^full:/, ''); })
+  .filter(function(name, index, names) { return name && name.charAt(0) !== '#' && names.indexOf(name) === index; });
+}
+function validHost(name) {
+ return name.length <= 253 && name.indexOf('.') > 0 && !/^\d+(\.\d+){3}$/.test(name) &&
+  name.split('.').every(function(part) { return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(part); });
+}
+function policyMatches(host, rules) {
+ host = host.toLowerCase().replace(/\.$/, '');
+ return !!host && rules.some(function(rule) {
+  var pattern = rule.split('*').map(function(part) { return part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }).join('.*');
+  return new RegExp('^' + pattern + '$').test(host);
+ });
+}
 
 function rpcRequest(request) {
  return new Promise(function(resolve, reject) {
@@ -35,22 +78,95 @@ function rpcRequest(request) {
  });
 }
 
+// Keep layout local; LuCI and the active theme style native controls and tabs.
 var styles = `
-.ps-accel{--pa-bg:#f4f6f8;--pa-card:#fff;--pa-text:#19212e;--pa-muted:#6b7483;--pa-line:#e3e7ed;--pa-accent:#b8dc48;--pa-tint:#eef5d6;--pa-danger:#bd4c4c;color:var(--pa-text);max-width:1180px;margin:0 auto;font-family:inherit}
-.ps-accel[data-theme="dark"]{--pa-bg:#101214;--pa-card:#191c20;--pa-text:#edf0f4;--pa-muted:#949da9;--pa-line:#30353b;--pa-tint:#293019;--pa-danger:#f29393}
-.ps-accel *{box-sizing:border-box}.ps-accel h2,.ps-accel h3,.ps-accel p{margin:0;color:inherit}.ps-accel button,.ps-accel input,.ps-accel select{font:inherit}
-.pa-head{display:flex;align-items:center;justify-content:space-between;gap:20px;padding:12px 0 24px}.pa-brand{display:flex;align-items:center;gap:14px}.pa-mark{display:grid;place-items:center;width:46px;height:46px;border-radius:15px;background:var(--pa-accent);color:#202810;font-size:24px;font-weight:900}.pa-brand h2{font-size:27px;letter-spacing:-1px;font-weight:750;line-height:1.3}.pa-sub{font-size:12px;color:var(--pa-muted);margin-top:4px}.pa-chip{display:inline-flex;align-items:center;gap:7px;border:1px solid var(--pa-line);border-radius:99px;padding:7px 11px;font-size:12px;white-space:nowrap}.pa-dot{height:7px;width:7px;border-radius:50%;background:var(--pa-muted)}[data-running="true"] .pa-dot{background:var(--pa-accent);box-shadow:0 0 0 3px var(--pa-tint)}
-.pa-stats{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin-bottom:18px}.pa-stat{background:var(--pa-card);border:1px solid var(--pa-line);border-radius:16px;padding:19px 20px;min-height:116px}.pa-label{font-size:12px;color:var(--pa-muted);margin-bottom:12px}.pa-number{font-size:28px;font-weight:700;line-height:1.25;letter-spacing:-.8px;font-variant-numeric:tabular-nums}.pa-number small{font-size:12px;font-weight:400;letter-spacing:0;margin-left:5px;color:var(--pa-muted)}.pa-detail{font-size:11px;color:var(--pa-muted);margin-top:8px;line-height:1.6}
-.pa-grid{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,1fr);gap:18px}.pa-stack{display:flex;flex-direction:column;gap:18px;min-width:0}.pa-panel{border:1px solid var(--pa-line);background:var(--pa-card);border-radius:17px;overflow:hidden}.pa-panel-body{padding:22px}.pa-panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:18px}.pa-panel h3{font-size:16px;font-weight:650}.pa-caption{font-size:12px;color:var(--pa-muted);line-height:1.8;margin-top:5px}.pa-mini{color:var(--pa-muted);font-size:11px}.pa-profiles{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:8px;margin:18px 0}.pa-profile{border:1px solid var(--pa-line);border-radius:12px;background:var(--pa-bg);color:var(--pa-text);padding:16px 6px;text-align:center;cursor:pointer;position:relative}.pa-profile strong{font-size:23px;display:block;line-height:1.4;letter-spacing:-.6px}.pa-profile span{display:block;font-size:10px;color:var(--pa-muted);margin-top:3px}.pa-profile[aria-checked="true"]{border-color:var(--pa-accent);background:var(--pa-tint);box-shadow:inset 0 0 0 1px var(--pa-accent)}.pa-profile[aria-checked="true"] strong{color:var(--pa-text)}.pa-profile:disabled{cursor:default;opacity:.6}.pa-selection{font-size:12px;color:var(--pa-muted);line-height:1.7;min-height:21px;margin-bottom:16px}
-.ps-accel [hidden]{display:none!important}.pa-main-tabs{display:flex;gap:4px;width:fit-content;max-width:100%;padding:5px;margin-bottom:18px;border:1px solid var(--pa-line);border-radius:12px;background:var(--pa-card)}.pa-main-tab{border:0;border-radius:8px;background:transparent;color:var(--pa-muted);padding:11px 23px;font-size:12px;font-weight:600;cursor:pointer;white-space:nowrap}.pa-main-tab[aria-selected="true"]{background:var(--pa-tint);color:var(--pa-text)}.pa-main-tab:focus-visible,.pa-log-tab:focus-visible{outline:2px solid var(--pa-accent);outline-offset:2px}.pa-tab-panel{min-width:0}.pa-record-detail{margin-top:13px;font-size:11px;color:var(--pa-muted);line-height:1.9;overflow-wrap:anywhere}
-.pa-actions{display:flex;flex-wrap:wrap;align-items:center;gap:9px}.pa-btn{border:1px solid var(--pa-line);border-radius:9px;padding:10px 15px;background:var(--pa-bg);color:var(--pa-text);cursor:pointer;font-size:12px;font-weight:550;line-height:1.3;white-space:normal}.pa-btn.primary{background:var(--pa-accent);border-color:var(--pa-accent);color:#263016}.pa-btn.danger{color:var(--pa-danger);background:transparent}.pa-btn:disabled{opacity:.4;cursor:default}.pa-btn:hover:enabled{filter:brightness(.96)}.pa-btn:focus-visible,.pa-profile:focus-visible{outline:2px solid var(--pa-accent);outline-offset:3px}.pa-toggle{display:flex;gap:8px;align-items:center;font-size:12px;margin:18px 0;color:var(--pa-muted)}.pa-toggle input{accent-color:#99b939;width:16px;height:16px;margin:0}
-.pa-flow{display:grid;grid-template-columns:minmax(0,1fr) 20px minmax(0,1fr) 20px minmax(0,1fr);align-items:center;margin-top:18px}.pa-device{border:1px solid var(--pa-line);background:var(--pa-bg);border-radius:11px;padding:13px 8px;text-align:center;min-width:0}.pa-device b{font-size:12px;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pa-device span{font-size:10px;color:var(--pa-muted);display:block;margin-top:6px;word-break:break-all}.pa-device.router{border-color:var(--pa-accent)}.pa-arrow{text-align:center;color:var(--pa-muted);font-size:13px}.pa-path-note{font-size:11px;color:var(--pa-muted);text-align:center;margin-top:12px;line-height:1.8}
-.pa-step{display:flex;align-items:flex-start;gap:10px;padding:13px 0;border-bottom:1px solid var(--pa-line)}.pa-step:last-child{border-bottom:0}.pa-step-icon{width:23px;height:23px;border-radius:50%;display:grid;place-items:center;font-size:11px;background:var(--pa-bg);color:var(--pa-muted);flex-shrink:0}.pa-step[data-ready="true"] .pa-step-icon{background:var(--pa-tint);color:var(--pa-text)}.pa-step-title{font-size:12px;font-weight:600}.pa-step-desc{font-size:11px;color:var(--pa-muted);margin-top:4px;line-height:1.7}.pa-notice{font-size:12px;line-height:1.8;padding:14px 16px;border-radius:10px;background:var(--pa-bg);color:var(--pa-muted);margin-bottom:18px;border-left:3px solid var(--pa-accent)}.pa-notice[data-error="true"]{border-left-color:var(--pa-danger);color:var(--pa-danger)}
-.pa-form{display:grid;grid-template-columns:1fr 1fr;gap:15px}.pa-field{display:flex;flex-direction:column;gap:7px;min-width:0}.pa-field label{font-size:12px;font-weight:550}.pa-field input,.pa-field select{border:1px solid var(--pa-line);border-radius:8px;background:var(--pa-bg);color:var(--pa-text);width:100%;min-width:0;padding:10px 11px;min-height:39px;font-size:12px;box-shadow:none}.pa-field input:focus,.pa-field select:focus{border-color:var(--pa-accent);outline:1px solid var(--pa-accent)}.pa-field .pa-caption{font-size:10px;line-height:1.6;margin:0}.pa-form-footer{margin-top:18px}
-.pa-log-tabs{display:flex;gap:14px;margin-bottom:14px}.pa-log-tab{background:none;border:0;border-bottom:2px solid transparent;color:var(--pa-muted);font-size:12px;padding:0 0 7px;cursor:pointer}.pa-log-tab[aria-selected="true"]{border-bottom-color:var(--pa-accent);color:var(--pa-text)}.pa-log{background:var(--pa-bg);border:1px solid var(--pa-line);color:var(--pa-muted);padding:14px;border-radius:10px;min-height:135px;max-height:265px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;font-size:11px;line-height:1.9;margin:0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.pa-kv{display:flex;justify-content:space-between;gap:10px;font-size:11px;padding:9px 0;border-bottom:1px solid var(--pa-line);color:var(--pa-muted)}.pa-kv:last-child{border-bottom:0}.pa-kv span:last-child{text-align:right;color:var(--pa-text);word-break:break-word}.pa-foot{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:23px 1px;color:var(--pa-muted);font-size:10px;line-height:1.8}.pa-bars{display:flex;align-items:end;gap:3px;height:22px;margin-top:8px;overflow:hidden}.pa-bars i{flex:1;height:2px;min-width:2px;border-radius:2px;background:var(--pa-accent);opacity:.6}
-@media(max-width:800px){.pa-grid{grid-template-columns:1fr;gap:14px}.pa-stack{gap:14px}.pa-main-tabs{width:100%}.pa-main-tab{flex:1;padding:11px 8px}.pa-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.pa-stat{padding:16px;min-height:106px}.pa-panel-body{padding:18px}.pa-head{padding:8px 0 18px}.pa-brand h2{font-size:23px}.pa-mark{width:40px;height:40px;border-radius:12px}.pa-sub{font-size:10px}.pa-number{font-size:25px}.pa-profiles{gap:6px}.pa-profile{padding:13px 3px}.pa-profile strong{font-size:21px}.pa-chip{font-size:10px;padding:6px 9px}.pa-form{gap:12px}}
-@media(max-width:380px){.pa-form{grid-template-columns:1fr}.pa-profiles{grid-template-columns:repeat(3,minmax(0,1fr))}.pa-chip{display:none}.pa-flow{grid-template-columns:minmax(0,1fr) 14px minmax(0,1fr) 14px minmax(0,1fr)}}
+.ps-accel{min-width:0}.ps-accel [hidden]{display:none!important}
+.ps-accel .pa-grid{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(0,1fr);gap:16px;align-items:start}
+.ps-accel .pa-stack{display:flex;flex-direction:column;gap:16px;min-width:0}
+.ps-accel .pa-panel{min-width:0;margin:0}.ps-accel .pa-panel-body{min-width:0}
+.ps-accel .pa-panel-head{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+.ps-accel .pa-panel-head h3{margin:0}.ps-accel .pa-panel-head .cbi-button{max-width:100%}
+.ps-accel .pa-main-tabs>li{height:auto;max-width:100%}.ps-accel .pa-main-tab{line-height:1.5}
+.ps-accel .pa-nav-state{display:block;font-size:.85em;line-height:1.5;font-weight:normal}
+.ps-accel .pa-feature-head{margin:16px 0}.ps-accel .pa-feature-head h3{margin-bottom:6px}
+.ps-accel .pa-tab-panel,.ps-accel .pa-stage-panel{min-width:0}
+.ps-accel .pa-scope{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:12px 0}
+.ps-accel .pa-scope-copy{display:flex;gap:16px;flex-wrap:wrap}.ps-accel .pa-scope-copy b{margin-right:6px}
+.ps-accel .pa-form,.ps-accel .pa-device-form{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}
+.ps-accel .pa-field{display:block;margin:12px 0;min-width:0}
+.ps-accel .pa-field>.cbi-value-title{display:block;float:none;text-align:left;width:auto;padding:0}
+.ps-accel .pa-field>.cbi-value-field{display:block;margin:6px 0 0;min-width:0}
+.ps-accel .cbi-input-text,.ps-accel .cbi-input-select,.ps-accel .cbi-input-textarea{width:100%;max-width:100%;min-width:0;box-sizing:border-box}
+.ps-accel .cbi-input-textarea{resize:vertical}.ps-accel .pa-device-card{min-width:0}
+.ps-accel .pa-device-title{display:flex;align-items:baseline;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.ps-accel .pa-device-title h4{margin:12px 0 0}
+.ps-accel .pa-actions,.ps-accel .pa-domain-row-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:12px 0}
+.ps-accel .pa-btn,.ps-accel .pa-link,.ps-accel .pa-profile{white-space:normal;max-width:100%}
+.ps-accel .pa-config-foot{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-top:16px}
+.ps-accel .pa-profiles{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}.ps-accel .pa-profile{flex:1 1 90px}
+.ps-accel .pa-profile span{display:block;font-size:.85em;line-height:1.5}
+.ps-accel .pa-profile strong{font-size:inherit}.ps-accel .pa-selection{margin-bottom:12px}
+.ps-accel .pa-toggle{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;margin:12px 0}
+.ps-accel .pa-notice{margin:12px 0;overflow-wrap:anywhere}.ps-accel .pa-notice:empty{display:none}
+.ps-accel .pa-muted,.ps-accel .pa-mini,.ps-accel .pa-detail,.ps-accel .pa-device-identity,.ps-accel .pa-domain-time,.ps-accel .pa-record-detail{color:var(--text-color-medium,var(--muted,inherit));font-size:.9em;line-height:1.6;overflow-wrap:anywhere}
+.ps-accel .pa-caption{margin:8px 0;overflow-wrap:anywhere}
+.ps-accel .pa-domain-problem,.ps-accel [data-error="true"]{color:var(--error-color-high,var(--err,inherit))}
+.ps-accel .pa-status-pill{font-size:inherit}.ps-accel .pa-stats{margin:16px 0;width:100%}
+.ps-accel .pa-stats td{vertical-align:top}.ps-accel .pa-stats td:first-child{width:25%}
+.ps-accel .pa-number{white-space:nowrap}.ps-accel .pa-number small{font-size:inherit;margin-left:6px}
+.ps-accel .pa-bars{display:flex;align-items:flex-end;gap:3px;height:22px;max-width:200px;margin-top:6px}
+.ps-accel .pa-bars i{flex:1;min-width:2px;height:2px;background:currentColor;opacity:.5}
+.ps-accel .pa-feature-status{width:100%;margin:12px 0}.ps-accel .pa-feature-status td:first-child{width:30%}
+.ps-accel .pa-kv{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid var(--border-color-medium,var(--line,currentColor))}
+.ps-accel .pa-kv>span:last-child{text-align:right;overflow-wrap:anywhere}.ps-accel .pa-kv:last-child{border-bottom:0}
+.ps-accel .pa-device-inventory .pa-kv{flex-wrap:wrap}.ps-accel .pa-device-inventory .pa-actions{margin:0}
+.ps-accel .pa-disclosure{margin:16px 0}.ps-accel .pa-disclosure>summary{cursor:pointer;font-weight:600;margin-bottom:8px}
+.ps-accel .pa-step{display:flex;align-items:flex-start;gap:10px;margin:12px 0}.ps-accel .pa-step-icon{flex-shrink:0;font-weight:600}
+.ps-accel .pa-step-title{font-weight:600}.ps-accel .pa-step-desc{margin-top:4px}
+.ps-accel .pa-flow{display:grid;grid-template-columns:minmax(0,1fr) 16px minmax(0,1fr) 16px minmax(0,1fr);align-items:center;gap:6px;margin:16px 0}
+.ps-accel .pa-device{min-width:0;overflow-wrap:anywhere}.ps-accel .pa-device b,.ps-accel .pa-device span{display:block}.ps-accel .pa-arrow{text-align:center}
+.ps-accel .pa-log-tools{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.ps-accel .pa-log-tools .pa-log-tabs{margin-top:0}.ps-accel .pa-log{min-height:150px;max-height:320px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;box-sizing:border-box}
+.ps-accel .pa-domain-tools{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:12px 0}.ps-accel .pa-domain-tools .cbi-input-text{flex:1 1 180px}
+.ps-accel .pa-domain-tools .pa-toggle{margin:0}.ps-accel .pa-domain-table{overflow-x:auto;max-width:100%}
+.ps-accel .pa-domain-table .table{width:100%;margin:12px 0}.ps-accel .pa-domain-list .table{min-width:540px}
+.ps-accel .pa-domain-table td{vertical-align:top;overflow-wrap:anywhere}.ps-accel .pa-domain-name{overflow-wrap:anywhere;font-weight:600}
+.ps-accel .pa-domain-new{display:inline-block;margin-left:6px;font-size:.85em;font-weight:normal}
+.ps-accel .pa-domain-action-notice{margin:12px 0}.ps-accel .pa-domain-candidate{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:12px 0}
+.ps-accel .pa-domain-empty{padding:12px 0}.ps-accel .pa-incident{margin-top:16px}.ps-accel .pa-foot{margin-top:20px;padding:12px 0;font-size:.85em}
+@media(max-width:900px){.ps-accel .pa-grid{grid-template-columns:1fr}.ps-accel .pa-domain-list .table{min-width:0}}
+@media(max-width:600px){.ps-accel .pa-form,.ps-accel .pa-device-form{grid-template-columns:1fr}.ps-accel .pa-main-tabs>li{flex:1 1 auto}.ps-accel .pa-main-tab{width:100%}.ps-accel .pa-nav-state{white-space:normal}.ps-accel .pa-stats td:first-child{width:30%}.ps-accel .pa-flow{grid-template-columns:minmax(0,1fr) 12px minmax(0,1fr) 12px minmax(0,1fr);gap:3px}.ps-accel .pa-domain-list thead{display:none}.ps-accel .pa-domain-list tr{display:block;padding:10px 0;border-bottom:1px solid var(--border-color-medium,var(--line,currentColor))}.ps-accel .pa-domain-list td{display:block;width:100%;border:0;text-align:left;box-sizing:border-box}.ps-accel .pa-domain-list td:first-child{width:100%}.ps-accel .pa-log-tools{gap:8px}}
 `;
+
+function buttonClass(kind) {
+ return 'pa-btn btn cbi-button ' + (kind === 'danger' ? 'cbi-button-reset' :
+  kind === 'primary' ? 'cbi-button-action important' : 'cbi-button-neutral');
+}
+
+function luciControl(tag, attrs, children) {
+ attrs = Object.assign({}, attrs);
+ if (attrs.type !== 'hidden') {
+  var kind = tag === 'input' ? (attrs.type === 'checkbox' || attrs.type === 'radio' ? attrs.type : 'text') :
+   tag === 'select' ? 'select' : 'textarea';
+  attrs['class'] = ((attrs['class'] || '') + ' cbi-input-' + kind).trim();
+ }
+ return E(tag, attrs, children);
+}
+
+function formField(input, label, help) {
+ return E('div', { 'class': 'cbi-value pa-field' }, [
+  E('label', { 'class': 'cbi-value-title', 'for': input.id }, label),
+  E('div', { 'class': 'cbi-value-field' }, [input,
+   help ? E('div', { 'class': 'cbi-value-description pa-caption' }, help) : E('span')])
+ ]);
+}
+
+function setTabState(tab, selected) {
+ tab.setAttribute('aria-selected', String(selected));
+ tab.tabIndex = selected ? 0 : -1;
+ tab.parentNode.setAttribute('class', selected ? 'cbi-tab' : 'cbi-tab-disabled');
+}
+
 
 return view.extend({
  load: function() {
@@ -82,22 +198,339 @@ return view.extend({
   return this.detailsRequest;
  },
 
- refreshLogs: function() {
-  if (this.activeTab !== 'logs') return Promise.resolve();
-  var self = this, kind = this.logTab;
+ activeLog: function() {
+  if (this.activeTab === 'devices' && this.deviceLogDetails.open) return { kind: 'devices', node: this.deviceLogNode };
+  if (this.activeTab === 'bitrate' && this.activeStages.bitrate === 'logs')
+   return { kind: this.logTab, node: this.logNode };
+  if (this.activeTab === 'proxy' && this.activeStages.proxy === 'logs')
+   return { kind: this.proxyLogTab, node: this.proxyLogNode };
+  return null;
+ },
+
+ refreshLogs: function(force) {
+  var context = this.activeLog();
+  if (!context) return Promise.resolve();
+  if (context.kind === 'domains') return this.refreshDomains(force);
+  var self = this, kind = context.kind;
   if (this.logRequests[kind]) return this.logRequests[kind];
+  if (!force && Date.now() < (this.nextLogRead[kind] || 0)) return Promise.resolve();
+  this.nextLogRead[kind] = Date.now() + ((this.latest.logging || {}).mode === 'verbose' ? 2000 : 10000);
   this.logRequests[kind] = rpcRequest(function() { return callLogs(kind); }).then(function(data) {
    self.logContent[kind] = data.text;
-   if (self.activeTab !== 'logs' || self.logTab !== kind) return;
-   var bottom = self.logNode.scrollHeight - self.logNode.scrollTop - self.logNode.clientHeight < 40;
-   self.logNode.textContent = data.text || (kind === 'events' ?
-    '中继启动后，新连接事件会显示在这里。' : '设备配对、连接测试与维护操作的输出会显示在这里。');
-   if (bottom) self.logNode.scrollTop = self.logNode.scrollHeight;
+   var active = self.activeLog();
+   if (!active || active.kind !== kind) return;
+   var bottom = active.node.scrollHeight - active.node.scrollTop - active.node.clientHeight < 40;
+   var empty = { devices: '保存设备配置后，地址确认结果显示在这里。',
+    bitrate: '配置检查、连接测试、启停与恢复结果显示在这里。',
+    events: '码率增强启动后，握手修改与运行事件显示在这里。',
+    proxy: '透明代理的启用、更新、停用与回滚结果显示在这里。' };
+   active.node.textContent = data.text || empty[kind];
+   if (bottom) active.node.scrollTop = active.node.scrollHeight;
   }).catch(function(error) {
-   if (self.activeTab === 'logs' && self.logTab === kind)
-    self.logNode.textContent = '日志读取失败：' + error.message;
+   var active = self.activeLog();
+   if (active && active.kind === kind) active.node.textContent = '日志读取失败：' + error.message;
   }).finally(function() { delete self.logRequests[kind]; });
   return this.logRequests[kind];
+ },
+
+ refreshDomains: function(force, anyStage) {
+  if (!anyStage && (this.activeTab !== 'proxy' || this.activeStages.proxy !== 'logs' || this.proxyLogTab !== 'domains'))
+   return Promise.resolve();
+  if (this.domainRequest) return this.domainRequest;
+  if (!force && Date.now() < (this.nextDomainRead || 0)) return Promise.resolve();
+  var self = this, selected = this.incidentId || '';
+  this.nextDomainRead = Date.now() + ((this.latest.logging || {}).mode === 'verbose' ? 2000 : 10000);
+  this.domainRequest = rpcRequest(function() { return callDomains(selected); }).then(function(data) {
+   if ((self.incidentId || '') !== selected) return;
+   self.domainData = data;
+   self.renderDomains(data);
+   return data;
+  }).catch(function(error) {
+   if ((self.incidentId || '') === selected) self.domainState.textContent = '域名记录读取失败：' + error.message;
+  }).finally(function() {
+   self.domainRequest = null;
+   if ((self.incidentId || '') !== selected) self.refreshDomains(true);
+  });
+  return this.domainRequest;
+ },
+
+ selectLogTab: function(name, focus) {
+  var proxy = name === 'domains' || name === 'proxy', tabs = proxy ? this.proxyLogTabs : this.logTabs;
+  if (!tabs[name]) return;
+  if (proxy) this.proxyLogTab = name;
+  else this.logTab = name;
+  Object.keys(tabs).forEach(function(key) {
+   setTabState(tabs[key], key === name);
+  });
+  if (proxy) {
+   this.proxyLogNode.hidden = name === 'domains';
+   this.domainPanel.hidden = name !== 'domains';
+  }
+  if (!proxy) this.logNode.setAttribute('aria-labelledby', tabs[name].id || tabs[name].attributes && tabs[name].attributes.id);
+  if (focus) tabs[name].focus();
+  if (name !== 'domains') (proxy ? this.proxyLogNode : this.logNode).textContent = this.logContent[name] || '正在读取日志…';
+  return this.refreshLogs(true);
+ },
+
+ refreshDevices: function(force) {
+  if (this.deviceRequest) return this.deviceRequest;
+  if (this.activeTab !== 'devices' && !force) return Promise.resolve();
+  if (!force && Date.now() < (this.nextDeviceRead || 0)) return Promise.resolve();
+  var self = this;
+  this.nextDeviceRead = Date.now() + 10000;
+  this.deviceRequest = rpcRequest(callDevices).then(function(data) {
+   self.deviceData = data; self.deviceError = null;
+   self.renderDevices(data); self.update(self.latest);
+  }).catch(function(error) {
+   self.deviceError = error.message;
+   self.deviceInventory.replaceChildren(E('p', { 'class': 'pa-caption pa-domain-problem' },
+    '设备列表读取失败：' + error.message));
+   self.update(self.latest);
+  }).finally(function() { self.deviceRequest = null; self.update(self.latest); });
+  return this.deviceRequest;
+ },
+
+ renderDevices: function(data) {
+  var self = this, devices = data.devices || [], binding = data.binding || {};
+  this.deviceChoiceButtons = [];
+  var options = [];
+  devices.forEach(function(device) {
+   device.addresses.filter(function(ip) { return ip.indexOf(':') < 0; }).forEach(function(ip) {
+    options.push(E('option', { value: ip }, device.label + ' · ' + device.mac));
+   });
+  });
+  this.deviceChoices.replaceChildren.apply(this.deviceChoices, options);
+  this.deviceInventory.replaceChildren.apply(this.deviceInventory, devices.length ? devices.map(function(device) {
+   return E('div', { 'class': 'pa-kv' }, [
+    E('div', {}, [ E('strong', {}, device.label), E('div', { 'class': 'pa-muted' }, device.addresses.join(' / ')),
+     E('div', { 'class': 'pa-muted' }, device.mac + ' · ' + (device.source === 'dhcp' ? 'DHCP 租约' : '邻居记录')) ]),
+    E('div', { 'class': 'pa-actions' }, ['portal', 'ps5'].map(function(role) {
+     var ip = device.addresses.filter(function(value) { return value.indexOf(':') < 0; })[0];
+     var button = E('button', { type: 'button', 'class': buttonClass(), disabled: '', click: function() {
+      if (self.fields[role + '_ip'].disabled || !ip) return;
+      self.fields[role + '_ip'].value = ip; self.fieldTouched[role + '_ip'] = true;
+      self.renderDeviceIdentity();
+     } }, '设为 ' + (role === 'portal' ? 'Portal' : 'PS5'));
+     button.dataset.role = role; button.dataset.ip = ip || '';
+     self.deviceChoiceButtons.push(button); return button;
+    })) ]);
+  }) : [E('p', { 'class': 'pa-caption' }, '保持两台设备开机，刷新后从租约与邻居记录选择地址。')]);
+  this.deviceConfirmed.textContent = binding.confirmed_at ? '上次确认 ' + localTime(binding.confirmed_at * 1000) :
+   data.configured ? '已沿用当前设备配对' : '保存后确认设备地址与 MAC';
+  this.renderDeviceIdentity();
+ },
+
+ renderDeviceIdentity: function() {
+  var data = this.deviceData || {}, devices = data.devices || [], binding = data.binding || {};
+  ['portal', 'ps5'].forEach(function(role) {
+   var ip = this.fields[role + '_ip'].value.trim();
+   var matches = devices.filter(function(device) { return device.addresses.indexOf(ip) >= 0; });
+   var mac = matches.length === 1 ? matches[0].mac :
+    (binding.config || {})[role + '_ip'] === ip ? binding[role + '_mac'] : '';
+   this.deviceIdentity[role].textContent = mac ? '设备 MAC · ' + mac : '保存时确认设备身份';
+  }, this);
+ },
+
+ deviceSelectors: function() {
+  var config = this.latest.config || {}, saved = this.latest.device_selectors || {};
+  return { portal: saved.portal || config.portal_ip || '', ps5: saved.ps5 || config.ps5_ip || '' };
+ },
+
+ invalidatePolicy: function() {
+  this.policyPlan = null;
+  if (this.policyConfirm) this.policyConfirm.checked = false;
+  if (this.policyPreview) this.policyPreview.hidden = true;
+  this.updatePolicyControls();
+ },
+
+ dynamicDomainRules: function() {
+  return ((this.policyData || {}).dynamic_rules || (this.domainData || {}).dynamic_rules || [])
+   .map(function(rule) { return rule.domain; });
+ },
+
+ addDomainToPolicy: function(domain, target) {
+  domain = domain.trim().toLowerCase().replace(/^full:/, '');
+  var busy = this.readonly || this.policyPending || this.pending || !!(this.latest.job || {}).busy;
+  if (busy || ['domains', 'exclusions'].indexOf(target) < 0) return;
+  var hosts = policyHosts(this.policyInputs[target].value);
+  if (target === 'domains' && policyMatches(domain, policyHosts(this.policyInputs.exclusions.value).filter(function(rule) {
+   return rule !== domain;
+  }))) {
+   this.domainActionText.textContent = domain + ' 命中泛匹配排除规则，请在代理配置中调整该规则后加入。';
+   this.domainActionNotice.hidden = false; this.domainActionNotice.setAttribute('data-error', 'true'); return;
+  }
+  if (!validHost(domain) || (hosts.indexOf(domain) < 0 && hosts.length >= 32)) {
+   this.domainActionText.textContent = validHost(domain) ? '每份清单最多 32 个域名，请先整理代理配置。' :
+    '请从日志选择有效的完整主机名。';
+   this.domainActionNotice.hidden = false; this.domainActionNotice.setAttribute('data-error', 'true'); return;
+  }
+  if (hosts.indexOf(domain) < 0) hosts.push(domain);
+  var other = target === 'domains' ? 'exclusions' : 'domains';
+  this.policyInputs[target].value = hosts.join('\n');
+  this.policyInputs[other].value = policyHosts(this.policyInputs[other].value).filter(function(name) {
+   return name !== domain;
+  }).join('\n');
+  this.policyTouched[target] = this.policyTouched[other] = true;
+  this.invalidatePolicy();
+  this.policyConfigNotice.textContent = this.policyDraftState.textContent =
+   '代理草稿已调整，保存并生成新预览后应用。';
+  this.policyConfigNotice.setAttribute('data-error', 'false');
+  this.domainActionText.textContent = domain + ' 已加入' + (target === 'domains' ? '代理清单' : '排除清单') +
+   '。检查配置并生成预览后应用。';
+  this.domainActionNotice.hidden = false; this.domainActionNotice.setAttribute('data-error', 'false');
+  if (this.domainData) this.renderDomains(this.domainData);
+ },
+
+ domainRuleActions: function(domain) {
+  var self = this, names = policyHosts(this.policyInputs.domains.value), exclusions = policyHosts(this.policyInputs.exclusions.value);
+  var excluded = policyMatches(domain, exclusions), dynamic = policyMatches(domain, this.dynamicDomainRules());
+  var included = policyMatches(domain, names) || dynamic;
+  return E('div', {}, [ E('div', { 'class': 'pa-domain-rule' }, '草稿 · ' +
+   (excluded ? '排除清单 / 原有策略' : dynamic ? '动态匹配 / 所选节点' : included ? '代理清单 / 所选节点' : '沿用原有策略')),
+   E('div', { 'class': 'pa-domain-row-actions' }, [['domains', '加入代理'], ['exclusions', '加入排除']].map(function(item) {
+    var chosen = item[0] === 'domains' ? included && !excluded : excluded;
+    var disabled = self.readonly || self.policyPending || self.pending || !!(self.latest.job || {}).busy || chosen || !validHost(domain);
+    var button = E('button', { type: 'button', 'class': buttonClass(), click: function() {
+     self.addDomainToPolicy(domain, item[0]);
+    } }, chosen ? (item[0] === 'domains' ? '已覆盖代理' : '已加入排除') : item[1]);
+    button.disabled = !!disabled; button.dataset.chosen = String(chosen); button.dataset.domain = domain;
+    self.domainActionButtons.push(button); return button;
+   })) ]);
+ },
+
+ addSuggestedDomains: function() {
+  var self = this;
+  if (this.readonly || this.policyPending || this.pending || !!(this.latest.job || {}).busy) return Promise.resolve();
+  return this.refreshDomains(true, true).then(function(data) {
+   if (!data) { self.policyCandidateSummary.textContent = '域名候选读取待确认，请重新读取。'; return; }
+   if (self.readonly || self.policyPending || self.pending || !!(self.latest.job || {}).busy) return;
+   var hosts = policyHosts(self.policyInputs.domains.value), excluded = policyHosts(self.policyInputs.exclusions.value);
+   var covered = hosts.concat(self.dynamicDomainRules());
+   var additions = ((self.domainData || {}).candidates || []).filter(function(row) { return row.suggestion === 'proxy'; }).map(function(row) { return row.domain; }).filter(function(host, index, all) {
+    return validHost(host) && !policyMatches(host, excluded) && !policyMatches(host, covered) && all.indexOf(host) === index;
+   });
+   if (hosts.length + additions.length > 32) {
+    self.policyCandidateSummary.textContent = '必要候选共 ' + additions.length + ' 项，合并后超过 32 项；从日志逐项整理。'; return;
+   }
+   if (additions.length) {
+    self.policyInputs.domains.value = hosts.concat(additions).join('\n');
+    self.policyTouched.domains = true; self.invalidatePolicy();
+    self.policyConfigNotice.textContent = self.policyDraftState.textContent = '必要域名已加入草稿，保存并生成新预览后应用。';
+   }
+   self.policyCandidateSummary.textContent = additions.length ? '已加入 ' + additions.length + ' 个完整主机名：' + additions.join('、') :
+    '当前认证、信令与连通探测候选均已覆盖；排除清单继续生效。';
+   if (self.domainData) self.renderDomains(self.domainData);
+  });
+ },
+
+ saveLogging: function(feature) {
+  var self = this;
+  this.loggingPending = true; this.update(this.latest);
+  return rpcRequest(function() {
+   return callLogging((feature === 'proxy' ? self.proxyLogMode : self.logMode).value,
+    self.domainEnabled.checked ? 1 : 0, self.logTag.value.trim());
+  }).then(function(data) {
+   self.loggingTouched = false;
+   self.update(Object.assign({}, self.latest, { logging: data.logging }));
+   self.loggingNotice.textContent = self.proxyLoggingNotice.textContent =
+    data.observer_warning || '日志策略已保存，后台将在 10 秒内应用。';
+   return Promise.all([ self.refreshDetails(), self.refreshDomains(true) ]);
+  }).catch(function(error) {
+   self.loggingNotice.textContent = self.proxyLoggingNotice.textContent = '日志策略保存失败：' + error.message;
+  }).finally(function() { self.loggingPending = false; self.update(self.latest); });
+ },
+
+ markIncident: function() {
+  var self = this;
+  this.incidentPending = true; this.update(this.latest);
+  return rpcRequest(function() { return callIncident(self.incidentNote.value.trim() || 'Portal 连接失败'); }).then(function(data) {
+   self.incidentId = data.id;
+   self.selectStage('proxy', 'logs'); self.selectLogTab('domains');
+   self.incidentNotice.textContent = '已标记 ' + localTime(data.time) + '，正在收集后 15 秒的观测证据。';
+   return self.refreshDomains(true);
+  }).catch(function(error) {
+   self.incidentNotice.textContent = '失败标记保存失败：' + error.message;
+  }).finally(function() { self.incidentPending = false; self.update(self.latest); });
+ },
+
+ renderDomains: function(data) {
+  var self = this, observer = data.observer || {}, rows = data.domains || [];
+  this.domainActionButtons = [];
+  var names = { observing: observer.fresh ? '正在观察设备域名' : '观察状态待确认',
+   disabled: '域名记录已关闭', waiting: '等待设备配对与网桥就绪', stopped: '观察服务已停止' };
+  this.domainState.textContent = (names[observer.state] || '等待观察服务') + ' · 已记录 ' + rows.length + ' 个设备域名' +
+   (data.logging && data.logging.tag ? ' · 标记：' + data.logging.tag : '') +
+   (observer.error ? '。' + observer.error : '');
+  var health = observer.health || {}, io = observer.observability || {};
+  this.domainHealth.textContent = '观测丢弃 ' + Number(observer.capture_drops || 0) +
+   ' · 限速舍弃 ' + Number(observer.rate_drops || 0) + ' · 缓存舍弃 ' + Number(health.capacity_drops || 0) +
+   ' · 解析舍弃 ' + Number(health.malformed || 0) + ' · 报文截断 ' + Number(health.snaplen_limited || 0) +
+   ' · 合并重复 ' + Number(health.suppressed_events || 0) + ' · 写入错误 ' + Number(io.write_errors || 0) +
+   (observer.snapshot_truncated ? ' · 部分历史上下文已精简' : '') +
+   (io.last_error ? '。' + io.last_error : '。');
+  var optionNodes = [ E('option', { value: '' }, '当前域名清单') ].concat((data.incidents || []).map(function(item) {
+   return E('option', { value: item.id }, localTime(item.time) + ' · ' + item.note);
+  }));
+  this.incidentSelect.replaceChildren.apply(this.incidentSelect, optionNodes);
+  this.incidentSelect.value = this.incidentId || '';
+  var search = this.domainSearch.value.trim().toLowerCase();
+  var filtered = rows.filter(function(row) {
+   return (!search || (row.domain || '').indexOf(search) >= 0) &&
+    (!self.domainOnlyProblems.checked || row.last_problem);
+  });
+  var table = E('table', { 'class': 'table' }, [ E('thead', {}, E('tr', { 'class': 'tr' },
+   [ '设备 / 域名', '可见证据', '代理草稿', '最近出现' ].map(function(title) { return E('th', { 'class': 'th' }, title); }))),
+   E('tbody', {}, filtered.slice(0, 100).map(function(row) {
+    var counts = row.counts || {}, observed = Object.keys(evidenceNames).filter(function(key) {
+     return key !== 'new_domain' && counts[key];
+    }).map(function(key) { return evidenceNames[key] + ' ' + counts[key]; });
+    var addresses = (row.addresses || []).map(function(item) { return item.address; }).join('、');
+    return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td' }, [ E('div', { 'class': 'pa-domain-name', title: addresses },
+     [ (row.device === 'ps5' ? 'PS5' : 'Portal') + ' · ' + row.domain,
+      row.new_since_tag ? E('span', { 'class': 'pa-domain-new' }, '本轮新增') : E('span') ]),
+     E('div', { 'class': 'pa-muted' }, row.category_label || '其他'),
+     E('div', { 'class': 'pa-domain-time' }, '首次 ' + localTime(row.first_seen)) ]),
+     E('td', { 'class': 'td ' + (row.last_problem ? 'pa-domain-problem' : '') },
+      (row.last_problem ? evidenceNames[row.last_problem] + '。' : '') + (observed.join(' · ') || '首次可见')),
+     E('td', { 'class': 'td' }, self.domainRuleActions(row.domain)),
+     E('td', { 'class': 'td pa-domain-time' }, localTime(row.last_seen)) ]);
+   })) ]);
+  this.domainList.replaceChildren(filtered.length ? table : E('div', { 'class': 'pa-domain-empty' },
+   rows.length ? '当前筛选条件下暂无记录。' : '完成设备配对后，由 PS5 或 Portal 发起连接，域名记录会显示在这里。'));
+  this.domainCount.textContent = filtered.length > 100 ? '显示最近 100 项，共 ' + filtered.length + ' 项；输入域名缩小范围。' : '';
+  var selected = data.selected, evidence = selected && selected.evidence;
+  this.incidentPanel.hidden = !selected;
+  if (selected) {
+   this.incidentTitle.textContent = localTime(selected.time) + ' · ' + selected.note;
+   this.incidentSummary.textContent = '回溯前 180 秒、后 15 秒。' +
+    (evidence && evidence.evidence_complete ? '观测窗口已结束。' : '正在补齐后续观测。') +
+    (evidence && evidence.coverage_limited ? '采集启动时间或记录容量影响了窗口覆盖。' : '') +
+    (evidence && evidence.truncated ? '部分历史上下文已精简，优先保留异常。' : '') +
+    ' 下列域名按异常证据排序，结合设备错误提示确认原因。';
+   var candidates = (evidence && evidence.candidates || []).map(function(item) {
+    return E('div', { 'class': 'pa-domain-candidate' }, [
+     E('div', {}, [ E('strong', { 'class': 'pa-domain-name' }, (item.device === 'ps5' ? 'PS5' : 'Portal') + ' · ' + item.domain),
+      E('p', { 'class': 'pa-caption' }, (item.errors ? '异常 ' + item.errors + ' 次 · ' : '') +
+       (item.evidence || []).map(function(kind) { return evidenceNames[kind] || kind; }).join(' / ')) ]),
+     self.domainRuleActions(item.domain) ]);
+   });
+   this.incidentCandidates.replaceChildren.apply(this.incidentCandidates, candidates.length ? candidates :
+    [ E('p', { 'class': 'pa-caption' }, '当前窗口的域名证据较少，请结合采集状态、覆盖范围和设备提示检查。') ]);
+   this.incidentEvents.textContent = (evidence && evidence.events || []).map(function(item) {
+    return localTime(item.time) + ' ' + (item.device === 'ps5' ? 'PS5' : 'Portal') + ' ' +
+     (evidenceNames[item.kind] || item.kind) + ' ' + (item.domains || []).join('、') +
+     (item.rcode ? ' · DNS ' + ({ 2: 'SERVFAIL', 3: 'NXDOMAIN', 5: 'REFUSED' }[item.rcode] || item.rcode) : '') +
+     (item.address ? ' · ' + item.address + (item.port ? ':' + item.port : '') : '') +
+     (item.retries ? ' · 重试 ' + item.retries + ' 次' : '') +
+     (item.repeated ? ' · 合并 ' + item.count + ' 次' : '');
+   }).join('\n') || '当前窗口暂无可见域名事件。';
+   var coreEvidence = selected.core_evidence || {};
+   if ((coreEvidence.connections || []).length) this.incidentEvents.textContent += '\n\n核心连接证据：\n' + coreEvidence.connections.map(function(row) {
+    return (row.device === 'ps5' ? 'PS5' : 'Portal') + ' ' + row.domain + ' · ' + row.phase +
+     ' · ' + ({selected:'所选节点',direct:'原有直连',original:'原有出口'}[row.route] || '出口待确认') +
+     (row.failure ? ' · 上游响应待检查' : '');
+   }).join('\n');
+  }
  },
 
  refresh: function(forceDetails) {
@@ -108,7 +541,12 @@ return view.extend({
    self.connectionError = null;
    self.update(Object.assign({}, self.latest, data));
    if (!self.detailsKnown || self.detailsRevision !== data.details_revision) self.refreshDetails();
-   self.refreshLogs();
+   self.refreshLogs(); self.refreshDevices();
+   var job = data.job || {};
+   if (job.action && job.action.indexOf('psportal_') === 0 && job.action !== 'psportal_probe' && !job.busy && self.policyJob !== job.id) {
+    self.policyJob = job.id; self.policyTouched = {}; self.policyPlan = null;
+    self.refreshPolicy(true);
+   } else self.refreshPolicy();
   }).catch(function(error) {
    self.connectionError = error.message;
    self.update(self.latest);
@@ -117,7 +555,7 @@ return view.extend({
  },
 
  button: function(name, label, kind) {
-  var button = E('button', { type: 'button', 'class': 'pa-btn ' + (kind || ''),
+  var button = E('button', { type: 'button', 'class': buttonClass(kind),
    click: ui.createHandlerFn(this, this.run, name) }, label);
   this.buttons[name] = button;
   return button;
@@ -126,34 +564,394 @@ return view.extend({
  field: function(name, label, input, help) {
   var self = this;
   input.id = 'psa-' + name;
-  input.addEventListener('input', function() { self.fieldTouched[name] = true; });
+  input.addEventListener('input', function() {
+   self.fieldTouched[name] = true;
+   if (name !== 'address') self.renderDeviceIdentity();
+   self.update(self.latest);
+  });
   this.fields[name] = input;
-  return E('div', { 'class': 'pa-field' }, [
-   E('label', { 'for': input.id }, label), input, E('div', { 'class': 'pa-caption' }, help || '')
-  ]);
+  return formField(input, label, help);
+ },
+
+ panel: function(title, content, extra, classes) {
+  return E('section', { 'class': 'cbi-section pa-panel ' + (classes || '') }, E('div', { 'class': 'cbi-section-node pa-panel-body' }, [
+   E('div', { 'class': 'pa-panel-head' }, [ E('h3', {}, title), extra || E('span') ])
+  ].concat(content)));
+ },
+
+ navigation: function(items, registry, prefix, classes, select) {
+  var self = this;
+  return items.map(function(item, index) {
+   var tab = E('a', { href: '#' + prefix + '-pane-' + item[0], id: prefix + '-tab-' + item[0], 'class': classes, role: 'tab',
+    'aria-controls': prefix + '-pane-' + item[0], click: function(event) {
+     event.preventDefault(); select.call(self, item[0], false);
+    },
+    keydown: function(event) {
+     var position = index;
+     if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault(); select.call(self, item[0], false); return;
+     }
+     if (event.key === 'ArrowRight') position = (index + 1) % items.length;
+     else if (event.key === 'ArrowLeft') position = (index + items.length - 1) % items.length;
+     else if (event.key === 'Home') position = 0;
+     else if (event.key === 'End') position = items.length - 1;
+     else return;
+     event.preventDefault(); select.call(self, items[position][0], true);
+    } }, item[1]);
+   registry[item[0]] = tab;
+   return E('li', { 'class': 'cbi-tab-disabled', role: 'presentation', 'data-tab': item[0] }, tab);
+  });
  },
 
  selectTab: function(name, focus) {
+  name = { stream: 'bitrate', psportal: 'proxy' }[name] || name;
   if (!this.mainTabs[name]) return;
   this.activeTab = name;
   Object.keys(this.mainTabs).forEach(function(key) {
-   this.mainTabs[key].setAttribute('aria-selected', String(key === name));
-   this.mainTabs[key].tabIndex = key === name ? 0 : -1;
+   setTabState(this.mainTabs[key], key === name);
    this.mainPanels[key].hidden = key !== name;
   }, this);
   if (focus) this.mainTabs[name].focus();
-  if (name === 'logs') this.refreshLogs();
+  if (name === 'devices') this.refreshDevices(true);
+  if (name === 'proxy') this.refreshPolicy(true);
+  this.refreshLogs();
+ },
+
+ selectStage: function(feature, name, focus) {
+  if (!this.stageTabs[feature] || !this.stageTabs[feature][name]) return;
+  this.activeStages[feature] = name;
+  Object.keys(this.stageTabs[feature]).forEach(function(key) {
+   setTabState(this.stageTabs[feature][key], key === name);
+   this.stagePanels[feature][key].hidden = key !== name;
+  }, this);
+  if (this.activeTab !== feature) this.selectTab(feature);
+  if (focus) this.stageTabs[feature][name].focus();
+  if (name === 'logs') this.refreshLogs(true);
+ },
+
+ showLog: function(feature, kind) {
+  this.selectStage(feature, 'logs');
+  this.selectLogTab(kind || (feature === 'proxy' ? 'proxy' : 'bitrate'));
+ },
+
+ policyValues: function() {
+  var self = this;
+  var selectors = this.deviceSelectors();
+  return policyFields.map(function(key) { return key === 'portal' || key === 'ps5' ? selectors[key] : self.policyInputs[key].value.trim(); });
+ },
+
+ refreshPolicy: function(force) {
+  if (this.policyRequest) return this.policyRequest;
+  if ((!force && this.activeTab !== 'proxy') || this.policyPending) return Promise.resolve();
+  if (!force && Date.now() < (this.nextPolicyRead || 0)) return Promise.resolve();
+  var self = this;
+  this.nextPolicyRead = Date.now() + 10000;
+  this.policyRequest = rpcRequest(callPolicyStatus).then(function(data) {
+   self.policyData = data; self.policyEnvironmentError = false;
+   if (self.deviceData) self.deviceData.proxy_enabled = !!data.enabled;
+   if ((data.blockers || []).length && self.policyPlan) self.invalidatePolicy();
+   var config = data.config || {}, environment = data.environment || {}, active = data.active_config || {};
+   var state = (data.receipt || {}).state === 'recovery_required' ? 'PassWall 恢复待检查' : data.enabled ?
+    (environment.attached_cores ? '规则已载入' : '已启用 · 等待入口加载') : '已停用';
+   self.policyState.textContent = self.proxyNavNode.textContent = state;
+   self.policyEnvironment.textContent = 'PassWall ' + (environment.passwall || '待确认') +
+    ' · Sing-box ' + (environment.singbox || '待确认') + ' · 活动入口 ' + Number(environment.active_cores || 0);
+   self.policyBlockers.textContent = (data.blockers || []).join('；');
+   self.policyCoverage.textContent = ((data.entry_scope || {}).notices || []).join('；');
+   self.renderProxyTelemetry(data);
+   var selected = self.policyTouched.node ? self.policyInputs.node.value : config.node || '';
+   var options = [ E('option', { value: '' }, '选择已有代理节点') ].concat((data.nodes || []).map(function(node) {
+    return E('option', { value: node.id }, node.label + ' · ' + node.protocol);
+   }));
+   if (selected && !(data.nodes || []).some(function(node) { return node.id === selected; }))
+    options.push(E('option', { value: selected }, '已保存的节点 · 当前待确认'));
+   self.policyInputs.node.replaceChildren.apply(self.policyInputs.node, options);
+   self.policyInputs.node.value = selected;
+   policyFields.forEach(function(key) {
+    if (key !== 'portal' && key !== 'ps5' && !self.policyTouched[key] && typeof config[key] === 'string')
+     self.policyInputs[key].value = config[key];
+   });
+   var selectors = self.deviceSelectors();
+   self.policyInputs.portal.value = selectors.portal; self.policyInputs.ps5.value = selectors.ps5;
+   var sources = data.sources || {};
+   self.policySourceState.textContent = '当前规则来源 · Portal ' + ((sources.portal || []).join(' / ') || '等待当前地址') +
+    '；PS5 ' + ((sources.ps5 || []).join(' / ') || '等待当前地址');
+   var activeNode = (data.nodes || []).filter(function(node) { return node.id === active.node; })[0];
+   self.policyActiveNode.textContent = data.enabled ? activeNode && activeNode.label || active.node || '待确认' : '等待启用';
+   self.policyActiveDomains.textContent = data.enabled ? policyHosts(active.domains).length + ' 条配置 + ' +
+    self.dynamicDomainRules().length + ' 条动态规则' : '等待启用';
+   self.policyDynamicRules.textContent = '内置动态认证 / 信令规则 · ' + self.dynamicDomainRules().join('、');
+   self.policyAppliedTime.textContent = (data.receipt || {}).time ? localTime(data.receipt.time * 1000) : '等待应用';
+   self.policyRuntimeSummary.textContent = data.enabled ?
+    '新连接按已应用的设备、域名与端口选择代理出口。重新连接 Portal 后检查访问日志。' :
+    '完成配置后生成启用预览，核对目标范围与应用方式。';
+   self.policyDraftState.textContent = Object.keys(self.policyTouched).length ? '草稿已调整，生成新预览后应用。' :
+    data.enabled && ['node', 'domains', 'ports', 'exclusions'].some(function(key) { return config[key] !== active[key]; }) ?
+     '已保存配置与运行配置有差异，生成预览后更新。' : data.enabled ? '已保存配置与运行配置一致。' : '配置保存后可随时启用。';
+   if (!self.policyPlan) self.policyButtons.apply.textContent = data.enabled ? '更新透明代理' : '启用透明代理';
+   if (self.domainData) self.renderDomains(self.domainData);
+   self.update(self.latest);
+  }).catch(function(error) {
+   self.policyEnvironmentError = true; self.invalidatePolicy();
+   self.policyState.textContent = self.proxyNavNode.textContent = '状态待确认';
+   self.policyBlockers.textContent = '代理环境读取失败：' + error.message;
+   self.updatePolicyControls();
+  }).finally(function() { self.policyRequest = null; });
+  return this.policyRequest;
+ },
+
+ renderProxyTelemetry: function(data) {
+  var telemetry = data.telemetry || {}, probes = data.probes || {};
+  this.policyCoreSummary.textContent = telemetry.fresh && telemetry.sampled_cores ?
+   '已采样 ' + telemetry.sampled_cores + ' 个核心 · 当前所选节点命中 ' + Number(telemetry.matched_connections || 0) + ' 条连接' :
+   '等待新的核心连接记录。启用后重新连接 Portal，可查看实际出口。';
+  if ((telemetry.errors || []).length) this.policyCoreSummary.textContent += '。' + telemetry.errors.join('；');
+  var phases = {AUTH:'认证连接',SIGNALING:'信令连接',CONNECTED:'连接传输',DISCONNECTED:'连接结束'};
+  var routes = {selected:'所选节点',previous:'此前节点',direct:'原有直连',original:'原有出口',unknown:'出口待确认'};
+  var rows = (telemetry.connections || []).slice(0, 10).map(function(row) {
+   return E('tr', { 'class': 'tr' }, [
+    E('td', { 'class': 'td' }, [(row.device === 'ps5' ? 'PS5' : 'Portal') + ' · ', E('span', { 'class': 'pa-domain-name' }, row.domain || row.address)]),
+    E('td', { 'class': 'td' }, phases[row.phase] || row.phase),
+    E('td', { 'class': 'td' }, routes[row.route] || '出口待确认'),
+    E('td', { 'class': 'td' }, row.failure ? '上游响应待检查' :
+     '↑ ' + Math.round(Number(row.bytes_up || 0) / 1024) + ' KB / ↓ ' + Math.round(Number(row.bytes_down || 0) / 1024) + ' KB')]);
+  });
+  this.policyConnections.replaceChildren(rows.length ? E('table', { 'class': 'table' }, [
+   E('thead', {}, E('tr', { 'class': 'tr' }, ['设备 / 域名','推断阶段','实际出口','传输 / 异常'].map(function(label) {
+    return E('th', { 'class': 'th' }, label);
+   }))), E('tbody', {}, rows)]) : E('p', { 'class': 'pa-caption' }, '新的设备连接将在这里显示；阶段依据域名与核心记录推断。'));
+  this.policyProbeState.textContent = probes.epoch ? '最近检测 ' + localTime(probes.epoch * 1000) +
+   (probes.cancelled ? ' · 检测已取消' : probes.current_config === false ? ' · 此前配置检测，重新检测当前出口' :
+    probes.healthy ? ' · 出口连通检查通过' : ' · 部分阶段需要检查') : '检测认证、信令和连通探测出口，并检查固件下载直连。';
+  this.policyProbeResults.replaceChildren.apply(this.policyProbeResults, (probes.targets || []).map(function(row) {
+   var parts = ['路由器 DNS ' + (row.dns && row.dns.ok ? '通过' : '待检查'), '目标 TCP ' + (row.tcp ? '通过' : '待检查')];
+   if (row.tls !== null) parts.push('TLS ' + (row.tls ? '通过' : '待检查'));
+   var failures = {target_connect_failure:'目标连接失败',probe_entry_failure:'检测入口待检查',tls_failure:'TLS 握手失败',certificate_validation:'证书校验失败'};
+   return E('p', { 'class': 'pa-caption' }, [(row.category_label || '') + ' · ', E('span', { 'class': 'pa-domain-name' }, row.domain),
+    ' · ' + (probes.current_config === false ? '此前配置出口' : row.path === 'direct' ? '直连' : '所选节点') + ' · ' + parts.join(' / '),
+    row.failure ? ' · ' + (failures[row.failure] || '检查连接') : '']);
+  }));
+ },
+
+ updatePolicyControls: function() {
+  if (!this.policyButtons) return;
+  var job = ((this.latest || {}).job || {});
+  var busy = !!this.policyPending || !!this.pending || !!job.busy;
+  var selectors = this.deviceSelectors(), ready = !!selectors.portal && !!selectors.ps5 &&
+   this.latest.devices_configured !== false;
+  this.policyButtons.preview.disabled = busy || !ready;
+  this.policyButtons.save.disabled = this.readonly || busy || !ready;
+  this.policyButtons.apply.disabled = this.readonly || busy || !!this.policyEnvironmentError || !this.policyPlan ||
+   !this.policyPlan.can_apply || (this.policyPlan.restart_required && !this.policyConfirm.checked);
+  this.policyButtons.disable.disabled = this.readonly || busy || !(this.policyData || {}).enabled;
+  this.policyButtons.probe.disabled = this.readonly || busy || !(this.policyData || {}).enabled;
+  this.policyButtons.candidates.disabled = this.readonly || busy || !ready;
+  this.policyButtons.cancel.disabled = this.readonly || this.pendingAction === 'stop' ||
+   !job.busy || jobFeature(job.action) !== 'proxy';
+  policyFields.forEach(function(key) { this.policyInputs[key].disabled = this.readonly || busy; }, this);
+  this.policyConfirm.disabled = this.readonly || busy;
+  (this.domainActionButtons || []).forEach(function(button) {
+   button.disabled = this.readonly || busy || button.dataset.chosen === 'true' || !validHost(button.dataset.domain);
+  }, this);
+ },
+
+ policyAction: function(name) {
+  if (name === 'cancel') {
+   if (!this.policyButtons.cancel.disabled) return this.run('stop');
+   return Promise.resolve();
+  }
+  if (this.policyPending || (this.readonly && name !== 'preview') || this.pending || !!(this.latest.job || {}).busy)
+   return Promise.resolve();
+  var self = this, values = this.policyValues(), operation;
+  if (name === 'preview') operation = function() { return callPolicyPreview.apply(null, values); };
+  else if (name === 'save') operation = function() { return callPolicySave.apply(null, values); };
+  else if (name === 'disable') operation = callPolicyDisable;
+  else if (name === 'probe') operation = callPolicyProbe;
+  else {
+   if (!this.policyPlan || !this.policyPlan.can_apply || this.policyEnvironmentError ||
+       (this.policyPlan.restart_required && !this.policyConfirm.checked)) return Promise.resolve();
+   values = values.concat([ this.policyPlan.token, this.policyConfirm.checked ? 1 : 0 ]);
+   operation = function() { return callPolicyApply.apply(null, values); };
+  }
+  if (name === 'preview') { this.invalidatePolicy(); this.selectStage('proxy', 'runtime'); }
+  this.policyPending = true; this.update(this.latest);
+  return rpcRequest(operation).then(function(result) {
+   if (name === 'preview') {
+    self.policyPlan = result; self.policyConfirm.checked = false;
+    self.policyConfirmation.hidden = !result.restart_required;
+    var previewSources = result.sources || {};
+    self.policyPreviewSources.textContent = '预览设备范围 · Portal ' + ((previewSources.portal || []).join(' / ') || '等待当前地址') +
+     '；PS5 ' + ((previewSources.ps5 || []).join(' / ') || '等待当前地址');
+    self.policyPreviewNotice.textContent = (result.notice || '') +
+     (result.validation ? '。保留 ' + Number(result.validation.protection_rules || 0) + ' 条原有直连 / 阻断保护条件。' : '') +
+     ' ' + (((result.entry_scope || {}).notices || []).join('；'));
+    self.policyPreviewBody.replaceChildren.apply(self.policyPreviewBody, (result.rules || []).concat((result.direct_rules || []).map(function(rule) {
+     return Object.assign({}, rule, { direct: true });
+    })).map(function(rule) {
+     return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td' }, rule.domain + (rule.builtin ? ' · 内置动态' : '')),
+      E('td', { 'class': 'td' }, 'TCP ' + rule.ports),
+      E('td', { 'class': 'td' }, rule.direct ? '设备直连 · 原有阻断优先' : rule.excluded ? '排除清单 · 原有策略' :
+       '所选节点 · 排除 / 直连 / 阻断优先') ]);
+    }));
+    self.policyPreview.hidden = false;
+    self.policyNotice.textContent = (result.blockers || []).join('；') || '预览已生成，核对范围后启用透明代理。';
+    self.policyNotice.setAttribute('data-error', String(!result.can_apply));
+    self.policyButtons.apply.textContent = result.restart_required ? '应用并重启 PassWall' :
+     (self.policyData || {}).enabled ? '热更新配置' : '启用透明代理';
+   } else if (name === 'probe') {
+    self.policyNotice.textContent = '正在检测出口连通性，请等待检测结果。';
+    self.policyNotice.setAttribute('data-error', 'false');
+    self.selectStage('proxy', 'runtime');
+   } else {
+    self.invalidatePolicy();
+    self.policyNotice.textContent = self.policyConfigNotice.textContent = name === 'save' ?
+     '代理配置已保存，进入“启用与状态”生成预览。' : name === 'disable' ?
+      '正在停用透明代理，新连接将使用原有策略。' : '正在校验并启用透明代理，请等待任务完成。';
+    self.policyNotice.setAttribute('data-error', 'false');
+    self.policyConfigNotice.setAttribute('data-error', 'false');
+    if (name === 'save') self.policyTouched = {};
+    else self.selectStage('proxy', 'runtime');
+   }
+  }).catch(function(error) {
+   self.policyNotice.textContent = self.policyConfigNotice.textContent = error.message;
+   self.policyNotice.setAttribute('data-error', 'true');
+   self.policyConfigNotice.setAttribute('data-error', 'true');
+   if (name === 'apply') self.invalidatePolicy();
+  }).finally(function() {
+   self.policyPending = false; self.update(self.latest);
+   if (name !== 'preview') { self.refreshPolicy(true); self.refresh(); }
+  });
+ },
+
+ renderPolicy: function() {
+  var self = this;
+  this.policyInputs = {}; this.policyButtons = {}; this.policyTouched = {};
+  this.policyInputs.portal = luciControl('input', { type: 'hidden' });
+  this.policyInputs.ps5 = luciControl('input', { type: 'hidden' });
+  this.policyState = E('strong', { 'class': 'pa-status-pill' }, '正在检测');
+  this.policyEnvironment = E('p', { 'class': 'pa-caption' });
+  this.policyBlockers = E('p', { 'class': 'pa-caption pa-domain-problem', role: 'status' });
+  this.policySourceState = E('p', { 'class': 'pa-caption' });
+  this.policyCoverage = E('p', { 'class': 'pa-caption' });
+  this.policyCoreSummary = E('p', { 'class': 'pa-caption', role: 'status' });
+  this.policyConnections = E('div', { 'class': 'pa-domain-table' });
+  this.policyProbeState = E('p', { 'class': 'pa-caption', role: 'status' });
+  this.policyProbeResults = E('div');
+  this.policyCandidateSummary = E('p', { 'class': 'pa-caption', role: 'status' });
+  this.policyRuntimeSummary = E('p', { 'class': 'pa-caption' });
+  this.policyDraftState = E('p', { 'class': 'pa-caption' });
+  this.policyConfigNotice = E('p', { 'class': 'pa-caption', role: 'status', 'aria-live': 'polite' });
+  this.policyNotice = E('div', { 'class': 'pa-notice alert-message notice', role: 'status', 'aria-live': 'polite' },
+   '生成预览，确认本次代理范围与应用方式。');
+  this.policyActiveNode = E('span'); this.policyActiveDomains = E('span'); this.policyAppliedTime = E('span');
+  function field(key, label, input, help) {
+   input.id = 'psa-policy-' + key; self.policyInputs[key] = input;
+   function changed() {
+    self.policyTouched[key] = true; self.invalidatePolicy();
+    self.policyConfigNotice.textContent = self.policyDraftState.textContent =
+     '代理草稿已调整，保存并生成新预览后应用。';
+    self.policyConfigNotice.setAttribute('data-error', 'false');
+    if (self.domainData) self.renderDomains(self.domainData);
+   }
+   input.addEventListener('input', changed); input.addEventListener('change', changed);
+   return formField(input, label, help);
+  }
+  function button(name, label, kind) {
+   var node = E('button', { type: 'button', 'class': buttonClass(kind),
+    click: function() { return self.policyAction(name); } }, label);
+   self.policyButtons[name] = node; return node;
+  }
+  var form = E('div', { 'class': 'pa-form pa-policy-form' }, [
+   field('node', '代理出口', luciControl('select', {}, E('option', { value: '' }, '选择已有代理节点')),
+    '使用 PassWall 中已有的 Sing-box 普通节点。'),
+   field('ports', '目标 TCP 端口', luciControl('input', { type: 'text', maxlength: 128, placeholder: '443' }),
+    '默认 443；多个端口以逗号分隔。'),
+   field('domains', '需要代理的域名', luciControl('textarea', { rows: 8, maxlength: 8192, spellcheck: 'false' }),
+    '每行一个完整主机名或 *.example.com，支持 full: 前缀。泛匹配覆盖各级子域名；根域名单独填写。动态认证 / 信令自动覆盖。'),
+   field('exclusions', '排除域名', luciControl('textarea', { rows: 8, maxlength: 8192, spellcheck: 'false' }),
+    '支持完整主机名与 *.example.com，优先于动态匹配。固件下载命中排除时，设备 TCP 80 / 443 使用直连；其余排除沿用原策略。原阻断条件继续生效。') ]);
+  this.policyDynamicRules = E('p', { 'class': 'pa-caption' }, '动态认证 / 信令按域名特征自动覆盖，新域名首次连接即可匹配。');
+  this.policyButtons.candidates = E('button', { type: 'button', 'class': buttonClass(),
+   click: function() { return self.addSuggestedDomains(); } }, '补齐未覆盖的必要域名');
+  this.policyConfirm = luciControl('input', { type: 'checkbox', id: 'psa-policy-confirm',
+   change: function() { self.updatePolicyControls(); } });
+  this.policyConfirmation = E('label', { 'class': 'pa-toggle', 'for': 'psa-policy-confirm', hidden: '' },
+   [ this.policyConfirm, '确认重启 PassWall，当前网络连接可能重连' ]);
+  this.policyPreviewSources = E('p', { 'class': 'pa-caption' });
+  this.policyPreviewNotice = E('p', { 'class': 'pa-caption' }); this.policyPreviewBody = E('tbody');
+  this.policyPreview = E('div', { hidden: '' }, [this.policyPreviewSources,
+   E('div', { 'class': 'pa-domain-table pa-policy-table', style: 'margin:18px 0' }, E('table', { 'class': 'table' }, [
+    E('thead', {}, E('tr', { 'class': 'tr' }, [ E('th', { 'class': 'th' }, '域名 / 匹配规则'), E('th', { 'class': 'th' }, '协议与端口'), E('th', { 'class': 'th' }, '匹配后路径') ])),
+    this.policyPreviewBody ])), this.policyPreviewNotice, this.policyConfirmation ]);
+  function status(label, value) {
+   return E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td' }, label), E('td', { 'class': 'td' }, value)]);
+  }
+  return {
+   config: this.panel('代理配置', [
+    E('p', { 'class': 'pa-caption', style: 'margin-bottom:18px' },
+     'Portal 与 PS5 的指定域名、TCP 端口走所选出口，其余连接执行原有规则。'),
+    form, this.policyDynamicRules, this.policyInputs.portal, this.policyInputs.ps5, this.policyConfigNotice,
+    this.policyButtons.candidates, this.policyCandidateSummary,
+    E('div', { 'class': 'pa-config-foot' }, [
+     E('button', { type: 'button', 'class': 'pa-link btn cbi-button cbi-button-neutral', click: function() {
+      self.selectStage('proxy', 'logs'); self.selectLogTab('domains');
+     } }, '从域名访问日志补充配置'),
+     E('div', { 'class': 'pa-actions' }, [ button('save', '保存代理配置', 'primary'),
+      E('button', { type: 'button', 'class': buttonClass(), click: function() { self.selectStage('proxy', 'runtime'); } },
+       '下一步：启用') ]) ]) ]),
+   runtime: E('div', { 'class': 'pa-grid' }, [
+    this.panel('透明代理状态', [ this.policyRuntimeSummary,
+     E('table', { 'class': 'table pa-feature-status' }, E('tbody', {}, [status('当前出口', this.policyActiveNode),
+      status('已应用范围', this.policyActiveDomains), status('最近应用', this.policyAppliedTime)])),
+     this.policySourceState, this.policyDraftState, this.policyBlockers,
+     this.policyPreview, this.policyNotice,
+     E('div', { 'class': 'pa-actions pa-runtime-actions' }, [
+      button('preview', '生成启用预览'), button('apply', '启用透明代理', 'primary'),
+      button('disable', '停用透明代理', 'danger'), button('cancel', '取消任务') ]),
+     E('div', { 'class': 'pa-config-foot' }, [
+      E('button', { type: 'button', 'class': 'pa-link btn cbi-button cbi-button-neutral', click: function() { self.selectStage('proxy', 'config'); } }, '调整代理配置'),
+      E('button', { type: 'button', 'class': 'pa-link btn cbi-button cbi-button-neutral', click: function() { self.showLog('proxy'); } }, '查看启用日志') ])
+    ], this.policyState),
+    this.panel('连接验证', [
+     this.policyCoreSummary, this.policyConnections,
+     E('p', { 'class': 'pa-caption' }, '设备实际命中来自核心记录；阶段按域名与传输推断。短连接可能在采样间完成。'),
+     this.policyProbeState, this.policyProbeResults, button('probe', '检测出口连通性'),
+     E('div', { 'class': 'pa-step' }, [E('span', { 'class': 'pa-step-icon' }, '1'),
+      E('div', {}, [E('b', { 'class': 'pa-step-title' }, '检查访问记录'),
+       E('p', { 'class': 'pa-step-desc' }, '查看新增域名、解析与连接异常，结合设备错误提示判断。')])]),
+     E('div', { 'class': 'pa-step' }, [E('span', { 'class': 'pa-step-icon' }, '2'),
+      E('div', {}, [E('b', { 'class': 'pa-step-title' }, '调整必要范围'),
+       E('p', { 'class': 'pa-step-desc' }, '从日志加入代理或排除清单，再预览并更新配置。')])]),
+     E('button', { type: 'button', 'class': buttonClass(), style: 'margin-top:17px', click: function() {
+      self.selectStage('proxy', 'logs'); self.selectLogTab('domains');
+     } }, '查看域名访问日志'),
+     E('details', { 'class': 'pa-disclosure' }, [E('summary', {}, '代理环境与接管范围'),
+      this.policyEnvironment, this.policyCoverage,
+      E('p', { 'class': 'pa-caption' }, '配置归属显示当前规则范围。实际出口结合 PassWall 核心日志和新连接验证。')])
+    ]) ])
+  };
  },
 
  run: function(name) {
+  if (this.readonly && name !== 'diagnostics' && name !== 'proxy_diagnostics') return Promise.resolve();
+  if (name === 'logging') return this.saveLogging('bitrate');
+  if (name === 'proxy_logging') return this.saveLogging('proxy');
+  if (name === 'incident') return this.markIncident();
+  if (this.buttons[name] && this.buttons[name].disabled && name !== 'stop') return Promise.resolve();
   var self = this, request;
-  if (name === 'configure') {
-   var values = [ 'bridge', 'address', 'ps5_ip', 'portal_ip' ].map(function(key) {
-    return self.fields[key].value.trim();
-   });
+  if (name === 'device_save') {
+   var deviceValues = ['bridge', 'portal_ip', 'ps5_ip'].map(function(key) { return self.fields[key].value.trim(); });
+   if (deviceValues.some(function(value) { return !value; })) {
+    this.deviceNotice.textContent = '请选择 LAN 网桥并填写 Portal / PS5 的内网地址。';
+    this.deviceNotice.setAttribute('data-error', 'true'); return Promise.resolve();
+   }
+   request = function() { return callDeviceSave.apply(null, deviceValues); };
+  }
+  else if (name === 'configure') {
+   var config = this.latest.config || {};
+   var values = [config.bridge || '', this.fields.address.value.trim(), config.ps5_ip || '', config.portal_ip || ''];
    if (values.some(function(value) { return !value; })) {
-    ui.addNotification(null, E('p', '请填写中继、PS5 和 Portal 的地址，并选择 LAN 网桥。'), 'warning');
-    return Promise.resolve();
+    this.bitrateConfigNotice.textContent = '确认设备配置后，填写中继独立地址并保存。'; return Promise.resolve();
    }
    values.push(this.selectedProfile);
    request = function() { return callConfigure.apply(null, values); };
@@ -161,21 +959,29 @@ return view.extend({
   else if (name === 'profile') request = function() { return callProfile(self.selectedProfile); };
   else if (name === 'start') request = function() { return callStart(self.autostart.checked ? 1 : 0); };
   else if (name === 'diagnostics') request = callDiagnostics;
+  else if (name === 'proxy_diagnostics') request = callProxyDiagnostics;
   else request = calls[name];
   var pendingToken = {};
   this.pending = true; this.pendingAction = name; this.pendingToken = pendingToken;
   this.update(this.latest);
   return rpcRequest(request).then(function(result) {
-   if (name === 'diagnostics') {
+   if (name === 'diagnostics' || name === 'proxy_diagnostics') {
+    if (name === 'diagnostics') {
+     delete result.domain_diagnostics;
+     result.privacy = '诊断包含码率增强配置、运行计数、测试有效性与恢复状态；设备地址与 MAC 已遮盖。';
+    }
     var url = URL.createObjectURL(new Blob([ JSON.stringify(result, null, 2) + '\n' ], { type: 'application/json' }));
-    var link = E('a', { href: url, download: 'ps-accel-diagnostics.json' });
+    var link = E('a', { href: url, download: name === 'proxy_diagnostics' ? 'ps-accel-proxy-diagnostics.json' : 'ps-accel-bitrate-diagnostics.json' });
     document.body.appendChild(link);
     link.click();
     link.remove();
     window.setTimeout(function() { URL.revokeObjectURL(url); }, 1000);
    }
    if (name === 'start') self.bootTouched = false;
-   return self.refresh(name !== 'diagnostics');
+   if (name === 'device_save') self.deviceNotice.textContent = '正在确认设备地址与 MAC，请等待保存结果。';
+   else if (name === 'doctor') self.showLog('bitrate');
+   else if (name !== 'diagnostics' && name !== 'proxy_diagnostics' && name !== 'stop') self.selectStage('bitrate', 'runtime');
+   return self.refresh(name !== 'diagnostics' && name !== 'proxy_diagnostics');
   }).catch(function(error) {
    ui.addNotification(null, E('p', error.message || String(error)), 'danger');
   }).finally(function() {
@@ -190,14 +996,60 @@ return view.extend({
   if (!data || !data.ok) return;
   var previousConfig = (this.latest || {}).config || {};
   var job = data.job || {}, config = data.config || {}, env = data.environment || {};
+  var featureJobs = data.feature_jobs || {};
+  var relayJob = featureJobs.bitrate || (jobFeature(job.action) === 'bitrate' ? job : {});
+  var proxyJob = featureJobs.proxy || (jobFeature(job.action) === 'proxy' ? job : {});
+  var deviceJob = featureJobs.devices || (jobFeature(job.action) === 'devices' ? job : {});
   if (this.selectedProfile === previousConfig.profile) this.selectedProfile = config.profile || '65';
   if (job.action === 'profile' && !job.busy && job.applied_profile && job.id !== this.appliedJob) {
    this.selectedProfile = job.applied_profile;
    this.appliedJob = job.id;
   }
+  var oldSelectors = (this.latest || {}).device_selectors || {};
+  var changedDevices = ['portal_ip', 'ps5_ip', 'bridge'].some(function(key) { return previousConfig[key] !== config[key]; }) ||
+   ['portal', 'ps5'].some(function(key) { return oldSelectors[key] !== (data.device_selectors || {})[key]; });
   this.latest = data;
-  if (job.action === 'configure' && job.state === 'complete' && job.id !== this.configuredJob) {
-   this.fieldTouched = {}; this.configuredJob = job.id;
+  if (changedDevices) this.invalidatePolicy();
+  var selectors = this.deviceSelectors();
+  this.policyInputs.portal.value = selectors.portal; this.policyInputs.ps5.value = selectors.ps5;
+  this.scopeNodes.forEach(function(nodes) {
+   nodes.portal.textContent = config.portal_ip || '等待配置'; nodes.ps5.textContent = config.ps5_ip || '等待配置';
+  });
+  this.updatePolicyControls();
+  if (proxyJob.action === 'psportal_apply' || proxyJob.action === 'psportal_disable') {
+   if (proxyJob.busy) this.policyConfigNotice.textContent = this.policyNotice.textContent =
+    actionNames[proxyJob.action] + '中，请等待完成。';
+   else if (proxyJob.id !== this.policyJob) {
+    this.policyJob = proxyJob.id; this.policyPlan = null;
+    if (proxyJob.action === 'psportal_apply' && proxyJob.state === 'complete') {
+     this.policyTouched = {};
+     this.domainActionNotice.hidden = true;
+    }
+    this.policyConfigNotice.textContent = this.policyNotice.textContent = proxyJob.state === 'failed' ? proxyJob.error || '操作失败，请查看任务日志。' :
+     proxyJob.state === 'cancelled' ? '透明代理任务已取消，规则恢复完成。' :
+     proxyJob.action === 'psportal_disable' ? '透明代理已停用，新连接继续执行原有策略。' : '透明代理已启用，可重新连接 Portal 验证。';
+    this.policyNotice.setAttribute('data-error', String(proxyJob.state === 'failed'));
+    this.policyConfigNotice.setAttribute('data-error', String(proxyJob.state === 'failed'));
+    this.nextPolicyRead = 0; this.refreshPolicy(true);
+   }
+  } else if (proxyJob.action === 'psportal_probe') {
+   if (proxyJob.busy) this.policyNotice.textContent = '正在检测出口连通性，请等待检测结果。';
+   else if (proxyJob.id !== this.policyProbeJob) {
+    this.policyProbeJob = proxyJob.id;
+    this.policyNotice.textContent = proxyJob.state === 'failed' ? proxyJob.error || '出口检测失败，请查看启用日志。' :
+     proxyJob.state === 'cancelled' ? '出口检测已取消，代理规则继续运行。' : '出口检测完成，分阶段结果见连接验证。';
+    this.policyNotice.setAttribute('data-error', String(proxyJob.state === 'failed'));
+    this.nextPolicyRead = 0; this.refreshPolicy(true);
+   }
+  }
+  this.updatePolicyControls();
+  if (relayJob.action === 'configure' && relayJob.state === 'complete' && relayJob.id !== this.configuredJob) {
+   delete this.fieldTouched.address; this.configuredJob = relayJob.id;
+  }
+  if (deviceJob.action === 'device_save' && deviceJob.state === 'complete' && deviceJob.id !== this.deviceConfiguredJob) {
+   ['bridge', 'portal_ip', 'ps5_ip'].forEach(function(key) { delete this.fieldTouched[key]; }, this);
+   this.deviceConfiguredJob = deviceJob.id; this.nextDeviceRead = 0;
+   if (this.activeTab === 'devices') this.refreshDevices(true);
   }
   Object.keys(this.fields).forEach(function(key) {
    var input = this.fields[key];
@@ -208,17 +1060,33 @@ return view.extend({
     input.value = config[key];
    }
   }, this);
-  var busy = !!job.busy || !!this.pending;
+  var busy = !!job.busy || !!this.pending || !!this.policyPending;
   var locked = this.readonly || busy || !!this.connectionError || data.state_known === false || this.detailsKnown === false;
   var blocked = !!(data.running || data.engine_alive || data.recovery_required || data.foreign_relay || job.orphan_active);
   var profileBlocked = !!(data.recovery_required || data.foreign_relay ||
    (data.running && data.mode !== 'active') || (data.engine_alive && !data.running) || job.orphan_active);
-  Object.keys(this.fields).forEach(function(key) { this.fields[key].disabled = locked || blocked; }, this);
+  var deviceBlocked = locked || blocked || !!(this.deviceData || {}).proxy_enabled;
+  Object.keys(this.fields).forEach(function(key) {
+   this.fields[key].disabled = key === 'address' ? locked || blocked : deviceBlocked;
+  }, this);
+  this.deviceChoiceButtons.forEach(function(button) {
+   button.disabled = deviceBlocked || !button.dataset.ip;
+  });
+  this.deviceRefreshButton.disabled = !!this.deviceRequest;
+  var devicesReady = !!config.portal_ip && !!config.ps5_ip && data.devices_configured !== false;
+  this.buttons.device_save.disabled = deviceBlocked;
+  var addressChanged = this.fields.address.value.trim() !== (config.address || '');
+  this.buttons.configure.hidden = !!data.configured && !addressChanged;
+  this.buttons.profile.hidden = !data.configured || addressChanged;
   this.profileButtons.forEach(function(button) {
    button.disabled = locked || profileBlocked;
-   button.setAttribute('aria-checked', String(button.dataset.profile === this.selectedProfile));
+   var selected = button.dataset.profile === this.selectedProfile;
+   button.setAttribute('aria-checked', String(selected));
+   button.setAttribute('class', 'pa-profile btn cbi-button ' +
+    (selected ? 'cbi-button-action important' : 'cbi-button-neutral'));
+   button.tabIndex = selected ? 0 : -1;
   }, this);
-  this.buttons.configure.disabled = locked || blocked;
+  this.buttons.configure.disabled = locked || blocked || !devicesReady;
   this.buttons.profile.disabled = locked || profileBlocked || !data.configured || this.selectedProfile === config.profile;
   this.buttons.profile.textContent = data.running ? '保存并自动重启' : '保存码率';
   this.buttons.baseline.disabled = locked || blocked || !data.configured;
@@ -227,24 +1095,53 @@ return view.extend({
   this.buttons.doctor.disabled = this.readonly || busy;
   this.buttons.repair.disabled = !!(this.readonly || busy || data.running || data.engine_alive || data.foreign_relay || job.orphan_active);
   this.buttons.stop.disabled = this.readonly || this.pendingAction === 'stop' ||
+   (job.busy && jobFeature(job.action) !== 'bitrate') ||
    !(job.busy || this.pending || data.running || data.engine_alive || job.orphan_active || data.recovery_required ||
      job.state === 'failed' || this.connectionError || data.state_known === false);
   this.buttons.diagnostics.disabled = this.pendingAction === 'diagnostics';
+  this.buttons.proxy_diagnostics.disabled = this.pendingAction === 'proxy_diagnostics';
+  this.buttons.logging.disabled = this.buttons.proxy_logging.disabled = this.readonly || !!this.loggingPending;
+  this.buttons.incident.disabled = this.readonly || !!this.incidentPending;
+  this.logMode.disabled = this.proxyLogMode.disabled = this.domainEnabled.disabled = this.logTag.disabled = this.buttons.logging.disabled;
+  this.incidentNote.disabled = this.buttons.incident.disabled;
+  if (!this.loggingTouched) {
+   var preferences = data.logging || { mode: 'compact', domains: true, tag: '' };
+   this.logMode.value = this.proxyLogMode.value = preferences.mode; this.domainEnabled.checked = preferences.domains;
+   this.logTag.value = preferences.tag || '';
+  }
   this.autostart.disabled = locked || data.running;
   if (!this.bootTouched) this.autostart.checked = !!data.autostart;
 
   var state = data.running ? (data.mode === 'baseline' ? '连接测试中' : '运行中') : '已停止';
-  if (job.busy) state = (actionNames[job.action] || '操作') + '中';
-  if (job.busy && job.action === 'profile') state = profilePhases[job.phase] || '正在应用码率';
-  if (job.busy && (job.action === 'stop' || job.action === 'repair'))
-   state = profilePhases[job.phase] || '正在停止与恢复';
-  if (job.stopping) state = '正在恢复';
-  if (!job.busy && data.recovery_required) state = '待恢复';
-  if (!job.busy && data.cleanup_pending) state = '清理待重试';
+  if (relayJob.busy) state = (actionNames[relayJob.action] || '操作') + '中';
+  if (relayJob.busy && relayJob.action === 'profile') state = profilePhases[relayJob.phase] || '正在应用码率';
+  if (relayJob.busy && (relayJob.action === 'stop' || relayJob.action === 'repair'))
+   state = profilePhases[relayJob.phase] || '正在停止与恢复';
+  if (relayJob.stopping) state = '正在恢复';
+  if (!relayJob.busy && data.recovery_required) state = '待恢复';
+  if (!relayJob.busy && data.cleanup_pending) state = '清理待重试';
   if (data.state_known === false) state = '状态待确认';
   if (this.connectionError) state = '状态连接中断';
   if (data.foreign_relay) state = '其他中继占用';
   this.stateNode.textContent = state;
+  this.bitrateNavNode.textContent = (config.profile || '65') + ' Mbps · ' + state;
+  this.deviceState.textContent = data.devices_configured || data.configured ? '已确认' : '等待配置';
+  this.deviceNavNode.textContent = data.devices_configured || data.configured ? '已确认 2 台设备' : '等待确认地址';
+  var deviceMessage = '确认两台设备的内网地址，保存后供码率增强、透明代理与域名日志使用。';
+  if (deviceJob.action === 'device_save') {
+   if (deviceJob.busy) {
+    this.deviceState.textContent = this.deviceNavNode.textContent = '正在确认设备';
+    deviceMessage = '正在确认内网地址与 MAC，请保持两台设备开机。';
+   } else if (deviceJob.state === 'complete') deviceMessage = '设备配置已保存，两项功能与域名日志共用已确认的地址。';
+   else if (deviceJob.state === 'failed') deviceMessage = deviceJob.error || '设备确认失败，请刷新设备并查看配置日志。';
+  }
+  if (!deviceJob.busy && (data.running || data.engine_alive))
+   deviceMessage += ' 码率增强运行中，停止并完成网络恢复后可保存设备配置。';
+  if (!deviceJob.busy && (this.deviceData || {}).proxy_enabled)
+   deviceMessage += ' 透明代理已启用，停用后可保存设备配置。';
+  this.deviceNotice.textContent = deviceMessage;
+  this.deviceNotice.setAttribute('data-error', String(deviceJob.action === 'device_save' && deviceJob.state === 'failed'));
+  this.renderDeviceIdentity();
   this.root.setAttribute('data-running', String(!!data.running));
   this.profileNode.textContent = config.profile || '65';
   var observability = data.observability || {}, delayed = data.running && observability.status_fresh === false;
@@ -260,7 +1157,7 @@ return view.extend({
   this.portalNode.textContent = config.portal_ip || '待配对';
   this.ps5Node.textContent = config.ps5_ip || '待配对';
   this.bridgeNode.textContent = config.address || '待设置独立地址';
-  this.steps[0].setAttribute('data-ready', String(!!data.configured));
+  this.steps[0].setAttribute('data-ready', String(!!(data.devices_configured || data.configured)));
   this.steps[1].setAttribute('data-ready', String(!!data.baseline_valid));
   this.steps[2].setAttribute('data-ready', String(!data.recovery_required && !data.foreign_relay));
   this.baselineNode.textContent = data.baseline_reason || '尚未完成连接测试';
@@ -270,46 +1167,49 @@ return view.extend({
   this.archNode.textContent = env.target || env.architecture || '—';
   this.packageNode.textContent = env.package_manager || '—';
   this.modelNode.textContent = env.model || 'OpenWrt 主路由';
-  this.versionNode.textContent = 'PS Accel ' + (env.version || '0.1.2');
+  this.versionNode.textContent = 'PS Accel ' + (env.version || '0.1.5');
   this.telemetryNode.textContent = delayed ? '采样延迟' : Number(observability.write_errors || 0) > 0 ? '记录异常' : '后台记录正常';
   this.telemetryDetail.textContent = '写入错误 ' + Number(observability.write_errors || 0) +
    ' 次 · 舍弃日志 ' + Number(observability.dropped_logs || 0) + ' 条 · 合并快照 ' +
    Number(observability.coalesced_snapshots || 0) + ' 次' +
+   ' · 合并事件 ' + Number(observability.suppressed_logs || 0) + ' 条' +
    (observability.last_error ? '。最近记录错误：' + observability.last_error : '。');
 
-  var message = data.configured ? '连接测试通过后，进行 90 秒试运行，再启动常驻中继。' : '进入设备配置，填写地址并完成设备配对。';
+  var message = data.configured ? '连接测试通过后，进行 90 秒试运行，再启动码率增强。' :
+   devicesReady ? '在配置阶段填写中继独立地址，保存并检查配置后进行连接测试。' : '进入设备配置，确认 Portal / PS5 的内网地址。';
   if (data.baseline_valid) message = '连接准备就绪。选择目标码率，启动中继后重新连接 Portal。';
   if (data.running) message = '中继已运行，新连接使用 ' + config.profile + ' Mbps 目标。停止时会自动恢复设备直达路径。';
-  if (job.busy && job.action === 'configure') message = '正在探测中继地址并配对设备，请保持 PS5 与 Portal 开机。';
-  if (job.busy && job.action === 'baseline') message = '等待日志出现 BASELINE READY，再连接 Portal，检查画面与按键。';
-  if (job.busy && job.action === 'trial') message = '等待日志出现 AUTO READY，再重新连接。90 秒后自动结束并恢复网络。';
-  if (job.busy && job.action === 'start') message = '正在等待 LAN 网桥就绪并启动中继。';
-  if (job.busy && job.action === 'profile') message = (profilePhases[job.phase] || '正在应用码率') +
+  if (relayJob.busy && relayJob.action === 'configure') message = '正在探测中继地址并配对设备，请保持 PS5 与 Portal 开机。';
+  if (relayJob.busy && relayJob.action === 'baseline') message = '等待日志出现 BASELINE READY，再连接 Portal，检查画面与按键。';
+  if (relayJob.busy && relayJob.action === 'trial') message = '等待日志出现 AUTO READY，再重新连接。90 秒后自动结束并恢复网络。';
+  if (relayJob.busy && relayJob.action === 'start') message = '正在等待 LAN 网桥就绪并启动中继。';
+  if (relayJob.busy && relayJob.action === 'profile') message = (profilePhases[relayJob.phase] || '正在应用码率') +
    '。本次操作自动完成网络恢复、保存和重启，请等待完成。';
-  if (job.state === 'complete' && job.action === 'profile') message = job.restarted && data.running ?
+  if (relayJob.state === 'complete' && relayJob.action === 'profile') message = relayJob.restarted && data.running ?
    '码率已保存，中继已自动重启。重新连接 Portal 即可使用 ' + config.profile + ' Mbps 目标。' :
    '码率已保存，连接测试记录保留。启动中继后重新连接 Portal。';
-  if (job.state === 'complete' && job.action === 'trial') message = '试运行完成。确认画面与按键体验后，可启动常驻中继。';
-  if (job.state === 'cancelled') message = '操作已停止，网络恢复完成。';
-  if (job.state === 'failed') message = job.error || '操作失败，请查看日志与诊断摘要。';
-  if (job.state === 'failed' && job.rolled_back) message += ' 原档位已恢复，中继已重新启动。';
-  if (delayed && !job.busy && job.state !== 'failed') message += ' 统计采样延迟，中继进程保持运行。详情见日志诊断。';
-  if (data.recovery_required && !job.busy) message = (job.state === 'failed' ? message + ' ' : '') +
+  if (relayJob.state === 'complete' && relayJob.action === 'trial') message = '试运行完成。确认画面与按键体验后，可启动常驻中继。';
+  if (relayJob.state === 'cancelled') message = '操作已停止，网络恢复完成。';
+  if (relayJob.state === 'failed') message = relayJob.error || '操作失败，请查看日志与诊断摘要。';
+  if (relayJob.state === 'failed' && relayJob.rolled_back) message += ' 原档位已恢复，中继已重新启动。';
+  if (delayed && !relayJob.busy && relayJob.state !== 'failed') message += ' 统计采样延迟，中继进程保持运行。详情见增强日志。';
+  if (data.recovery_required && !relayJob.busy) message = (relayJob.state === 'failed' ? message + ' ' : '') +
    (data.cleanup_pending ? '网络清理待重试，点击“恢复网络”继续完成清理。' :
     '需要完成网络恢复。点击停止，待退出后重试恢复网络。');
-  if (job.cleanup_error && !job.busy && job.cleanup_error !== job.error)
-   message += ' 恢复详情：' + job.cleanup_error;
-  if (job.rollback_error && !job.busy && job.rollback_error !== job.cleanup_error)
-   message += ' 原档位恢复详情：' + job.rollback_error;
-  if (job.orphan_active && !job.busy) message += ' 前次进程仍在退出，点击停止继续完成恢复。';
+  if (relayJob.cleanup_error && !relayJob.busy && relayJob.cleanup_error !== relayJob.error)
+   message += ' 恢复详情：' + relayJob.cleanup_error;
+  if (relayJob.rollback_error && !relayJob.busy && relayJob.rollback_error !== relayJob.cleanup_error)
+   message += ' 原档位恢复详情：' + relayJob.rollback_error;
+  if (relayJob.orphan_active && !relayJob.busy) message += ' 前次进程仍在退出，点击停止继续完成恢复。';
   if (data.foreign_relay) message = '协议引擎由其他提码率插件占用。先在原插件中停止服务，再启动 PS Accel。';
-  if (job.stopping || (job.busy && job.action === 'stop')) message =
-   (profilePhases[job.phase] || '正在停止中继') + '，完成后恢复设备连接。';
+  if (relayJob.stopping || (relayJob.busy && relayJob.action === 'stop')) message =
+   (profilePhases[relayJob.phase] || '正在停止中继') + '，完成后恢复设备连接。';
   var warnings = (data.status_warnings || []).concat(data.details_warnings || []);
   if (warnings.length) message += ' 状态读取提示：' + warnings.join('；') + '。停止与恢复入口可继续重试。';
   if (this.connectionError) message = '状态连接中断：' + this.connectionError + ' 停止与恢复入口保持可重试。';
   this.messageNode.textContent = message;
-  this.messageNode.setAttribute('data-error', String(job.state === 'failed' || (!!data.recovery_required && !job.busy)));
+  if (relayJob.action === 'configure' || relayJob.action === 'profile') this.bitrateConfigNotice.textContent = message;
+  this.messageNode.setAttribute('data-error', String(relayJob.state === 'failed' || (!!data.recovery_required && !relayJob.busy)));
   if (data.sample_time && data.sample_time !== this.lastSample) {
    this.lastSample = data.sample_time;
    this.history.push(Number(data.control_mbps || 0));
@@ -324,11 +1224,16 @@ return view.extend({
 
  render: function(data) {
   var self = this, config = data.config || {};
-  this.fields = {}; this.fieldTouched = {}; this.buttons = {}; this.history = []; this.bars = []; this.logTab = 'log';
-  this.logRequests = {}; this.logContent = {};
-  this.mainTabs = {}; this.mainPanels = {};
-  this.readonly = !L.hasViewPermission();
-  this.selectedProfile = config.profile || '65';
+  this.latest = data; this.fields = {}; this.fieldTouched = {}; this.buttons = {};
+  this.history = []; this.bars = []; this.logTab = 'bitrate'; this.proxyLogTab = 'domains';
+  this.logRequests = {}; this.logContent = {}; this.nextLogRead = {}; this.logTabs = {}; this.proxyLogTabs = {};
+  this.incidentId = ''; this.mainTabs = {}; this.mainPanels = {}; this.stageTabs = {}; this.stagePanels = {};
+  this.activeStages = { bitrate: data.configured ? 'runtime' : 'config', proxy: 'config' };
+  this.scopeNodes = []; this.deviceChoiceButtons = []; this.domainActionButtons = [];
+  this.readonly = !L.hasViewPermission(); this.selectedProfile = config.profile || '65';
+  this.deviceNavNode = E('span', { 'class': 'pa-nav-state' }, '等待确认地址');
+  this.bitrateNavNode = E('span', { 'class': 'pa-nav-state' }, '等待运行');
+  this.proxyNavNode = E('span', { 'class': 'pa-nav-state' }, '点击查看状态');
   this.stateNode = E('span', {}, '正在读取'); this.profileNode = E('span'); this.countNode = E('span');
   this.rateNode = E('span'); this.uptimeNode = E('div', { 'class': 'pa-detail' });
   this.selectionNode = E('div', { 'class': 'pa-selection' });
@@ -337,147 +1242,305 @@ return view.extend({
   this.packetNode = E('span'); this.kernelNode = E('span'); this.archNode = E('span'); this.packageNode = E('span');
   this.modelNode = E('span'); this.versionNode = E('span');
   this.telemetryNode = E('span'); this.telemetryDetail = E('div', { 'class': 'pa-record-detail' });
-  this.messageNode = E('div', { 'class': 'pa-notice', role: 'status', 'aria-live': 'polite' });
-  this.logNode = E('pre', { 'class': 'pa-log', 'aria-label': '操作日志' }, '正在读取日志…');
-  this.autostart = E('input', { type: 'checkbox', id: 'psa-autostart', change: function() { self.bootTouched = true; } });
-  var profiles = data.profiles || ['35', '45', '65', '100', '200'].map(function(value) {
-   return { value: value, label: value + ' Mbps', experimental: value === '200' };
+  this.messageNode = E('div', { 'class': 'pa-notice alert-message notice', role: 'status', 'aria-live': 'polite' });
+  this.deviceNotice = E('div', { 'class': 'pa-notice alert-message notice', role: 'status', 'aria-live': 'polite' },
+   '确认两台设备的内网地址，保存后供码率增强、透明代理与域名日志使用。');
+  this.deviceState = E('span', { 'class': 'pa-status-pill' }); this.deviceConfirmed = E('p', { 'class': 'pa-caption' });
+  this.deviceIdentity = { portal: E('div', { 'class': 'pa-device-identity' }), ps5: E('div', { 'class': 'pa-device-identity' }) };
+  this.deviceChoices = E('datalist', { id: 'psa-device-choices' });
+  this.deviceInventory = E('div', { 'class': 'pa-device-inventory' });
+  this.deviceLogNode = E('pre', { 'class': 'pa-log', 'aria-label': '设备配置日志' }, '保存设备配置后查看地址确认结果。');
+  this.deviceLogDetails = E('details', { 'class': 'pa-disclosure', toggle: function() {
+   if (self.deviceLogDetails.open) self.refreshLogs(true);
+  } }, [E('summary', {}, '设备配置日志'), this.deviceLogNode]);
+  this.deviceLogDetails.open = false;
+  this.logNode = E('pre', { 'class': 'pa-log', id: 'psa-bitrate-log-content', role: 'tabpanel',
+   'aria-label': '码率增强日志' }, '正在读取日志…');
+  this.proxyLogNode = E('pre', { 'class': 'pa-log', id: 'psa-proxy-log-pane-proxy', role: 'tabpanel',
+   'aria-labelledby': 'psa-proxy-log-tab-proxy', 'aria-label': '透明代理启用日志' }, '正在读取日志…');
+  function logMode(id) {
+   return luciControl('select', { id: id }, [ E('option', { value: 'compact' }, '简洁 · 日常运行'),
+    E('option', { value: 'verbose' }, '详细 · 临时排查') ]);
+  }
+  this.logMode = logMode('psa-log-mode'); this.proxyLogMode = logMode('psa-proxy-log-mode');
+  this.logTag = luciControl('input', { id: 'psa-log-tag', type: 'text', maxlength: 64, placeholder: '例如 Portal 升级 4.0' });
+  this.domainEnabled = luciControl('input', { id: 'psa-domain-enabled', type: 'checkbox' });
+  [ this.logMode, this.proxyLogMode, this.logTag, this.domainEnabled ].forEach(function(node) {
+   function changed() {
+    self.loggingTouched = true;
+    if (node === self.logMode) self.proxyLogMode.value = node.value;
+    if (node === self.proxyLogMode) self.logMode.value = node.value;
+   }
+   node.addEventListener('input', changed); node.addEventListener('change', changed);
   });
-  this.profileButtons = profiles.map(function(profile) {
-   var button = E('button', { type: 'button', 'class': 'pa-profile', role: 'radio',
-    'data-profile': profile.value, 'aria-label': profile.label + '，' + profile.description,
-    click: function() { self.selectedProfile = profile.value; self.update(self.latest); } }, [
-    E('strong', {}, profile.value), E('span', {}, 'Mbps'),
-    E('span', {}, profile.value === '65' ? '推荐' : profile.experimental ? '实验' : '\u00a0')
-   ]);
+  this.loggingNotice = E('p', { 'class': 'pa-caption', role: 'status', 'aria-live': 'polite' });
+  this.proxyLoggingNotice = E('p', { 'class': 'pa-caption', role: 'status', 'aria-live': 'polite' });
+  this.incidentNote = luciControl('input', { id: 'psa-incident-note', type: 'text', maxlength: 300,
+   value: 'Portal 连接失败', placeholder: '设备提示、错误码或复现步骤' });
+  this.incidentNotice = E('p', { 'class': 'pa-caption', role: 'status', 'aria-live': 'polite' });
+  this.domainState = E('p', { 'class': 'pa-caption', role: 'status' }, '正在读取域名访问日志…');
+  this.domainHealth = E('p', { 'class': 'pa-caption' });
+  this.domainSearch = luciControl('input', { type: 'text', maxlength: 253, placeholder: '筛选域名',
+   'aria-label': '筛选域名', input: function() { if (self.domainData) self.renderDomains(self.domainData); } });
+  this.domainOnlyProblems = luciControl('input', { type: 'checkbox', change: function() {
+   if (self.domainData) self.renderDomains(self.domainData);
+  } });
+  this.incidentSelect = luciControl('select', { 'aria-label': '选择失败记录', change: function() {
+   self.incidentId = this.value; self.refreshDomains(true);
+  } }, E('option', { value: '' }, '当前域名清单'));
+  this.domainList = E('div', { 'class': 'pa-domain-table pa-domain-list' });
+  this.domainCount = E('p', { 'class': 'pa-caption' });
+  this.domainActionText = E('span');
+  this.domainActionNotice = E('div', { 'class': 'pa-domain-action-notice', hidden: '', role: 'status', 'aria-live': 'polite' },
+   [this.domainActionText, E('button', { type: 'button', 'class': 'pa-link btn cbi-button cbi-button-neutral', click: function() {
+    self.selectStage('proxy', 'config'); self.policyInputs.domains.focus();
+   } }, '检查代理配置')]);
+  this.incidentTitle = E('h4'); this.incidentSummary = E('p', { 'class': 'pa-caption' });
+  this.incidentCandidates = E('div'); this.incidentEvents = E('pre', { 'class': 'pa-log', 'aria-label': '失败窗口域名事件' });
+  this.incidentPanel = E('div', { 'class': 'pa-incident', hidden: '' },
+   [ this.incidentTitle, this.incidentSummary, this.incidentCandidates, this.incidentEvents ]);
+  this.domainPanel = E('div', { id: 'psa-proxy-log-pane-domains', role: 'tabpanel',
+   'aria-labelledby': 'psa-proxy-log-tab-domains' }, [
+   this.domainState,
+   E('div', { 'class': 'pa-domain-tools' }, [ this.domainSearch,
+    E('label', { 'class': 'pa-toggle' }, [ this.domainOnlyProblems, '仅看最近异常' ]),
+    E('button', { type: 'button', 'class': buttonClass(), click: function() { self.refreshDomains(true); } }, '刷新域名') ]),
+   this.domainActionNotice, this.domainList, this.domainCount,
+   E('div', { 'class': 'pa-domain-tools' }, this.incidentSelect), this.incidentPanel,
+   E('details', { 'class': 'pa-disclosure' }, [ E('summary', {}, '采集状态与证据范围'), this.domainHealth,
+    E('p', { 'class': 'pa-caption' }, '配置归属以当前草稿为准，调整后通过预览应用。域名记录提供可见 DNS、TCP 与 TLS 证据。'),
+    E('p', { 'class': 'pa-caption' }, '观测超时表示窗口内缺少响应；共享 IP、加密 DNS、TLS ECH 和硬件加速会影响覆盖。HTTPS 业务错误结合设备提示判断。') ]) ]);
+  this.autostart = luciControl('input', { type: 'checkbox', id: 'psa-autostart', change: function() { self.bootTouched = true; } });
+  var profiles = data.profiles || ['35', '45', '65', '100', '200'].map(function(value) {
+   return { value: value, label: value + ' Mbps', description: '', experimental: value === '200' };
+  });
+  this.profileButtons = profiles.map(function(profile, index) {
+   var button = E('button', { type: 'button', 'class': 'pa-profile btn cbi-button cbi-button-neutral', role: 'radio',
+    'data-profile': profile.value, 'aria-label': profile.value + ' Mbps，' + (profile.description || ''),
+    click: function() { self.selectedProfile = profile.value; self.update(self.latest); },
+    keydown: function(event) {
+     var position;
+     if (event.key === 'ArrowRight' || event.key === 'ArrowDown') position = (index + 1) % profiles.length;
+     else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') position = (index + profiles.length - 1) % profiles.length;
+     else return;
+     event.preventDefault();
+     if (!self.profileButtons[position].disabled) {
+      self.selectedProfile = profiles[position].value; self.update(self.latest); self.profileButtons[position].focus();
+     }
+    } }, [ E('strong', {}, profile.value), E('span', {}, 'Mbps'),
+    E('span', {}, profile.value === '65' ? '推荐起点' : profile.experimental ? '实验档位' : '\u00a0') ]);
    return button;
   });
-  function panel(title, content, extra) {
-   var classes = { '画质与码率': 'pa-bitrate', '中继控制': 'pa-control', '本地连接路径': 'pa-topology',
-    '日志与诊断': 'pa-logs', '主路由环境': 'pa-environment' };
-   return E('section', { 'class': 'pa-panel ' + (classes[title] || '') }, E('div', { 'class': 'pa-panel-body' }, [
-    E('div', { 'class': 'pa-panel-head' }, [ E('h3', {}, title), extra || E('span') ])
-   ].concat(content)));
-  }
+  function panel(title, content, extra, classes) { return self.panel(title, content, extra, classes); }
   function stat(label, value, unit, detail) {
-   return E('div', { 'class': 'pa-stat' }, [ E('div', { 'class': 'pa-label' }, label),
-    E('div', { 'class': 'pa-number' }, [ value, unit ? E('small', {}, unit) : E('span') ]), detail ]);
+   return E('tr', { 'class': 'tr' }, [E('td', { 'class': 'td' }, label),
+    E('td', { 'class': 'td pa-number' }, [value, unit ? E('small', {}, unit) : E('span')]),
+    E('td', { 'class': 'td' }, detail)]);
   }
   function detail(text) { return E('div', { 'class': 'pa-detail' }, text); }
   function step(number, title, description) {
-   return E('div', { 'class': 'pa-step' }, [ E('span', { 'class': 'pa-step-icon' }, number),
-    E('div', {}, [ E('div', { 'class': 'pa-step-title' }, title), description ]) ]);
+   return E('div', { 'class': 'pa-step' }, [E('span', { 'class': 'pa-step-icon' }, number),
+    E('div', {}, [E('div', { 'class': 'pa-step-title' }, title), description])]);
   }
-  this.steps = [ step('1', '设备配对', E('div', { 'class': 'pa-step-desc' }, 'PS5 与 Portal 使用固定地址')),
-   step('2', '连接测试', this.baselineNode), step('3', '网络恢复', this.recoveryNode) ];
+  this.steps = [step('1', '设备配置', E('div', { 'class': 'pa-step-desc' }, '共用已确认的 Portal / PS5 地址')),
+   step('2', '连接测试', this.baselineNode), step('3', '网络恢复', this.recoveryNode)];
   var bridgeNames = (data.bridges || []).slice(), bridgeName = config.bridge || 'br-lan';
   if (bridgeNames.indexOf(bridgeName) < 0) bridgeNames.unshift(bridgeName);
-  var bridge = E('select', {}, bridgeNames.map(function(name) { return E('option', { value: name }, name); }));
+  var bridge = luciControl('select', {}, bridgeNames.map(function(name) { return E('option', { value: name }, name); }));
   bridge.value = bridgeName;
-  function input(value, placeholder) {
-   return E('input', { type: 'text', value: value || '', placeholder: placeholder,
-    maxlength: 80, spellcheck: 'false', autocomplete: 'off' });
+  function input(value, placeholder, list) {
+   var attrs = { type: 'text', value: value || '', placeholder: placeholder, maxlength: 80,
+    spellcheck: 'false', autocomplete: 'off' };
+   if (list) attrs.list = list;
+   return luciControl('input', attrs);
   }
-  var deviceSettings = panel('设备与网桥', [
-    E('div', { 'class': 'pa-form' }, [
-     this.field('bridge', 'LAN 网桥', bridge, '选择 PS5 与 Portal 所在的网桥。'),
-     this.field('address', '中继独立地址', input(config.address, '10.0.0.250/24'), '使用空闲地址，避开主路由地址和 DHCP 动态池。'),
-     this.field('ps5_ip', 'PS5 地址', input(config.ps5_ip, '10.0.0.100'), '建议在主路由设置 DHCP 静态租约。'),
-     this.field('portal_ip', 'Portal 地址', input(config.portal_ip, '10.0.0.101'), '检测时保持两台设备开机。')
-    ]), E('div', { 'class': 'pa-form-footer pa-actions' }, [ this.button('configure', '保存并检测设备'),
-     E('span', { 'class': 'pa-mini' }, '停止中继后修改地址，并重新完成连接测试。') ])
-   ]);
+  var deviceCards = ['portal', 'ps5'].map(function(role) {
+   return E('div', { 'class': 'pa-device-card' }, [
+    E('div', { 'class': 'pa-device-title' }, [E('h4', {}, role === 'portal' ? 'PlayStation Portal' : 'PlayStation 5'),
+     E('span', { 'class': 'pa-mini' }, role === 'portal' ? '串流设备' : '游戏主机')]),
+    self.field(role + '_ip', '内网 IPv4 地址', input(config[role + '_ip'],
+     role === 'portal' ? '10.0.0.101' : '10.0.0.100', 'psa-device-choices'), '可输入地址，或从右侧设备列表选择。'),
+    self.deviceIdentity[role] ]);
+  });
+  this.deviceRefreshButton = E('button', { type: 'button', 'class': buttonClass(), click: function() {
+   return self.refreshDevices(true);
+  } }, '刷新设备');
+  var deviceLayout = E('div', { 'class': 'pa-grid' }, [
+   panel('确认设备地址', [this.deviceNotice, this.field('bridge', '设备所在 LAN 网桥', bridge,
+    '选择 Portal 与 PS5 所在网桥，建议在 OpenWrt 设置 DHCP 静态租约。'),
+    E('div', { 'class': 'pa-device-form' }, deviceCards), this.deviceChoices, this.deviceConfirmed,
+    E('div', { 'class': 'pa-config-foot' }, [E('span', { 'class': 'pa-muted' }, '这组设备供两项功能与域名采集共用。'),
+     E('div', { 'class': 'pa-actions' }, [this.button('device_save', '保存设备配置', 'primary')])]),
+    this.deviceLogDetails], this.deviceState),
+   E('div', { 'class': 'pa-stack' }, [
+    panel('局域网设备', [E('p', { 'class': 'pa-caption' }, '读取当前 DHCP 租约与邻居，保存时确认两台设备的 MAC。'),
+     this.deviceInventory], this.deviceRefreshButton),
+    panel('主路由', [
+     E('div', { 'class': 'pa-kv' }, [E('span', {}, '设备'), this.modelNode]),
+     E('div', { 'class': 'pa-kv' }, [E('span', {}, '平台'), this.archNode]),
+     E('div', { 'class': 'pa-kv' }, [E('span', {}, '内核'), this.kernelNode]),
+     E('div', { 'class': 'pa-kv' }, [E('span', {}, '包管理'), this.packageNode]) ])
+   ]) ]);
+  this.bitrateConfigNotice = E('p', { 'class': 'pa-caption', role: 'status', 'aria-live': 'polite' });
+  var bitrateConfig = panel('码率增强配置', [
+   E('p', { 'class': 'pa-caption' }, '从 65 Mbps 起步，结合游戏画面、无线余量与连接稳定性逐档调整。'),
+   E('div', { 'class': 'pa-profiles', role: 'radiogroup', 'aria-label': '目标码率' }, this.profileButtons),
+   this.selectionNode,
+   E('div', { style: 'margin-top:22px' }, this.field('address', '中继独立地址',
+    input(config.address, '10.0.0.250/24'), '使用同一 LAN 的空闲 IPv4 地址并填写前缀，避开主路由地址与 DHCP 动态池。')),
+   this.bitrateConfigNotice,
+   E('div', { 'class': 'pa-config-foot' }, [E('span', { 'class': 'pa-muted' }, '地址检查与设备配对通过后，开始连接测试。'),
+    E('div', { 'class': 'pa-actions' }, [this.button('configure', '保存并检查配置', 'primary'),
+     this.button('profile', '保存码率', 'primary'),
+     E('button', { type: 'button', 'class': buttonClass(), click: function() { self.selectStage('bitrate', 'runtime'); } },
+      '下一步：运行')])])
+  ]);
   var bars = E('div', { 'class': 'pa-bars', 'aria-label': '最近控制转发速率采样' });
   for (var i = 0; i < 24; i++) { var bar = E('i'); this.bars.push(bar); bars.appendChild(bar); }
-  var tabs = [ [ 'log', '任务输出' ], [ 'events', '中继事件' ] ].map(function(item) {
-   return E('button', { type: 'button', 'class': 'pa-log-tab', role: 'tab', 'aria-selected': String(item[0] === 'log'),
-    click: function(event) {
-     self.logTab = item[0];
-     Array.prototype.forEach.call(event.currentTarget.parentNode.children, function(tab) {
-      tab.setAttribute('aria-selected', String(tab === event.currentTarget));
-     });
-     self.logNode.textContent = self.logContent[item[0]] || '正在读取日志…';
-     self.refreshLogs();
-    } }, item[1]);
-  });
-  this.mainPanels.stream = E('div', { id: 'psa-pane-stream', 'class': 'pa-tab-panel pa-grid',
-   role: 'tabpanel', 'aria-labelledby': 'psa-tab-stream' }, [
-   panel('画质与码率', [ E('p', { 'class': 'pa-caption' }, '从稳定档位起步，结合实际游戏场景逐档调整。'),
-    E('div', { 'class': 'pa-profiles', role: 'radiogroup', 'aria-label': '目标码率' }, this.profileButtons),
-    this.selectionNode, E('div', { 'class': 'pa-actions' }, [ this.button('profile', '保存码率'),
-     E('span', { 'class': 'pa-mini' }, '保留有效连接测试记录') ]) ]),
-   panel('中继控制', [ E('div', {}, this.steps),
-    E('div', { 'class': 'pa-actions', style: 'margin-top:18px' }, [ this.button('baseline', '连接测试 · 60 秒'),
-     this.button('trial', '试运行 · 90 秒') ]),
-    E('label', { 'class': 'pa-toggle', 'for': 'psa-autostart' }, [ this.autostart, '随主路由开机启动' ]),
-    E('div', { 'class': 'pa-actions' }, [ this.button('start', '启动中继', 'primary'), this.button('stop', '停止', 'danger') ]) ])
-  ]);
-  this.mainPanels.devices = E('div', { id: 'psa-pane-devices', 'class': 'pa-tab-panel pa-grid',
-   role: 'tabpanel', 'aria-labelledby': 'psa-tab-devices' }, [ deviceSettings,
+  var bitrateStats = E('table', { 'class': 'table pa-stats' }, E('tbody', {}, [
+   stat('增强状态', this.stateNode, '', this.uptimeNode),
+   stat('目标请求码率', this.profileNode, 'Mbps', detail('新连接握手使用的请求值')),
+   stat('已增强连接', this.countNode, '次', detail('同一握手的重传合并计数')),
+   stat('控制转发', this.rateNode, 'Mbps', bars) ]));
+  var bitrateRuntime = E('div', {}, [bitrateStats, E('div', { 'class': 'pa-grid' }, [
+   panel('运行控制', [this.messageNode,
+    E('div', { 'class': 'pa-actions' }, [this.button('start', '启动码率增强', 'primary'),
+     this.button('stop', '停止并恢复', 'danger')]),
+    E('label', { 'class': 'pa-toggle', 'for': 'psa-autostart' }, [this.autostart, '随主路由开机启动']),
+    E('div', { 'class': 'pa-actions' }, [
+     this.button('baseline', '连接测试 · 60 秒'), this.button('trial', '试运行 · 90 秒')]),
+    E('details', { 'class': 'pa-disclosure' }, [E('summary', {}, '连接准备与恢复状态'), E('div', {}, this.steps)]),
+    E('div', { 'class': 'pa-config-foot' }, [
+     E('button', { type: 'button', 'class': 'pa-link btn cbi-button cbi-button-neutral', click: function() { self.selectStage('bitrate', 'config'); } }, '调整码率配置'),
+     E('button', { type: 'button', 'class': 'pa-link btn cbi-button cbi-button-neutral', click: function() { self.showLog('bitrate'); } }, '查看任务日志')])]),
    E('div', { 'class': 'pa-stack' }, [
-    panel('本地连接路径', [ E('p', { 'class': 'pa-caption' }, '控制流经过主路由的独立网络空间。'),
-     E('div', { 'class': 'pa-flow' }, [ E('div', { 'class': 'pa-device' }, [ E('b', {}, 'Portal'), this.portalNode ]),
-      E('span', { 'class': 'pa-arrow' }, '→'), E('div', { 'class': 'pa-device router' }, [ this.routerNode, this.bridgeNode ]),
-      E('span', { 'class': 'pa-arrow' }, '→'), E('div', { 'class': 'pa-device' }, [ E('b', {}, 'PS5'), this.ps5Node ]) ]),
-     E('div', { 'class': 'pa-path-note' }, '视频回程：PS5 → Portal 直达'),
-     E('div', { 'class': 'pa-kv', style: 'margin-top:13px' }, [ E('span', {}, '控制转发累计'), this.packetNode ]) ]),
-    panel('主路由环境', [ E('div', { 'class': 'pa-kv' }, [ E('span', {}, '设备'), this.modelNode ]),
-     E('div', { 'class': 'pa-kv' }, [ E('span', {}, '目标平台'), this.archNode ]),
-     E('div', { 'class': 'pa-kv' }, [ E('span', {}, '内核'), this.kernelNode ]),
-     E('div', { 'class': 'pa-kv' }, [ E('span', {}, '包管理器'), this.packageNode ]) ])
+    panel('串流路径', [
+     E('p', { 'class': 'pa-caption' }, '控制请求经中继调整，PS5 视频回程直达 Portal。'),
+     E('div', { 'class': 'pa-flow' }, [E('div', { 'class': 'pa-device' }, [E('b', {}, 'Portal'), this.portalNode]),
+      E('span', { 'class': 'pa-arrow' }, '→'), E('div', { 'class': 'pa-device router' }, [this.routerNode, this.bridgeNode]),
+      E('span', { 'class': 'pa-arrow' }, '→'), E('div', { 'class': 'pa-device' }, [E('b', {}, 'PS5'), this.ps5Node])]),
+     E('div', { 'class': 'pa-kv', style: 'margin-top:15px' }, [E('span', {}, '控制转发累计'), this.packetNode]),
+     E('p', { 'class': 'pa-caption' }, '画质与视频吞吐结合真实游戏场景评估。')]),
+    panel('检查与恢复', [
+     E('p', { 'class': 'pa-caption', style: 'margin-bottom:15px' }, '检查主路由依赖，停止增强后恢复设备直达连接。'),
+     E('div', { 'class': 'pa-actions' }, [this.button('doctor', '环境检查'), this.button('repair', '恢复网络', 'danger')])])
+   ])
+  ])]);
+  var bitrateLogTabs = this.navigation([['bitrate', '任务输出'], ['events', '增强事件']],
+   this.logTabs, 'psa-bitrate-log', 'pa-log-tab', this.selectLogTab);
+  Object.keys(this.logTabs).forEach(function(key) { self.logTabs[key].setAttribute('aria-controls', 'psa-bitrate-log-content'); });
+  var bitrateLogs = E('div', { 'class': 'pa-grid' }, [
+   panel('码率增强日志', [
+    E('div', { 'class': 'pa-log-tools' }, [
+     E('ul', { 'class': 'cbi-tabmenu pa-log-tabs', role: 'tablist', 'aria-label': '码率增强日志类型' }, bitrateLogTabs),
+     E('button', { type: 'button', 'class': 'pa-link btn cbi-button cbi-button-neutral', click: function() { self.refreshLogs(true); } }, '刷新日志')]),
+    this.logNode,
+    E('p', { 'class': 'pa-caption' }, '任务输出记录配置检查、测试与恢复；增强事件记录新连接的握手修改。')
+   ], this.button('diagnostics', '导出增强诊断'), 'pa-log-panel'),
+   E('div', { 'class': 'pa-stack' }, [
+    panel('日志设置', [
+     formField(this.logMode, '日志详细程度'),
+     E('p', { 'class': 'pa-caption' }, '简洁模式保留启停、连接修改与异常。详细模式适合临时复现问题，共用于增强与域名观察。'),
+     E('div', { 'class': 'pa-actions', style: 'margin-top:16px' }, this.button('logging', '保存日志设置')),
+     this.loggingNotice]),
+    panel('记录状态', [
+     E('div', { 'class': 'pa-kv' }, [E('span', {}, '日志与统计'), this.telemetryNode]),
+     E('div', { 'class': 'pa-kv' }, [E('span', {}, '事件日志容量'), E('span', {}, '1 MiB / 份 · 2 份备份')]),
+     this.telemetryDetail,
+     E('p', { 'class': 'pa-caption' }, '记录延迟与增强运行状态分别展示，采样延迟时可继续检查进程状态。')])
    ])
   ]);
-  this.mainPanels.logs = E('div', { id: 'psa-pane-logs', 'class': 'pa-tab-panel pa-grid',
-   role: 'tabpanel', 'aria-labelledby': 'psa-tab-logs' }, [
-   panel('日志与诊断', [ E('div', { 'class': 'pa-log-tabs', role: 'tablist', 'aria-label': '日志类型' }, tabs),
-    this.logNode, E('p', { 'class': 'pa-caption', style: 'margin-top:12px' },
-     '导出包含运行与恢复摘要，设备地址及原始报文保留在本机。')
-   ], this.button('diagnostics', '导出诊断')),
+  var policy = this.renderPolicy();
+  var proxyLogTabs = this.navigation([['domains', '域名访问'], ['proxy', '启用日志']],
+   this.proxyLogTabs, 'psa-proxy-log', 'pa-log-tab', this.selectLogTab);
+  var proxyLogs = E('div', { 'class': 'pa-grid' }, [
+   panel('透明代理日志', [
+    E('div', { 'class': 'pa-log-tools' }, [
+     E('ul', { 'class': 'cbi-tabmenu pa-log-tabs', role: 'tablist', 'aria-label': '透明代理日志类型' }, proxyLogTabs),
+     E('button', { type: 'button', 'class': 'pa-link btn cbi-button cbi-button-neutral', click: function() { self.refreshLogs(true); } }, '刷新日志')]),
+    this.proxyLogNode, this.domainPanel
+   ], this.button('proxy_diagnostics', '导出代理诊断'), 'pa-log-panel'),
    E('div', { 'class': 'pa-stack' }, [
-    panel('记录状态', [ E('div', { 'class': 'pa-kv' }, [ E('span', {}, '日志与统计'), this.telemetryNode ]),
-     E('div', { 'class': 'pa-kv' }, [ E('span', {}, '事件日志容量'), E('span', {}, '每份 1 MiB · 保留 2 份备份') ]),
-     this.telemetryDetail, E('p', { 'class': 'pa-caption', style: 'margin-top:12px' },
-      '写入延迟会合并统计快照。记录状态与中继运行状态分别显示。') ]),
-    panel('维护操作', [ E('p', { 'class': 'pa-caption', style: 'margin-bottom:15px' },
-     '检查主路由依赖，或在中继停止后恢复设备直达路径。'),
-     E('div', { 'class': 'pa-actions' }, [ this.button('doctor', '环境检查'), this.button('repair', '恢复网络', 'danger') ]) ])
+    panel('域名日志设置', [
+     E('label', { 'class': 'pa-toggle', 'for': 'psa-domain-enabled', style: 'margin-top:0' },
+      [this.domainEnabled, '记录 Portal / PS5 域名访问']),
+     E('p', { 'class': 'pa-caption' }, '透明代理停用期间也可采集，便于连接前后比较。关闭后保留已有记录。'),
+     formField(this.proxyLogMode, '日志详细程度'),
+     formField(this.logTag, '本轮排查标记'),
+     E('p', { 'class': 'pa-caption' }, '升级或调整配置前保存新标记，随后首次出现的域名标为“本轮新增”。'),
+     E('div', { 'class': 'pa-actions', style: 'margin-top:16px' }, this.button('proxy_logging', '保存域名日志设置')),
+     this.proxyLoggingNotice]),
+    panel('连接失败回溯', [
+     formField(this.incidentNote, '设备提示或失败描述'),
+     E('div', { 'class': 'pa-actions', style: 'margin-top:14px' }, this.button('incident', '记录这次失败')),
+     this.incidentNotice,
+     E('p', { 'class': 'pa-caption' }, '回溯前 180 秒、后 15 秒。结合异常域名调整代理清单，保留最近 32 次记录。')])
    ])
   ]);
-  var mainItems = [ [ 'stream', '串流控制' ], [ 'devices', '设备配置' ], [ 'logs', '日志诊断' ] ];
-  var mainTabs = mainItems.map(function(item, index) {
-   var button = E('button', { id: 'psa-tab-' + item[0], type: 'button', 'class': 'pa-main-tab',
-    role: 'tab', 'aria-controls': 'psa-pane-' + item[0],
-    click: function() { self.selectTab(item[0]); },
-    keydown: function(event) {
-     var position = index;
-     if (event.key === 'ArrowRight') position = (index + 1) % mainItems.length;
-     else if (event.key === 'ArrowLeft') position = (index + mainItems.length - 1) % mainItems.length;
-     else if (event.key === 'Home') position = 0;
-     else if (event.key === 'End') position = mainItems.length - 1;
-     else return;
-     event.preventDefault();
-     self.selectTab(mainItems[position][0], true);
-    } }, item[1]);
-   self.mainTabs[item[0]] = button;
-   return button;
-  });
-  this.root = E('div', { 'class': 'ps-accel' }, [ E('style', {}, styles),
-   E('header', { 'class': 'pa-head' }, [ E('div', { 'class': 'pa-brand' }, [ E('div', { 'class': 'pa-mark' }, 'P'),
-    E('div', {}, [ E('h2', {}, 'PS Accel'), E('div', { 'class': 'pa-sub' }, 'PS5 × Portal · 本地串流控制') ]) ]),
-    E('span', { 'class': 'pa-chip' }, [ E('i', { 'class': 'pa-dot' }), 'OpenWrt 主路由' ]) ]),
-   E('div', { 'class': 'pa-stats' }, [ stat('中继状态', this.stateNode, '', this.uptimeNode),
-    stat('目标码率', this.profileNode, 'Mbps', detail('下一次新连接使用的请求值')),
-    stat('已修改连接', this.countNode, '次', detail('每次握手重传合并计数')),
-    stat('控制转发', this.rateNode, 'Mbps', bars) ]),
-   E('nav', { 'class': 'pa-main-tabs', role: 'tablist', 'aria-label': '控制台功能' }, mainTabs),
-   this.messageNode, this.mainPanels.stream, this.mainPanels.devices, this.mainPanels.logs,
-   E('footer', { 'class': 'pa-foot' }, [ this.versionNode,
-    E('span', {}, '本地运行 · 原生 LuCI · 主路由网络隔离') ])
+  function heading(title, caption) {
+   return E('div', { 'class': 'pa-feature-head' }, [E('div', {}, [
+    E('h3', {}, title), E('p', { 'class': 'pa-caption' }, caption)])]);
+  }
+  function scope() {
+   var portal = E('span'), ps5 = E('span'); self.scopeNodes.push({portal: portal, ps5: ps5});
+   return E('div', { 'class': 'pa-scope' }, [
+    E('div', { 'class': 'pa-scope-copy' }, [
+     E('span', {}, [E('b', {}, 'Portal'), portal]), E('span', {}, [E('b', {}, 'PS5'), ps5])]),
+    E('button', { type: 'button', 'class': 'pa-link btn cbi-button cbi-button-neutral', click: function() { self.selectTab('devices'); } }, '设备配置')]);
+  }
+  function feature(name, title, caption, panels, labels) {
+   self.stageTabs[name] = {}; self.stagePanels[name] = {};
+   var stageItems = ['config', 'runtime', 'logs'].map(function(key, index) {
+    return [key, labels[index]];
+   });
+   var tabs = self.navigation(stageItems, self.stageTabs[name], 'psa-' + name, 'pa-stage', function(key, focus) {
+    self.selectStage(name, key, focus);
+   });
+   var nodes = ['config', 'runtime', 'logs'].map(function(key) {
+    var node = E('div', { id: 'psa-' + name + '-pane-' + key, 'class': 'pa-stage-panel', role: 'tabpanel',
+     'aria-labelledby': 'psa-' + name + '-tab-' + key }, panels[key]);
+    self.stagePanels[name][key] = node; return node;
+   });
+   return E('div', { id: 'psa-pane-' + name, 'class': 'pa-tab-panel', role: 'tabpanel',
+    'aria-labelledby': 'psa-tab-' + name }, [heading(title, caption), scope(),
+     E('ul', { 'class': 'cbi-tabmenu pa-stages', role: 'tablist', 'aria-label': title + '操作阶段' }, tabs)].concat(nodes));
+  }
+  this.mainPanels.devices = E('div', { id: 'psa-pane-devices', 'class': 'pa-tab-panel', role: 'tabpanel',
+   'aria-labelledby': 'psa-tab-devices' }, [
+    heading('设备配置', '确认 Portal 与 PS5 的内网地址，两项功能共用一组设备。'), deviceLayout]);
+  this.mainPanels.bitrate = feature('bitrate', '码率增强', '配置目标码率，完成连接测试，再启动并观察运行状态。',
+   {config: bitrateConfig, runtime: bitrateRuntime, logs: bitrateLogs}, ['配置', '运行与状态', '日志']);
+  this.mainPanels.proxy = feature('proxy', '透明代理', '配置必要域名与出口，启用后用访问日志持续调整范围。',
+   {config: policy.config, runtime: policy.runtime, logs: proxyLogs}, ['配置', '启用与状态', '日志']);
+  var mainItems = [
+   ['devices', [E('span', {}, '设备配置'), this.deviceNavNode]],
+   ['bitrate', [E('span', {}, '码率增强'), this.bitrateNavNode]],
+   ['proxy', [E('span', {}, '透明代理'), this.proxyNavNode]]
+  ];
+  var mainTabs = this.navigation(mainItems, this.mainTabs, 'psa', 'pa-main-tab', this.selectTab);
+  this.root = E('div', { 'class': 'cbi-map ps-accel' }, [
+   E('style', {}, styles),
+   E('h2', {}, 'PS Accel'),
+   E('div', { 'class': 'cbi-map-descr' }, '设备配置 · 码率增强 · 透明代理'),
+   this.readonly ? E('div', { 'class': 'pa-readonly alert-message notice' }, '当前为只读权限，可查看状态、日志与代理预览。') : E('span'),
+   E('ul', { 'class': 'cbi-tabmenu pa-main-tabs', role: 'tablist', 'aria-label': '一级功能' }, mainTabs),
+   this.mainPanels.devices, this.mainPanels.bitrate, this.mainPanels.proxy,
+   E('footer', { 'class': 'pa-foot' }, this.versionNode)
   ]);
-  var rgb = window.getComputedStyle(document.body).color.match(/\d+/g);
-  this.root.setAttribute('data-theme', rgb && Number(rgb[0]) + Number(rgb[1]) + Number(rgb[2]) > 480 ? 'dark' : 'light');
-  this.selectTab(data.configured ? 'stream' : 'devices');
+  this.selectLogTab('bitrate'); this.selectLogTab('domains');
+  ['bitrate', 'proxy'].forEach(function(name) {
+   var selected = self.activeStages[name];
+   Object.keys(self.stageTabs[name]).forEach(function(key) {
+    setTabState(self.stageTabs[name][key], key === selected);
+    self.stagePanels[name][key].hidden = key !== selected;
+   });
+  });
   this.update(data);
+  var hash = (window.location && window.location.hash || '').replace(/^#/, '').split('/');
+  var initial = {stream: 'bitrate', psportal: 'proxy'}[hash[0]] || hash[0];
+  this.selectTab(this.mainTabs[initial] ? initial : (data.devices_configured || data.configured ? 'bitrate' : 'devices'));
+  if (hash[1] && this.stageTabs[this.activeTab]) this.selectStage(this.activeTab, hash[1]);
+  if (hash[2]) this.selectLogTab(hash[2]);
   poll.add(function() { return self.refresh(); }, 3);
   return this.root;
  },

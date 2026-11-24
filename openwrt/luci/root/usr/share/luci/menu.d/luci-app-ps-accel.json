@@ -1,6 +1,6 @@
 {
   "admin/services/ps-accel": {
-    "title": "PS Accel 串流增强",
+    "title": "PS Accel",
     "order": 65,
     "action": {
       "type": "view",

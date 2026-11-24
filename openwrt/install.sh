@@ -12,6 +12,8 @@ command -v uci >/dev/null 2>&1 || fail '系统需要 UCI。'
 [ ! -e "$APP" ] || fail 'PS Accel 已安装。先停止并卸载已有版本，保留配置。'
 [ ! -e /etc/init.d/ps-accel ] || fail '系统已有 PS Accel 服务，请先停止并卸载。'
 [ ! -e /usr/sbin/ps-accel ] || fail '系统已有 PS Accel 命令，请先停止并卸载。'
+[ ! -e /etc/init.d/ps-accel-observe ] || fail '系统已有设备域名观察服务，请先停止并卸载。'
+[ ! -e /etc/init.d/ps-accel-policy ] || fail '系统已有精确分流管理服务，请先停止并卸载。'
 [ ! -e /var/run/netns/ps-accel ] || fail '请先完成已有中继的网络恢复。'
 [ ! -e /var/run/portal-lab-capture.lock ] || fail '请先停止原提码率插件并完成网络恢复。'
 
@@ -27,11 +29,11 @@ if [ "$offline" = 1 ]; then
 elif command -v apk >/dev/null 2>&1; then
 	echo '使用 apk 安装当前固件依赖。'
 	apk update
-	apk add python3 scapy ip-full kmod-veth libpcap luci-base rpcd
+	apk add python3 scapy ip-full kmod-veth libpcap luci-base rpcd ca-bundle
 elif command -v opkg >/dev/null 2>&1; then
 	echo '使用 opkg 安装当前固件依赖。'
 	opkg update
-	opkg install python3 scapy ip-full kmod-veth libpcap luci-base rpcd
+	opkg install python3 scapy ip-full kmod-veth libpcap luci-base rpcd ca-bundle
 else
 	fail '请检查本机 apk / opkg 包管理器。'
 fi
@@ -58,7 +60,15 @@ cp "$HERE"/app/* "$APP/"
 chmod 600 "$APP"/*
 cp "$HERE/files/ps-accel" /usr/sbin/ps-accel
 cp "$HERE/files/ps-accel.init" /etc/init.d/ps-accel
-chmod 755 /usr/sbin/ps-accel /etc/init.d/ps-accel
+cp "$HERE/files/ps-accel-observe" /usr/sbin/ps-accel-observe
+cp "$HERE/files/ps-accel-observe.init" /etc/init.d/ps-accel-observe
+cp "$HERE/files/ps-accel-policy" /usr/sbin/ps-accel-policy
+cp "$HERE/files/ps-accel-policy.init" /etc/init.d/ps-accel-policy
+chmod 755 /usr/sbin/ps-accel /etc/init.d/ps-accel /usr/sbin/ps-accel-observe /etc/init.d/ps-accel-observe /usr/sbin/ps-accel-policy /etc/init.d/ps-accel-policy
+if [ ! -e /etc/ps-accel/observability.json ]; then
+	cp "$HERE/files/observability.json" /etc/ps-accel/observability.json
+fi
+chmod 600 /etc/ps-accel/observability.json
 (
 	umask 022
 	cp -R "$HERE/luci/root/." /
@@ -72,6 +82,9 @@ chmod 600 /etc/config/ps_accel
 uci set ps_accel.main.enabled=0
 uci commit ps_accel
 /etc/init.d/ps-accel disable
+if ! /etc/init.d/ps-accel-observe enable; then echo '域名观察开机启动设置待检查。' >&2; fi
+if ! /etc/init.d/ps-accel-observe start; then echo '域名观察启动待检查，串流管理界面可继续使用。' >&2; fi
+if [ -f /etc/ps-accel/psportal/manifest.json ]; then /usr/sbin/ps-accel-policy resume; fi
 rm -f /tmp/luci-indexcache*
 if /etc/init.d/rpcd running >/dev/null 2>&1; then /etc/init.d/rpcd reload; fi
-echo '安装完成。进入 服务 → PS Accel 串流增强，检测设备并完成连接测试。'
+echo '安装完成。进入 服务 → PS Accel，检测设备并完成连接测试。'

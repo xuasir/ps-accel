@@ -1,14 +1,14 @@
 {
   "luci-app-ps-accel": {
-    "description": "配置 PS Accel 串流增强与导出诊断摘要",
+    "description": "管理设备配置、码率增强、透明代理与本地诊断",
     "read": {
       "ubus": {
-        "ps-accel": ["status", "details", "logs", "diagnostics"]
+        "ps-accel": ["status", "details", "devices", "logs", "diagnostics", "proxy_diagnostics", "domains", "psportal_status", "psportal_preview"]
       }
     },
     "write": {
       "ubus": {
-        "ps-accel": ["configure", "profile", "baseline", "trial", "start", "stop", "repair", "doctor"]
+        "ps-accel": ["device_save", "configure", "profile", "baseline", "trial", "start", "stop", "repair", "doctor", "logging", "incident", "psportal_save", "psportal_apply", "psportal_disable", "psportal_probe"]
       }
     }
   }

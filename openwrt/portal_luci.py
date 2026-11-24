@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 import datetime
 import fcntl
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,13 @@ import uuid
 import re
 
 import portal_openwrt as port
+import portal_policy as policy
 from profiles import public_profiles
+from domain_tracker import host_name
+from sony_domains import candidates, domain_info, dynamic_rule_info
+from observability import (LogPreferences, OBSERVATION_LIMIT, correlate, load_preferences, merge_events, new_incident,
+                           read_bounded, read_domain_events, read_incidents, record_failure,
+                           save_incident, save_preferences)
 
 JOBS = port.RUNTIME / 'luci'
 SERVICE = '/etc/init.d/ps-accel'
@@ -25,10 +32,16 @@ CHILD_TIMEOUTS = {'configure': 120, 'baseline': 180, 'try': 210, 'doctor': 45,
                   'repair': 45, 'profile': 30, 'start': 20, 'stop': 20}
 TERMINAL_STATES = {'complete', 'cancelled', 'failed'}
 READ_ERRORS = (OSError, ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError)
-METHODS = {'status': {}, 'details': {}, 'logs': {'kind': ''},
+METHODS = {'status': {}, 'details': {}, 'devices': {}, 'device_save': {key: '' for key in port.DEVICE_FIELDS},
+           'logs': {'kind': ''},
            'configure': {'bridge': '', 'address': '', 'ps5_ip': '', 'portal_ip': '', 'profile': ''},
-           'profile': {'profile': ''}, 'diagnostics': {},
+           'profile': {'profile': ''}, 'diagnostics': {}, 'proxy_diagnostics': {},
+           'logging': {'mode': '', 'domains': 0, 'tag': ''}, 'domains': {'incident': ''}, 'incident': {'note': ''},
            'baseline': {}, 'trial': {}, 'start': {'autostart': 0}, 'stop': {}, 'repair': {}, 'doctor': {}}
+METHODS.update({'psportal_status': {}, 'psportal_preview': {key: '' for key in policy.FIELDS},
+                'psportal_save': {key: '' for key in policy.FIELDS},
+                'psportal_apply': dict({key: '' for key in policy.FIELDS}, token='', confirm_restart=0),
+                'psportal_disable': {}, 'psportal_probe': {}})
 
 
 def optional(path, default=None):
@@ -97,7 +110,29 @@ def update_job(job_id, **values):
         if job.get('id') != job_id:
             raise RuntimeError('Job ownership changed')
         job.update(values)
-        port.atomic(JOBS / 'job.json', job)
+        record_job(job)
+
+
+def record_job(job):
+    port.atomic(JOBS / 'job.json', job)
+    try:
+        port.atomic(JOBS / (job_log_kind(job.get('action', '')) + '.json'), job)
+    except READ_ERRORS as exc:
+        message('功能任务摘要保存待确认：' + str(exc), error=True)
+
+
+def feature_jobs(current):
+    result = {}
+    for kind in ('devices', 'bitrate', 'proxy'):
+        job = current if current.get('id') and job_log_kind(current.get('action', '')) == kind else optional(JOBS / (kind + '.json'))
+        if job:
+            job = dict(job)
+            if job.get('id') != current.get('id'):
+                job['busy'] = False
+                if job.get('state') in ('queued', 'running'):
+                    job.update(state='failed', error='此前后台任务结束，结果待确认，请查看本功能日志')
+            result[kind] = job
+    return result
 
 
 def message(text, error=False):
@@ -191,7 +226,7 @@ def status():
             'recovery_required': bool((recovery_pending or resources_present) and not running),
             'cleanup_pending': bool(resources_present and not recovery_pending and not service['process_alive']),
             'modified': counts.get('unique_modified_startups', 0),
-            'last_modified': report.get('last_mutation'), 'job': job,
+            'last_modified': report.get('last_mutation'), 'job': job, 'feature_jobs': feature_jobs(job),
             'counts': counts, 'sample_time': report.get('time') if stats_fresh else None,
             'control_mbps': report.get('control_mbps', 0) if running and stats_fresh else 0,
             'uptime_seconds': elapsed if running and managed else report.get('uptime_seconds', 0) if running else 0,
@@ -219,17 +254,255 @@ def details():
             autostart = port.command(SERVICE, 'enabled', check=False, timeout=3).returncode == 0
     except READ_ERRORS as exc:
         warnings.append('开机启动状态读取失败：' + str(exc))
-    return {'ok': True, 'config': config, 'configured': (port.PERSIST / 'auto-config.json').exists(),
+    try:
+        preferences = load_preferences(port.PERSIST / 'observability.json')
+    except (OSError, ValueError, TypeError) as exc:
+        preferences = LogPreferences()
+        warnings.append('日志偏好读取失败：' + str(exc))
+    binding = port.device_binding(values)
+    enrollment = optional(port.PERSIST / 'auto-config.json')
+    paired = (enrollment.get('network') == {'interface': port.IFACE, 'ps5_ip': config['ps5_ip'],
+                                            'portal_ip': config['portal_ip']})
+    return {'ok': True, 'config': config, 'configured': paired,
+            'devices_configured': bool(binding),
+            'device_selectors': {role: binding.get(role + '_mac', config.get(role + '_ip', ''))
+                                 for role in ('portal', 'ps5')},
             'details_revision': revision, 'details_warnings': warnings,
             'bridges': sorted(p.parent.name for p in port.SYSNET.glob('*/bridge') if p.is_dir()),
             'autostart': autostart, 'baseline_saved': (port.PERSIST / 'baseline.json').exists(),
             'baseline_valid': baseline['valid'], 'baseline_reason': baseline['reason'],
-            'environment': port.environment(), 'profiles': public_profiles()}
+            'environment': port.environment(), 'profiles': public_profiles(),
+            'logging': port.asdict(preferences)}
+
+
+def devices():
+    values = port.uci_values()
+    binding = port.device_binding(values)
+    return {'ok': True, 'config': {key: values.get(key, '') for key in port.DEVICE_FIELDS},
+            'configured': bool(binding), 'binding': binding, 'devices': policy.inventory(),
+            'proxy_enabled': bool(policy.read(policy.folder() / 'manifest.json').get('enabled'))}
+
+
+def save_devices(request):
+    """Confirm LAN identities without creating a relay namespace or changing proxy rules."""
+    request = port.validate_devices(request)
+    with port.exclusive(), policy.lock():
+        if (port.ENGINE_LOCK.exists() or (port.RUNTIME / 'recovery-required').exists()
+                or port.HANDLE.exists() or (port.SYSNET / port.HOST).exists()):
+            raise RuntimeError('请先停止码率增强并完成网络恢复，再保存设备配置')
+        if policy.read(policy.folder() / 'manifest.json').get('enabled'):
+            raise RuntimeError('请先停用透明代理，再保存设备配置')
+        if not (port.SYSNET / request['bridge'] / 'bridge').is_dir():
+            raise ValueError('所选 LAN 网桥待就绪，请检查设备所在网络')
+        addresses = json.loads(port.command('ip', '-j', 'addr', 'show', 'dev', request['bridge'], timeout=3).stdout)
+        networks = [ipaddress.IPv4Interface(str(item['local']) + '/' + str(item['prefixlen']))
+                    for row in addresses for item in row.get('addr_info', []) if item.get('family') == 'inet']
+        for role in ('portal', 'ps5'):
+            ip = ipaddress.IPv4Address(request[role + '_ip'])
+            if not any(ip in item.network and ip not in (item.ip, item.network.network_address,
+                                                         item.network.broadcast_address) for item in networks):
+                raise ValueError('两台设备需要使用所选 LAN 网桥内的独立地址')
+        inventory = policy.inventory()
+        missing = [request[role + '_ip'] for role in ('portal', 'ps5') if not any(
+            request[role + '_ip'] in item['addresses'] for item in inventory)]
+        for ip in missing:
+            try:
+                port.command('ping', '-I', request['bridge'], '-c', '1', '-W', '1', ip, check=False, timeout=3)
+            except READ_ERRORS:
+                pass
+        if missing:
+            inventory = policy.inventory()
+        binding = {'config': request, 'confirmed_at': time.time()}
+        for role in ('portal', 'ps5'):
+            matches = [item['mac'] for item in inventory if request[role + '_ip'] in item['addresses']]
+            if len(set(matches)) != 1:
+                raise ValueError(('Portal' if role == 'portal' else 'PS5') +
+                                 ' 地址与 MAC 待确认，请保持设备开机并刷新设备列表')
+            binding[role + '_mac'] = matches[0]
+        if binding['portal_mac'] == binding['ps5_mac']:
+            raise ValueError('Portal 与 PS5 对应同一设备，请核对地址')
+        previous = port.uci_values()
+        old_binding = port.device_binding(previous)
+        paths = [port.CONFIG_FILE, port.PERSIST / 'devices.json', port.PERSIST / 'auto-config.json',
+                 port.PERSIST / 'baseline.json', port.RUNTIME / 'auto-baseline.json']
+        backups = {path: path.read_bytes() if path.exists() else None for path in paths}
+        try:
+            for key, value in request.items():
+                port.command('uci', 'set', 'ps_accel.main.' + key + '=' + value)
+            port.command('uci', 'set', 'ps_accel.main.enabled=0')
+            port.command('uci', 'commit', 'ps_accel')
+            port.atomic(port.PERSIST / 'devices.json', binding)
+            changed = (any(previous.get(key, '') != value for key, value in request.items()) or
+                       any(old_binding.get(role + '_mac') != binding[role + '_mac'] for role in ('portal', 'ps5')))
+            if changed:
+                for path in paths[2:]:
+                    path.unlink(missing_ok=True)
+        except Exception:
+            port.command('uci', 'revert', 'ps_accel', check=False)
+            for path, content in backups.items():
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(content)
+                    path.chmod(0o600)
+            raise
+    message('设备地址已确认，码率增强与透明代理共用这组设备。')
+    try:
+        port.command('/etc/init.d/ps-accel-observe', 'start', check=False, timeout=3)
+    except READ_ERRORS as exc:
+        message('域名观察服务启动待确认：' + str(exc), error=True)
+
+
+def job_log_kind(action):
+    if isinstance(action, str) and action.startswith('psportal_'):
+        return 'proxy'
+    return 'devices' if action == 'device_save' else 'bitrate'
 
 
 def logs(kind):
-    path = JOBS / 'job.log' if kind == 'log' else port.RUNTIME / 'events.log'
+    if kind == 'events':
+        path = port.RUNTIME / 'events.log'
+    elif kind == 'log':
+        path = JOBS / 'job.log'
+    else:
+        path = JOBS / (kind + '.log')
+        # Retain access to a pre-upgrade job until its feature gets a new task.
+        if not path.exists() and job_log_kind(optional(JOBS / 'job.json').get('action', '')) == kind:
+            path = JOBS / 'job.log'
     return {'ok': True, 'kind': kind, 'text': tail(path)}
+
+
+def domains(incident_id=''):
+    try:
+        preferences = load_preferences(port.PERSIST / 'observability.json')
+    except (OSError, ValueError, TypeError):
+        preferences = LogPreferences()
+    try:
+        report = read_bounded(port.RUNTIME / 'domains.json')
+        if not isinstance(report, dict):
+            report = {}
+    except (OSError, ValueError):
+        report = {}
+    items = report.get('domains', [])
+    inventory_source = False
+    if not items:
+        try:
+            inventory = read_bounded(port.PERSIST / 'domains.json')
+            items = inventory.get('domains', [])
+            inventory_source = True
+        except (OSError, ValueError, AttributeError):
+            items = []
+    if not isinstance(items, list):
+        items = []
+    paired = {}
+    if inventory_source:
+        try:
+            identity_path = port.PERSIST / 'devices.json'
+            paired = read_bounded(identity_path if identity_path.exists() else port.PERSIST / 'auto-config.json', 16384)
+            if not isinstance(paired, dict):
+                paired = {}
+        except (OSError, ValueError):
+            paired = {}
+    rows = []
+    for item in items[:512]:
+        if not isinstance(item, dict):
+            continue
+        if item.get('device') not in ('ps5', 'portal') or not isinstance(item.get('domain'), str):
+            continue
+        try:
+            host_name(item['domain'])
+        except ValueError:
+            continue
+        if inventory_source and item.get('device_mac') != paired.get(item.get('device', '') + '_mac'):
+            continue
+        row = {key: item[key] for key in ('device', 'domain', 'first_epoch', 'last_epoch', 'first_seen',
+                                        'last_seen', 'counts', 'addresses', 'last_problem') if key in item}
+        row['new_since_tag'] = bool(preferences.tag and isinstance(row.get('first_epoch'), (int, float))
+                                   and row['first_epoch'] >= preferences.tag_since)
+        row.update(domain_info(row['domain']))
+        if not isinstance(row.get('counts'), dict):
+            row['counts'] = {}
+        if not isinstance(row.get('addresses'), list):
+            row['addresses'] = []
+        rows.append(row)
+    incidents = read_incidents(port.PERSIST)
+    selected = next((item for item in incidents if item['id'] == incident_id), None)
+    if incident_id and selected is None:
+        raise ValueError('失败记录已轮换，请选择其他记录')
+    if selected is not None:
+        selected = dict(selected)
+        initial = selected.get('evidence', {}).get('events', [])
+        events = merge_events(read_domain_events(port.RUNTIME), initial, report.get('recent', []))
+        if not selected.get('captured_at'):
+            selected['evidence'] = correlate(selected, events)
+            selected['evidence']['coverage_start'] = report.get('coverage_start')
+            coverage_start = report.get('coverage_start')
+            selected['evidence']['coverage_limited'] = (type(coverage_start) not in (int, float)
+                                                        or coverage_start > selected['epoch'] - 180
+                                                        or report.get('state') != 'observing'
+                                                        or bool(report.get('capture_drops') or report.get('rate_drops')))
+    try:
+        age = time.time() - datetime.datetime.fromisoformat(report['time']).timestamp()
+        fresh = alive(report.get('pid'), report.get('identity')) and 0 <= age < 30
+    except (KeyError, ValueError, TypeError):
+        fresh = False
+    return {'ok': True, 'logging': port.asdict(preferences), 'domains': rows,
+            'dynamic_rules': dynamic_rule_info(),
+            'candidates': candidates(rows, policy.read(policy.folder() / 'draft.json', policy.DEFAULTS)),
+            'observer': {'state': report.get('state', 'waiting') if preferences.domains else 'disabled',
+                         'fresh': fresh, 'time': report.get('time'), 'bridge': report.get('bridge'),
+                         'error': report.get('error', ''), 'health': report.get('health', {}),
+                         'observability': report.get('observability', {}),
+                         'snapshot_truncated': report.get('snapshot_truncated', False),
+                         'capture_drops': report.get('capture_drops', 0), 'rate_drops': report.get('rate_drops', 0)},
+            'incidents': [{key: item.get(key) for key in ('id', 'source', 'note', 'time', 'tag', 'captured_at')}
+                          for item in incidents], 'selected': selected, 'limit': OBSERVATION_LIMIT}
+
+
+def configure_logging(request):
+    # Separate serialization allows log changes and failure markers during a trial.
+    port.PERSIST.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (port.PERSIST / 'observability.lock').open('a') as lock:
+        deadline = time.monotonic() + 1
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError('日志策略正在保存，请稍后重试') from None
+                time.sleep(.05)
+        preferences = save_preferences(port.PERSIST / 'observability.json', request['mode'],
+                                       bool(request['domains']), request['tag'])
+    warning = ''
+    if preferences.domains:
+        try:
+            result = port.command('/etc/init.d/ps-accel-observe', 'start', check=False, timeout=3)
+            if result.returncode:
+                warning = '域名观察服务启动失败，请检查独立服务状态'
+        except READ_ERRORS as exc:
+            warning = '域名观察服务启动待确认：' + str(exc)
+    return {'ok': True, 'logging': port.asdict(preferences), 'observer_warning': warning}
+
+
+def mark_incident(note):
+    try:
+        tag = load_preferences(port.PERSIST / 'observability.json').tag
+    except (OSError, ValueError, TypeError):
+        tag = ''
+    incident = new_incident('manual', note, tag)
+    try:
+        report = read_bounded(port.RUNTIME / 'domains.json')
+        incident['evidence'] = correlate(incident, report.get('recent', []))
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    # The observer refreshes the full window after fifteen seconds.
+    core = policy.read(policy.runtime() / 'connections.json')
+    incident['core_evidence'] = {'epoch': core.get('epoch'), 'connections': core.get('connections', [])[:16],
+                                 'probes': policy.read(policy.runtime() / 'probes.json').get('targets', [])[:4]}
+    save_incident(port.PERSIST, incident)
+    return {'ok': True, 'id': incident['id'], 'time': incident['time']}
 
 
 def redact(text):
@@ -240,6 +513,8 @@ def redact(text):
 def diagnostics():
     current = dict(details(), **status())
     job = current['job']
+    domain_report = domains()
+    domain_report['incidents'] = read_incidents(port.PERSIST)
     return {'ok': True, 'generated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'environment': current['environment'],
             'network': {'bridge': current['config'].get('bridge'), 'paired': current['configured']},
@@ -254,7 +529,47 @@ def diagnostics():
             'profile': current['config'].get('profile'),
             'observability': dict(current.get('observability', {}),
                                   last_error=redact(current.get('observability', {}).get('last_error', ''))),
-            'privacy': '诊断文件使用状态摘要，设备 IP、MAC、原始日志与会话报文保留在路由器本地。'}
+            'domain_diagnostics': redact_domain_data(domain_report),
+            'logging': redact_domain_data(current.get('logging', {})),
+            'privacy': '诊断文件包含域名、公共解析地址与失败证据；设备地址、MAC 与会话报文保留在路由器本地。'}
+
+
+def proxy_diagnostics():
+    data = policy.status()
+    report = domains()
+    report['incidents'] = read_incidents(port.PERSIST)
+    return {'ok': True, 'generated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'proxy': redact_domain_data({key: data.get(key) for key in (
+                'enabled', 'config', 'active_config', 'environment', 'sources', 'blockers', 'receipt', 'entry_scope',
+                'telemetry', 'probes')}),
+            'domain_diagnostics': redact_domain_data(report),
+            'privacy': '诊断包含代理配置、域名访问与失败证据；设备地址与 MAC 已遮盖。'}
+
+
+def redact_domain_data(value):
+    import ipaddress
+    if isinstance(value, dict):
+        return {key: redact_domain_data(item) for key, item in value.items()
+                if key not in ('id', 'job_id', 'pid', 'identity', 'device_mac', 'ok')}
+    if isinstance(value, list):
+        return [redact_domain_data(item) for item in value]
+    if isinstance(value, str):
+        value = re.sub(r'(?i)\b(?:[0-9a-f]{2}:){5}[0-9a-f]{2}\b', '[设备 MAC]', value)
+        def address(match):
+            try:
+                return '[本地地址]' if not ipaddress.ip_address(match.group()).is_global else match.group()
+            except ValueError:
+                return match.group()
+        value = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', address, value)
+        value = re.sub(r'(?<![0-9A-Za-z:])(?:[0-9a-fA-F]{0,4}:){2,7}[0-9a-fA-F]{0,4}'
+                       r'(?:%[a-zA-Z0-9_.-]+)?(?![0-9A-Za-z:])', address, value)
+        try:
+            ip = ipaddress.ip_address(value)
+            if ip.version == 6 and not ip.is_global:
+                return '[本地 IPv6 地址]'
+        except ValueError:
+            pass
+    return value
 
 
 def validate(method, request):
@@ -267,12 +582,30 @@ def validate(method, request):
         if any(not isinstance(v, str) or len(v) > 80 for v in request.values()):
             raise ValueError('Invalid setting value')
         return port.asdict(port.Settings(**request).validate())
+    if method == 'device_save':
+        return port.validate_devices(request)
     if method == 'profile' and (not isinstance(request['profile'], str) or request['profile'] not in port.PROFILES):
         raise ValueError('请选择有效的目标码率档位')
-    if method == 'logs' and request['kind'] not in ('log', 'events'):
-        raise ValueError('请选择任务输出或中继事件日志')
+    if method == 'logs' and request['kind'] not in ('log', 'events', 'devices', 'bitrate', 'proxy'):
+        raise ValueError('请选择设备、码率增强或透明代理日志')
+    if method == 'logging':
+        if type(request['domains']) is not int or request['domains'] not in (0, 1):
+            raise ValueError('域名记录开关无效')
+        LogPreferences(request['mode'], bool(request['domains']), request['tag']).validate()
+    if method == 'domains' and (not isinstance(request['incident'], str) or
+                               (request['incident'] and not re.fullmatch('[0-9a-f]{32}', request['incident']))):
+        raise ValueError('失败记录标识无效')
+    if method == 'incident' and (not isinstance(request['note'], str) or not request['note'].strip()
+                                or len(request['note']) > 300 or any(ord(c) < 32 for c in request['note'])):
+        raise ValueError('失败描述使用 1 至 300 字的单行文本')
     if method == 'start' and (type(request['autostart']) is not int or request['autostart'] not in (0, 1)):
         raise ValueError('Invalid autostart setting')
+    if method in ('psportal_preview', 'psportal_save', 'psportal_apply'):
+        policy.normalize({key: request[key] for key in policy.FIELDS})
+    if method == 'psportal_apply':
+        if (not isinstance(request['token'], str) or not re.fullmatch('[0-9a-f]{64}', request['token']) or
+                type(request['confirm_restart']) is not int or request['confirm_restart'] not in (0, 1)):
+            raise ValueError('请生成最新分流预览并确认应用方式')
     return request
 
 
@@ -282,10 +615,26 @@ def dispatch(method, request):
         return status()
     if method == 'details':
         return details()
+    if method == 'devices':
+        return devices()
     if method == 'logs':
         return logs(request['kind'])
     if method == 'diagnostics':
         return diagnostics()
+    if method == 'proxy_diagnostics':
+        return proxy_diagnostics()
+    if method == 'domains':
+        return domains(request['incident'])
+    if method == 'logging':
+        return configure_logging(request)
+    if method == 'incident':
+        return mark_incident(request['note'].strip())
+    if method == 'psportal_status':
+        return policy.status()
+    if method == 'psportal_preview':
+        return policy.preview(request)
+    if method == 'psportal_save':
+        return policy.save(request)
     with control_lock():
         old = current_job()
         if old.get('busy'):
@@ -303,17 +652,21 @@ def dispatch(method, request):
                'started': time.time()}
         if orphan:
             job['orphan'] = orphan
-        port.atomic(JOBS / 'job.json', job)
+        record_job(job)
         worker_process = None
         try:
-            with (JOBS / 'job.log').open('w') as output:
+            output_path = JOBS / (job_log_kind(method) + '.log')
+            with output_path.open('w') as output:
+                output_path.chmod(0o600)
+                (JOBS / 'job.log').unlink(missing_ok=True)
+                os.link(output_path, JOBS / 'job.log')
                 worker_process = subprocess.Popen([sys.executable, '-u', str(Path(__file__).resolve()), 'worker', job_id],
                                                  stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                                                  start_new_session=True, close_fds=True)
             job.update(pid=worker_process.pid, identity=process_identity(worker_process.pid))
             if not job['identity'] and worker_process.poll() is None:
                 raise RuntimeError('后台任务标识获取失败。')
-            port.atomic(JOBS / 'job.json', job)
+            record_job(job)
         except BaseException as exc:
             # The worker is waiting for this lock, so it has not entered its action.
             if worker_process is not None:
@@ -323,9 +676,10 @@ def dispatch(method, request):
                     job['cleanup_error'] = str(cleanup_error)
             job.update(state='failed', error=str(exc), finished=time.time())
             try:
-                port.atomic(JOBS / 'job.json', job)
+                record_job(job)
             except Exception as record_error:
                 message('任务状态记录失败：' + str(record_error), error=True)
+            record_failure(port.RUNTIME, port.PERSIST, 'management', str(exc), job_id)
             raise
         return {'ok': True, 'id': job_id}
 
@@ -497,9 +851,12 @@ def worker(job_id):
             if job.get('id') != job_id:
                 raise RuntimeError('Unknown job')
             job.update(pid=os.getpid(), identity=process_identity(os.getpid()), state='running')
-            port.atomic(JOBS / 'job.json', job)
+            record_job(job)
         action, request = job['action'], validate(job['action'], job['request'])
-        if action == 'configure':
+        if action == 'device_save':
+            message('正在确认 Portal / PS5 的内网地址与设备身份。')
+            save_devices(request)
+        elif action == 'configure':
             message('正在保存设置并检测 PS5 / Portal，请保持两台设备开机。')
             run_child(job_id, [CLI, 'configure', '--bridge', request['bridge'], '--address', request['address'],
                               '--ps5', request['ps5_ip'], '--portal', request['portal_ip'], '--profile', request['profile']])
@@ -521,16 +878,33 @@ def worker(job_id):
             start_managed_service(job_id)
         elif action == 'stop':
             stop_service(job_id, job.get('orphan'))
+        elif action == 'psportal_apply':
+            message('正在校验 PS Portal 精确规则与原有直连策略。')
+            result = policy.apply(request, cancel=lambda: cancelled(job_id))
+            message('精确规则已应用，PassWall 已重启。' if result['restarted'] else
+                    '本地精确规则集已更新，PassWall 进程继续运行。')
+            if result.get('watcher_warning'):
+                message('设备地址跟踪服务启动待检查，请重新检测设备。')
+        elif action == 'psportal_disable':
+            policy.disable()
+            message('精确分流已停用，新连接恢复原有规则。')
+        elif action == 'psportal_probe':
+            message('正在检测认证、信令、连通探测与固件下载出口。')
+            result = policy.probe_connections(cancel=lambda: cancelled(job_id))
+            failed = [x['domain'] for x in result['targets'] if x['failure'] or not x['dns']['ok']]
+            message('已保留取消前的检测结果。' if result.get('cancelled') else
+                    '出口检测完成。' if result['healthy'] else '出口检测完成，需要检查：' +
+                    '；'.join(result['errors'] + failed))
     except Exception as exc:
-        error = exc
-        message(str(exc), error=True)
+        error = None if isinstance(exc, policy.PolicyCancelled) else exc
+        message(str(exc), error=error is not None)
 
     # Cancellation and action errors share the same recovery path. A completed
     # rollback keeps its restored service; a failed cleanup ends with a retryable job.
     cancel_requested = cancelled(job_id)
     saved = optional(JOBS / 'job.json')
     owns_job = not saved.get('id') or saved['id'] == job_id
-    needs_cleanup = owns_job and (cancel_requested or (error is not None and saved.get('cleanup_required')
+    needs_cleanup = owns_job and action not in ('psportal_apply', 'psportal_disable', 'psportal_probe') and (cancel_requested or (error is not None and saved.get('cleanup_required')
                                                      and not saved.get('rolled_back')))
     if needs_cleanup and not saved.get('cleanup_complete') and not saved.get('cleanup_attempted'):
         try:
@@ -551,8 +925,10 @@ def worker(job_id):
             values['cleanup_error'] = str(cleanup_error)
     else:
         values = dict(state='cancelled' if cancel_requested else 'complete', finished=time.time(), cleanup_required=False)
-        message('已停止，网络恢复完成。' if cancel_requested else '操作完成。')
+        message(('检测已取消。' if action == 'psportal_probe' else '已停止，网络恢复完成。') if cancel_requested else '操作完成。')
     best_effort_update(job_id, **values)
+    if values['state'] == 'failed':
+        record_failure(port.RUNTIME, port.PERSIST, 'management', values['error'], job_id)
     try:
         (JOBS / ('cancel.' + job_id)).unlink(missing_ok=True)
     except OSError as exc:
@@ -574,7 +950,10 @@ def main():
     if len(sys.argv) != 3 or sys.argv[1] != 'call':
         raise ValueError('Invalid rpcd invocation')
     try:
-        request = json.loads(sys.stdin.read(8193) or '{}')
+        raw = sys.stdin.read(32769)
+        if len(raw) > 32768:
+            raise ValueError('管理请求超过容量限制')
+        request = json.loads(raw or '{}')
         if not isinstance(request, dict):
             raise ValueError('Invalid request')
         print(json.dumps(dispatch(sys.argv[2], request), ensure_ascii=False))

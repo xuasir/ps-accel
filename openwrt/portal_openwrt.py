@@ -40,7 +40,7 @@ ENGINE_LOCK = Path('/var/run/portal-lab-capture.lock')
 SYSNET = Path('/sys/class/net')
 CONFIG_FILE = Path('/etc/config/ps_accel')
 FINGERPRINT_FILES = ('portal_auto.py', 'portal_auto_platform.py', 'portal_active_probe.py',
-                     'portal_windows_network.py', 'protocol.py', 'profiles.py', 'telemetry.py')
+                     'portal_windows_network.py', 'protocol.py', 'profiles.py', 'telemetry.py', 'observability.py')
 
 
 class ControllerBusy(RuntimeError):
@@ -88,7 +88,8 @@ def uci_values():
 def configuration_revision():
     """Cheap change token; full content fingerprints remain a start-time gate."""
     paths = [CONFIG_FILE, Path('/tmp/.uci/ps_accel'), Path('/etc/rc.d/S95ps-accel'),
-             PERSIST / 'auto-config.json', PERSIST / 'baseline.json', Path(__file__)]
+             PERSIST / 'auto-config.json', PERSIST / 'devices.json', PERSIST / 'baseline.json',
+             PERSIST / 'observability.json', Path(__file__)]
     paths.extend(APP / name for name in FINGERPRINT_FILES)
     records = []
     for path in paths:
@@ -98,6 +99,56 @@ def configuration_revision():
         except OSError:
             records.append(None)
     return hashlib.sha256(json.dumps(records).encode()).hexdigest()[:20]
+
+
+DEVICE_FIELDS = ('bridge', 'portal_ip', 'ps5_ip')
+
+
+def validate_devices(values):
+    if set(values) != set(DEVICE_FIELDS) or any(not isinstance(v, str) or len(v) > 80 for v in values.values()):
+        raise ValueError('请填写 LAN 网桥与两台设备的 IPv4 地址')
+    if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,15}', values['bridge']):
+        raise ValueError('请选择有效的 LAN 网桥')
+    result = dict(values)
+    for role in ('portal', 'ps5'):
+        try:
+            ip = ipaddress.IPv4Address(values[role + '_ip'])
+            if (ip.is_loopback or ip.is_multicast or ip.is_unspecified or ip.is_reserved
+                    or int(ip) < 0x01000000 or ip in ipaddress.IPv4Network('169.254.0.0/16')):
+                raise ValueError()
+        except ipaddress.AddressValueError:
+            raise ValueError('请填写有效的设备内网 IPv4 地址') from None
+        except ValueError:
+            raise ValueError('请填写有效的设备内网 IPv4 地址') from None
+        result[role + '_ip'] = str(ip)
+    if result['portal_ip'] == result['ps5_ip']:
+        raise ValueError('Portal 与 PS5 需要分别使用独立地址')
+    return result
+
+
+def device_binding(values=None):
+    """Shared device identity works before the bitrate relay is enrolled."""
+    try:
+        values = uci_values() if values is None else values
+        config = validate_devices({key: values.get(key, '') for key in DEVICE_FIELDS})
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        return {}
+    for name in ('devices.json', 'auto-config.json'):
+        try:
+            if (PERSIST / name).stat().st_size > 16384:
+                continue
+            binding = read_json(PERSIST / name)
+            matches = (binding.get('config') == config if name == 'devices.json' else
+                       binding.get('network') == {'interface': IFACE, 'ps5_ip': config['ps5_ip'],
+                                                  'portal_ip': config['portal_ip']})
+            macs = {role + '_mac': binding.get(role + '_mac', '').lower() for role in ('portal', 'ps5')}
+            if (matches and len(set(macs.values())) == 2 and all(
+                    re.fullmatch(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}', mac)
+                    and not int(mac[:2], 16) & 1 and mac != '00:00:00:00:00:00' for mac in macs.values())):
+                return dict(config=config, confirmed_at=binding.get('confirmed_at'), **macs)
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+    return {}
 
 
 @dataclass(frozen=True)
@@ -494,6 +545,7 @@ def supervise(settings, mode, seconds=None):
         generation = uuid.uuid4().hex
         argv = ['ip', 'netns', 'exec', NS, sys.executable, '-u', str(APP / 'portal_auto.py'),
                 mode, '--config', str(PERSIST / 'auto-config.json'), '--runtime', str(RUNTIME),
+                '--preferences', str(PERSIST / 'observability.json'),
                 '--generation', generation]
         if seconds is not None:
             argv += ['--seconds', str(seconds)]
@@ -551,6 +603,11 @@ def configure(settings):
             command('uci', 'set', f'ps_accel.main.{key}={value}')
         command('uci', 'set', 'ps_accel.main.enabled=0')
         command('uci', 'commit', 'ps_accel')
+        enrollment = read_json(PERSIST / 'auto-config.json')
+        atomic(PERSIST / 'devices.json', {
+            'config': {key: asdict(settings)[key] for key in DEVICE_FIELDS},
+            'portal_mac': enrollment['portal_mac'], 'ps5_mac': enrollment['ps5_mac'],
+            'confirmed_at': time.time()})
         (PERSIST / 'baseline.json').unlink(missing_ok=True)
         (RUNTIME / 'auto-baseline.json').unlink(missing_ok=True)
         print('Enrolled PS5 and Portal. Service is disabled. Next: ps-accel baseline')
@@ -633,6 +690,8 @@ if __name__ == '__main__':
     try:
         sys.exit(main())
     except (Exception, KeyboardInterrupt) as exc:
+        from observability import record_failure
+        record_failure(RUNTIME, PERSIST, 'supervisor', str(exc))
         if isinstance(exc, subprocess.CalledProcessError):
             print(exc.stderr.strip(), file=sys.stderr)
         print('ps-accel: ' + str(exc), file=sys.stderr)
