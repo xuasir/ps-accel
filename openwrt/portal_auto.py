@@ -158,10 +158,10 @@ def health_worker(results):
         results.put(str(exc))
 
 
-def run(c, runtime, active=True, seconds=None, generation='', preferences=None):
+def run(c, runtime, active=True, seconds=None, generation='', preferences=None, require_baseline=True):
     if (runtime / 'recovery-required').exists():
         raise RuntimeError('Previous relay recovery is unconfirmed. Run repair before restarting.')
-    if active and not baseline_valid(c, runtime):
+    if active and require_baseline and not baseline_valid(c, runtime):
         raise RuntimeError('Run a successful baseline with this config/version first.')
     state = net.state_for(c)
     probe.network = net
@@ -344,6 +344,7 @@ def main():
     parser.add_argument('--parent', type=int)
     parser.add_argument('--generation', default='')
     parser.add_argument('--preferences', type=Path)
+    parser.add_argument('--configured-start', action='store_true')
     args = parser.parse_args()
     runtime = args.runtime.resolve()
     if args.command == 'status':
@@ -403,7 +404,8 @@ def main():
     c = config(args.config)
     return 0 if run(c, runtime, active=args.command == 'run',
                     seconds=(60 if args.command == 'baseline' else args.seconds),
-                    generation=args.generation, preferences=args.preferences) is not None else 1
+                    generation=args.generation, preferences=args.preferences,
+                    require_baseline=not args.configured_start) is not None else 1
 
 
 if __name__ == '__main__':

@@ -161,21 +161,21 @@ class Settings:
 
     def validate(self):
         if not re.fullmatch(r'[a-zA-Z0-9_.-]{1,15}', self.bridge):
-            raise ValueError('Invalid LAN bridge name')
+            raise ValueError('请选择有效的 LAN 网桥')
         if self.profile not in PROFILES:
             raise ValueError('请选择 35、45、65、100 或 200 Mbps 档位')
         if '/' not in self.address:
-            raise ValueError('A free relay IP with prefix is required, e.g. 192.168.1.250/24')
+            raise ValueError('请填写中继独立地址和前缀，例如 192.168.1.250/24')
         local = ipaddress.IPv4Interface(self.address)
         peers = [ipaddress.IPv4Address(self.ps5_ip), ipaddress.IPv4Address(self.portal_ip)]
         addresses = [local.ip] + peers
         if local.network.prefixlen > 30 or len(set(addresses)) != 3:
-            raise ValueError('Use three distinct addresses in a /30 or larger IPv4 LAN')
+            raise ValueError('Portal、PS5 和中继应使用同一 LAN 内的三个独立 IPv4 地址')
         for ip in addresses:
             if (ip not in local.network or ip in (local.network.network_address, local.network.broadcast_address)
                     or ip.is_loopback or ip.is_multicast or ip.is_unspecified or ip.is_reserved
                     or int(ip) < 0x01000000 or ip in ipaddress.IPv4Network('169.254.0.0/16')):
-                raise ValueError('Relay, PS5 and Portal need valid unicast addresses on the same LAN')
+                raise ValueError('Portal、PS5 和中继地址需属于同一 LAN，且使用可用的单播 IPv4 地址')
         return self
 
     @classmethod
@@ -377,6 +377,19 @@ def internal(action, args):
         (RUNTIME / 'recovery-required').unlink(missing_ok=True)
 
 
+def verify_configuration(settings):
+    """A saved device pair and matching relay settings are sufficient to start."""
+    import portal_auto as engine
+    settings.validate()
+    config = engine.config(PERSIST / 'auto-config.json')
+    if config['network'] != settings.engine() or config['profile'] != settings.profile:
+        raise RuntimeError('设备地址或码率配置已变化，请重新保存码率增强配置')
+    binding = device_binding(asdict(settings))
+    if not binding or any(binding[role + '_mac'] != config[role + '_mac'] for role in ('portal', 'ps5')):
+        raise RuntimeError('请重新确认设备身份，保存设备配置后再保存码率增强配置')
+    return config
+
+
 def port_fingerprint(settings, config=None, engine_fingerprint=None):
     import portal_auto as engine
     from scapy import VERSION
@@ -526,7 +539,7 @@ def supervise(settings, mode, seconds=None):
     if (RUNTIME / 'recovery-required').exists():
         raise RuntimeError('Previous recovery is unconfirmed. Run repair first.')
     if mode == 'run':
-        verify_baseline(settings)
+        verify_configuration(settings)
     # Old restore data must never be used to repair a newly configured peer pair.
     for name in ('restore-state.json', 'status.json', 'recovery.json', 'engine-pid', 'engine.json', 'engine-ready.json', 'disabled'):
         (RUNTIME / name).unlink(missing_ok=True)
@@ -547,6 +560,8 @@ def supervise(settings, mode, seconds=None):
                 mode, '--config', str(PERSIST / 'auto-config.json'), '--runtime', str(RUNTIME),
                 '--preferences', str(PERSIST / 'observability.json'),
                 '--generation', generation]
+        if mode == 'run':
+            argv.append('--configured-start')
         if seconds is not None:
             argv += ['--seconds', str(seconds)]
         if interrupted:
@@ -610,7 +625,7 @@ def configure(settings):
             'confirmed_at': time.time()})
         (PERSIST / 'baseline.json').unlink(missing_ok=True)
         (RUNTIME / 'auto-baseline.json').unlink(missing_ok=True)
-        print('Enrolled PS5 and Portal. Service is disabled. Next: ps-accel baseline')
+        print('设备配对完成。进入 LuCI 启动增强，启动后重新连接 Portal。')
     finally:
         teardown()
 
@@ -675,7 +690,7 @@ def main(argv=None):
             return 0
         settings = Settings.load()
         if args.action == 'service' and uci_get('enabled', '0') != '1':
-            print('Disabled. Complete baseline/try, then enable the service in UCI.')
+            print('服务已停用。进入 LuCI 保存配置后启动增强。')
             return 0
         if args.action == 'service':
             print('正在等待主路由 LAN 网桥就绪…', flush=True)

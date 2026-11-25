@@ -26,7 +26,7 @@ class Element {
  addEventListener(name, handler) { this.handlers[name] = handler; }
  get options() { return this.children.filter(child => child.tag === 'option'); }
  focus() { this.focused = true; }
- click() { this.handlers.click?.({ currentTarget: this, preventDefault() {} }); }
+ click() { if (!this.disabled) return this.handlers.click?.({ currentTarget: this, preventDefault() {} }); }
  remove() { this.removed = true; }
 }
 
@@ -65,7 +65,7 @@ function harness({ manualTimers = false, permission = true } = {}) {
   running: false, engine_alive: false, recovery_required: false, cleanup_pending: false,
   mode: 'active', counts: {}, foreign_relay: false,
   job: { id: 'initial', state: 'complete', busy: false, action: 'baseline' } };
- const policyData = { ok: true, enabled: false,
+ const policyData = { ok: true, enabled: false, autostart: true,
   config: { portal: '02:00:00:00:00:01', ps5: '02:00:00:00:00:02', node: 'nodeA',
    domains: 'auth.api.playstation.com', ports: '443', exclusions: 'dwc.dl.playstation.net' },
   environment: { passwall: '26.11.11-r376', singbox: '1.14.4', compatible: true, active_cores: 1, attached_cores: 0 },
@@ -97,7 +97,12 @@ function harness({ manualTimers = false, permission = true } = {}) {
   return Promise.resolve({ ok: true });
  } };
  const poll = { add: (callback, seconds) => { poll.callback = callback; poll.seconds = seconds; } };
- const ui = { createHandlerFn: (object, fn, name) => () => fn.call(object, name),
+ const ui = { createHandlerFn: (object, fn, name) => event => {
+  // LuCI disables the clicked control before invoking the application handler.
+  const target = event.currentTarget;
+  target.disabled = true;
+  Promise.resolve(fn.call(object, name, event)).finally(() => { target.disabled = false; });
+ },
   addNotification: (_id, element) => notifications.push(element.textContent) };
  const document = { body: new Element('body') };
  const app = new Function('view', 'rpc', 'poll', 'ui', 'E', 'window', 'document', 'L', source)(
@@ -117,10 +122,10 @@ async function policyTab(h) {
 test('policy device choices, node choices and preview rows render as DOM nodes', async () => {
  const h = harness(); await h.init(); await policyTab(h);
  h.app.selectTab('devices'); await h.app.refreshDevices(true);
- assert.deepEqual(h.app.deviceChoices.options.map(node => node.value), ['10.0.0.101', '10.0.0.100']);
+ assert.deepEqual(h.app.fields.portal_ip.choicePicker.getOptions().map(node => node.value), ['10.0.0.101', '10.0.0.100']);
  await policyTab(h);
  assert.equal(h.app.policyInputs.portal.value, h.details.device_selectors.portal);
- assert.deepEqual(h.app.policyInputs.node.options.map(node => node.value), ['', 'nodeA']);
+ assert.deepEqual(h.app.policyNodePicker.getOptions().map(node => node.value), ['nodeA']);
  await h.app.policyAction('preview');
  const row = h.app.policyPreviewBody.children[0];
  assert.equal(row.tag, 'tr');
@@ -168,6 +173,7 @@ test('editing a scoped host invalidates the preview and restart consent', async 
  assert.equal(h.app.policyPlan, null);
  assert.equal(h.app.policyPreview.hidden, true);
  assert.equal(h.app.policyConfirm.checked, false);
+ assert.equal(h.app.policyConfirmation.hidden, true);
  assert.equal(h.app.policyButtons.apply.disabled, true);
  await h.app.refreshPolicy(true);
  assert.equal(h.app.policyInputs.domains.value, 'np.ac.playstation.net');
@@ -265,6 +271,8 @@ test('backend rejects expired previews with a fresh-preview path', async () => {
 test('completed policy jobs report their own result in the policy tab', async () => {
  const h = harness(); await h.init(); await policyTab(h);
  h.app.addDomainToPolicy('api.sony.example', 'domains');
+ await h.app.policyAction('preview');
+ h.app.policyConfirm.checked = true;
  h.policyData.config.domains = h.app.policyInputs.domains.value;
  h.policyData.enabled = true; h.policyData.environment.attached_cores = 1;
  h.status.job = { id: 'policy-job', action: 'psportal_apply', state: 'complete', busy: false };
@@ -272,6 +280,8 @@ test('completed policy jobs report their own result in the policy tab', async ()
  assert.match(h.app.policyNotice.textContent, /透明代理已启用/);
  assert.equal(h.app.policyConfigNotice.textContent, h.app.policyNotice.textContent);
  assert.equal(h.app.domainActionNotice.hidden, true);
+ assert.equal(h.app.policyConfirmation.hidden, true);
+ assert.equal(h.app.policyConfirm.checked, false);
  assert.match(h.app.policyState.textContent, /载入/);
  assert.equal(h.app.policyButtons.disable.disabled, false);
 });
@@ -582,23 +592,38 @@ test('read-only sessions keep log policy and failure marking disabled', async ()
  assert.equal(h.app.logMode.disabled, true);
 });
 
-test('the three main features keep configuration, runtime and logs in their own panels', async () => {
+test('the main features show runtime, configuration and open bounded logs in order', async () => {
  const h = harness(); await h.init();
  assert.deepEqual(Object.keys(h.app.mainTabs), ['devices', 'bitrate', 'proxy']);
- assert.deepEqual(Object.keys(h.app.stageTabs.bitrate), ['config', 'runtime', 'logs']);
- assert.deepEqual(Object.keys(h.app.stageTabs.proxy), ['config', 'runtime', 'logs']);
+ assert.deepEqual(Object.keys(h.app.stageTabs.bitrate), []);
+ assert.deepEqual(Object.keys(h.app.stageTabs.proxy), []);
  assert.equal(h.app.logTabs.domains, undefined);
  assert.equal(h.app.proxyLogTabs.domains.tag, 'a');
  assert.equal(h.app.proxyLogTabs.domains.parentNode.tag, 'li');
  assert.equal(h.app.proxyLogTabs.domains.parentNode.attributes['class'], 'cbi-tab');
  assert.doesNotMatch(elementText(h.app.mainPanels.devices), /中继独立地址/);
+ assert.doesNotMatch(elementText(h.app.mainPanels.devices), /局域网设备|主路由/);
  assert.match(elementText(h.app.stagePanels.bitrate.config), /中继独立地址/);
  assert.doesNotMatch(elementText(h.app.stagePanels.proxy.config), /已有 MAC 或当前 IP/);
+ for (const feature of ['bitrate', 'proxy']) {
+  assert.equal(h.app.mainPanels[feature].children[1], h.app.stagePanels[feature].runtime);
+  assert.equal(h.app.mainPanels[feature].children[2], h.app.stagePanels[feature].config);
+  assert.equal(h.app.mainPanels[feature].children[3], h.app.stagePanels[feature].logs);
+  assert.equal(h.app.stagePanels[feature].logs.open, true);
+ }
+ assert.equal(h.app.deviceLogDetails.open, true);
+ assert.equal(h.app.fields.bridge.choicePicker.root.parentNode.parentNode.parentNode.tag, 'div');
+ assert.equal(h.app.policyRules.open, true);
+ assert.equal(h.app.buttons.baseline, undefined);
+ assert.equal(h.app.buttons.trial, undefined);
+ h.details.baseline_valid = false; await h.app.refreshDetails();
+ assert.equal(h.app.buttons.start.disabled, false);
  h.app.selectStage('bitrate', 'config');
- assert.equal(h.app.stagePanels.bitrate.runtime.hidden, true);
+ assert.notEqual(h.app.stagePanels.bitrate.runtime.hidden, true);
+ assert.equal(h.app.stagePanels.bitrate.logs.open, true);
  h.app.selectStage('proxy', 'logs');
  assert.equal(h.app.mainPanels.bitrate.hidden, true);
- assert.equal(h.app.stagePanels.proxy.logs.hidden, false);
+ assert.equal(h.app.stagePanels.proxy.logs.open, true);
 });
 
 test('first-time setup starts at shared devices while proxy logs work before bitrate enrollment', async () => {
@@ -614,7 +639,7 @@ test('first-time setup starts at shared devices while proxy logs work before bit
  await h.app.refreshDetails();
  h.app.selectStage('proxy', 'logs'); await h.app.refreshDomains(); await settle();
  assert.match(elementText(h.app.domainList), /api\.sony\.example/);
- assert.equal(h.app.buttons.baseline.disabled, true);
+ assert.equal(h.app.buttons.start.disabled, true);
  assert.equal(h.app.policyButtons.save.disabled, false);
 });
 
@@ -625,6 +650,118 @@ test('saving shared device addresses leaves the relay address and bitrate profil
  await h.app.run('device_save'); await settle();
  assert.deepEqual(h.calls.find(call => call.method === 'device_save').args, ['br-lan', '10.0.0.111', '10.0.0.100']);
  assert.equal(h.calls.some(call => ['configure','profile','psportal_save','psportal_apply'].includes(call.method)), false);
+});
+
+test('clicking save submits first-time devices and stays locked until the job completes', async () => {
+ const h = harness();
+ h.details.configured = false; h.details.devices_configured = false; h.details.device_selectors = {};
+ h.details.config.portal_ip = ''; h.details.config.ps5_ip = ''; h.details.config.address = '';
+ h.deviceData.configured = false; h.deviceData.binding = {};
+ await h.init();
+ for (const [key, value] of Object.entries({portal_ip:'10.0.0.101', ps5_ip:'10.0.0.100'})) {
+  h.app.fields[key].value = value; h.app.fields[key].handlers.input();
+ }
+ let resolveSave;
+ h.handlers.device_save = () => new Promise(resolve => { resolveSave = resolve; });
+ h.calls.length = 0;
+ const saving = h.app.buttons.device_save.click(); await settle();
+ assert.deepEqual(h.calls.find(call => call.method === 'device_save')?.args,
+  ['br-lan', '10.0.0.101', '10.0.0.100']);
+ assert.equal(h.app.buttons.device_save.disabled, true);
+ h.app.buttons.device_save.click(); await settle();
+ assert.equal(h.calls.filter(call => call.method === 'device_save').length, 1);
+ h.status.job = {id:'saved-devices', action:'device_save', state:'running', busy:true};
+ resolveSave({ok:true, id:'saved-devices'}); await saving; await settle();
+ assert.equal(h.app.buttons.device_save.disabled, true);
+ h.status.job = {...h.status.job, state:'complete', busy:false};
+ h.details.config.portal_ip = '10.0.0.101'; h.details.config.ps5_ip = '10.0.0.100';
+ h.details.devices_configured = true; h.deviceData.configured = true;
+ await h.app.refresh(true); await settle();
+ assert.equal(h.app.buttons.device_save.disabled, false);
+ assert.equal(h.app.fields.portal_ip.value, '10.0.0.101');
+ assert.equal(h.app.fields.ps5_ip.value, '10.0.0.100');
+ assert.match(h.app.deviceNotice.textContent, /设备配置已保存/);
+ assert.equal(h.app.activeTab, 'devices');
+});
+
+test('device choices open with one click and polling preserves the open list', async () => {
+ const h = harness(); await h.init(); h.app.selectTab('devices');
+ h.deviceData.devices[0].addresses.push('10.0.0.111');
+ await h.app.refreshDevices(true); await settle();
+ const picker = h.app.fields.portal_ip.choicePicker;
+ picker.trigger.click();
+ assert.equal(picker.menu.hidden, false);
+ assert.equal(picker.trigger.attributes['aria-expanded'], 'true');
+ picker.search.value = '10.0.0.111'; picker.search.handlers.input();
+ const choice = picker.list.children[0];
+ h.deviceData.devices[0].label = 'Portal updated';
+ await h.app.refreshDevices(true); await settle();
+ assert.equal(picker.menu.hidden, false);
+ assert.equal(picker.list.children[0], choice);
+ choice.click();
+ assert.equal(h.app.fields.portal_ip.value, '10.0.0.111');
+ assert.equal(h.app.fieldTouched.portal_ip, true);
+ assert.equal(picker.menu.hidden, true);
+});
+
+test('node choices show local availability and preserve a search across polling', async () => {
+ const h = harness(); await h.init(); await policyTab(h);
+ h.policyData.nodes.push({id:'nodeB', label:'节点 B', protocol:'vless', available:false, reason:'此节点配置了链式代理'});
+ await h.app.refreshPolicy(true);
+ const picker = h.app.policyNodePicker;
+ picker.trigger.click(); picker.search.value = '节点 B'; picker.search.handlers.input();
+ assert.equal(picker.list.children[0].disabled, true);
+ assert.match(elementText(picker.list), /链式代理/);
+ await h.app.refreshPolicy(true);
+ assert.equal(picker.menu.hidden, false); assert.equal(picker.search.value, '节点 B');
+ picker.close();
+ h.policyData.node_error = 'PassWall 节点读取失败'; h.policyData.nodes = [];
+ await h.app.refreshPolicy(true);
+ assert.match(h.app.policyNodeState.textContent, /节点读取失败/);
+});
+
+test('the proxy boot switch saves separately and read-only users keep its boundary', async () => {
+ const h = harness(); await h.init(); await policyTab(h);
+ h.handlers.psportal_autostart = value => {
+  h.policyData.autostart = !!value;
+  return Promise.resolve({ok:true, autostart:!!value, enabled:false});
+ };
+ h.calls.length = 0; h.app.policyAutostart.checked = false;
+ await h.app.policyAutostart.handlers.change(); await settle();
+ assert.deepEqual(h.calls.find(call => call.method === 'psportal_autostart').args, [0]);
+ assert.equal(h.app.policyAutostart.checked, false);
+ assert.equal(h.calls.some(call => ['psportal_apply','psportal_disable','psportal_save'].includes(call.method)), false);
+ const readonly = harness({permission:false}); await readonly.init(); await policyTab(readonly);
+ assert.equal(readonly.app.policyAutostart.disabled, true);
+ await readonly.app.policyAutostart.handlers.change();
+ assert.equal(readonly.calls.some(call => call.method === 'psportal_autostart'), false);
+});
+
+test('the simple enable button checks and applies while keeping restart confirmation visible', async () => {
+ const h = harness(); await h.init(); await policyTab(h); h.calls.length = 0;
+ await h.app.policyButtons.enable.click(); await settle();
+ assert.equal(h.calls.filter(call => call.method === 'psportal_preview').length, 1);
+ assert.equal(h.calls.some(call => call.method === 'psportal_apply'), false);
+ assert.equal(h.app.policyConfirmation.hidden, false);
+ h.app.policyConfirm.checked = true; h.app.policyConfirm.handlers.change();
+ await h.app.policyButtons.enable.click(); await settle();
+ assert.equal(h.calls.filter(call => call.method === 'psportal_apply').length, 1);
+ assert.equal(h.app.policyConfirmation.hidden, true);
+ const hot = harness(); await hot.init(); await policyTab(hot);
+ hot.handlers.psportal_preview = () => Promise.resolve({ok:true, token:'a'.repeat(64), can_apply:true,
+  restart_required:false, rules:[], blockers:[]});
+ await hot.app.policyButtons.enable.click(); await settle();
+ assert.equal(hot.calls.filter(call => call.method === 'psportal_apply').length, 1);
+});
+
+test('device save errors remain visible in the device page after polling', async () => {
+ const h = harness(); await h.init();
+ h.handlers.device_save = () => Promise.resolve({ok:false, error:'设备地址与 MAC 待确认'});
+ await h.app.buttons.device_save.click(); await settle();
+ await h.app.refresh(); await settle();
+ assert.match(h.app.deviceNotice.textContent, /设备地址与 MAC 待确认/);
+ assert.equal(h.app.deviceNotice.attributes['data-error'], 'true');
+ assert.equal(h.app.buttons.device_save.disabled, false);
 });
 
 test('bitrate enrollment uses saved device addresses and preserves an unfinished device edit', async () => {
@@ -747,16 +884,17 @@ test('proxy cancellation uses the shared cancellation API and displays its own r
  assert.equal(h.calls.filter(call => call.method === 'stop').length, 1);
 });
 
-test('main navigation and stage navigation each preserve keyboard focus and selected panels', async () => {
+test('main navigation preserves keyboard focus and logs expand in place', async () => {
  const h = harness(); await h.init();
  let prevented = 0;
  h.app.mainTabs.devices.handlers.keydown({key:'End',preventDefault(){prevented++;}});
  assert.equal(h.app.activeTab, 'proxy'); assert.equal(h.app.mainTabs.proxy.focused, true);
- h.app.stageTabs.proxy.config.handlers.keydown({key:'ArrowRight',preventDefault(){prevented++;}});
- assert.equal(h.app.activeStages.proxy, 'runtime');
- assert.equal(h.app.stageTabs.proxy.runtime.focused, true);
- assert.equal(h.app.stagePanels.proxy.config.hidden, true);
- assert.equal(prevented, 2);
+ h.app.selectStage('proxy', 'logs', true);
+ assert.equal(h.app.activeStages.proxy, 'logs');
+ assert.equal(h.app.mainTabs.proxy.focused, true);
+ assert.notEqual(h.app.stagePanels.proxy.config.hidden, true);
+ assert.equal(h.app.stagePanels.proxy.logs.open, true);
+ assert.equal(prevented, 1);
 });
 
 test('restored feature results retain each failure after a task in another feature', async () => {
@@ -851,7 +989,7 @@ test('actual core routes and fixed-target probe stages render with separate evid
  h.policyData.probes = {epoch:1800000000,healthy:false,targets:[
   {domain:'auth.api.playstation.com',category_label:'认证',path:'proxy',dns:{ok:true},tcp:true,tls:false,failure:'certificate_validation'} ]};
  await policyTab(h);
- assert.match(h.app.policyCoreSummary.textContent, /命中 1/);
+ assert.match(h.app.policyCoreSummary.textContent, /处理 1 条设备连接/);
  assert.match(nodeText(h.app.policyConnections), /所选节点/);
  assert.match(nodeText(h.app.policyConnections), /原有直连/);
  assert.match(nodeText(h.app.policyProbeResults), /证书校验失败/);

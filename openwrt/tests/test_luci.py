@@ -55,6 +55,16 @@ class LuCITests(unittest.TestCase):
                     api.dispatch('configure', request)
                 spawn.assert_not_called()
 
+    def test_proxy_autostart_accepts_only_boolean_integers_and_waits_for_jobs(self):
+        for value in (True, '1', None, 2, -1):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                api.validate('psportal_autostart', {'autostart': value})
+        self.job('psportal_apply')
+        with patch.object(api, 'alive', return_value=True), patch.object(api.policy, 'set_autostart') as save:
+            with self.assertRaisesRegex(RuntimeError, '代理任务进行中'):
+                api.dispatch('psportal_autostart', {'autostart': 0})
+            save.assert_not_called()
+
     def test_async_job_has_only_fixed_executable_arguments(self):
         with patch.object(api.subprocess, 'Popen', return_value=MagicMock(pid=4242)) as spawn:
             with patch.object(api, 'process_identity', return_value='123'):
@@ -137,13 +147,29 @@ class LuCITests(unittest.TestCase):
         self.assertEqual(saved['state'], 'failed')
         self.assertIn('adapter unavailable', saved['error'])
 
-    def test_service_cannot_start_without_valid_baseline(self):
+    def test_service_requires_saved_configuration_before_enabling(self):
         job = self.job('start')
-        with patch.object(port, 'Settings') as settings, patch.object(port, 'verify_baseline', side_effect=RuntimeError('baseline missing')):
+        with patch.object(port, 'Settings'), patch.object(port, 'verify_configuration', side_effect=RuntimeError('configuration missing')):
             with patch.object(api, 'checked') as checked, patch.object(api, 'run_child') as run:
                 self.assertEqual(api.worker(job['id']), 1)
                 checked.assert_not_called()
                 run.assert_not_called()
+
+    def test_service_starts_with_saved_configuration_and_no_baseline(self):
+        job = self.job('start')
+        settings = port.Settings(**self.settings).validate()
+        port.atomic(port.PERSIST / 'auto-config.json', {'network': settings.engine(), 'profile': settings.profile,
+                    'ps5_mac': '02:00:00:00:00:02', 'portal_mac': '02:00:00:00:00:03'})
+        with patch.object(port, 'uci_values', return_value=dict(self.settings, enabled='0')):
+            with patch.object(port, 'environment', return_value={}):
+                details = api.details()
+        self.assertTrue(details['configured'])
+        self.assertFalse(details['baseline_valid'])
+        with patch.object(port.Settings, 'load', return_value=settings), patch.object(api, 'checked') as checked:
+            with patch.object(api, 'start_managed_service') as start:
+                self.assertEqual(api.worker(job['id']), 0)
+                checked.assert_any_call('uci', 'set', 'ps_accel.main.enabled=1')
+                start.assert_called_once_with(job['id'])
 
     def test_tail_is_bounded(self):
         log = api.JOBS / 'job.log'

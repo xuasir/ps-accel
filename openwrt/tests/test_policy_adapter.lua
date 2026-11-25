@@ -48,6 +48,19 @@ local function converter()
     return {type='socks',tag=TAG,server='127.0.0.1',server_port=1081}
 end
 
+test('boot preference and current session activation remain independent', function()
+    assert(adapter.active(manifest(), nil))
+    local current = manifest()
+    current.autostart = false
+    assert(not adapter.active(current, nil))
+    assert(adapter.active(current, {enabled=true}))
+    current.autostart = true
+    assert(not adapter.active(current, {enabled=false}))
+    assert(adapter.active(current, nil))
+    current.enabled = false
+    assert(not adapter.active(current, {enabled=true}))
+end)
+
 test('original rules, DNS and final remain intact after scoped insertion', function()
     local original, config = core(), core()
     adapter.transform(config, manifest(), converter)
@@ -154,11 +167,15 @@ test('native conversion strips internal fields and restores generation flags', f
     native.gen_outbound = function() error('secret node details') end
     fails(function() adapter.transform(core(), manifest()) end, 'node conversion failed')
     equal(native.NO_RUN, false)
-    for key, value in pairs({chain_proxy='1',shadowtls='1',domain_resolver='https',ech='1'}) do
+    for key, value in pairs({chain_proxy='1',shadowtls='1',ech='1'}) do
         node[key] = value
         fails(function() adapter.transform(core(), manifest()) end, 'plain node')
         node[key] = nil
     end
+    node.domain_resolver = 'https'
+    node.domain_resolver_dns_https = 'https://dns.example/query'
+    fails(function() adapter.transform(core(), manifest()) end, 'plain node')
+    node.domain_resolver, node.domain_resolver_dns_https = nil, nil
     package.loaded['luci.passwall.api'], package.loaded['luci.passwall.util_sing-box'] = old_api, old_native
 end)
 

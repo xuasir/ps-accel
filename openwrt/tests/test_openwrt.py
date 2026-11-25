@@ -284,7 +284,7 @@ class PortTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'outside'):
                 port.internal('_init', MagicMock())
 
-    def test_active_run_refused_before_baseline_or_failed_recovery(self):
+    def test_active_run_requires_configuration_and_completed_recovery(self):
         with patch.object(port, 'setup') as setup:
             with self.assertRaises(FileNotFoundError):
                 port.supervise(self.settings, 'run')
@@ -292,6 +292,17 @@ class PortTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'recovery'):
                 port.supervise(self.settings, 'baseline')
             setup.assert_not_called()
+
+    def test_configured_run_starts_without_baseline_and_keeps_recovery(self):
+        port.atomic(port.PERSIST / 'auto-config.json', {'network': self.settings.engine(), 'profile': '65',
+                    'ps5_mac': '02:00:00:00:00:02', 'portal_mac': '02:00:00:00:00:03'})
+        child = MagicMock(pid=123)
+        child.wait.return_value = 0
+        with patch.object(port, 'setup'), patch.object(port.subprocess, 'Popen', return_value=child) as start:
+            with patch.object(port, 'pids', return_value=[]), patch.object(port, 'repair_existing') as repair:
+                self.assertEqual(port.supervise(self.settings, 'run'), 0)
+        self.assertIn('--configured-start', start.call_args.args[0])
+        repair.assert_called_once()
 
     def test_runtime_receipt_survives_reboot_and_binds_port_settings(self):
         import portal_auto as engine
@@ -311,7 +322,7 @@ class PortTests(unittest.TestCase):
         child = MagicMock(pid=123)
         child.poll.return_value = None
         child.wait.side_effect = lambda: signal.getsignal(signal.SIGTERM)(signal.SIGTERM, None) or 0
-        with patch.object(port, 'verify_baseline'), patch.object(port, 'setup'):
+        with patch.object(port, 'verify_configuration'), patch.object(port, 'setup'):
             with patch.object(port.subprocess, 'Popen', return_value=child):
                 with patch.object(port, 'pids', return_value=[]), patch.object(port, 'owned', return_value=False):
                     with patch.object(port, 'repair_existing') as repair:
@@ -336,7 +347,7 @@ class PortTests(unittest.TestCase):
         child = MagicMock(pid=123)
         child.poll.return_value = None
         child.wait.return_value = 0
-        with patch.object(port, 'setup'), patch.object(port, 'verify_baseline'):
+        with patch.object(port, 'setup'), patch.object(port, 'verify_configuration'):
             with patch.object(port.subprocess, 'Popen', return_value=child):
                 with patch.object(port, 'atomic', side_effect=OSError('control storage unavailable')):
                     with patch.object(port, 'owned', return_value=False):

@@ -4,6 +4,7 @@ local TAG = 'ps-accel-psportal'
 local DIRECT_TAG = TAG .. '-direct'
 local PROBE_TAG = TAG .. '-probe'
 local MANIFEST = '/etc/ps-accel/psportal/manifest.json'
+local ACTIVATION = '/tmp/ps-accel/psportal/activation.json'
 local M = {}
 local PLAIN = {shadowsocks=true,trojan=true,vless=true,vmess=true,hysteria2=true,tuic=true,anytls=true,socks=true,http=true}
 
@@ -14,8 +15,8 @@ local function clone(value)
     return result
 end
 
-local function read_manifest()
-    local f = io.open(MANIFEST, 'r')
+local function read_manifest(path)
+    local f = io.open(path or MANIFEST, 'r')
     if not f then return nil end
     local raw = f:read(65537)
     f:close()
@@ -87,14 +88,18 @@ local function convert(node_id)
     local api = require('luci.passwall.api')
     local native = require('luci.passwall.util_sing-box')
     local node = api.uci_get_c(node_id)
-    if not node or node.type ~= 'sing-box' or not PLAIN[node.protocol] then
+    local core = node and (node.type or ''):lower():gsub('_', '-'):gsub(' ', '')
+    if not node or (core ~= 'sing-box' and core ~= 'singbox') or not PLAIN[node.protocol] then
         error('native Sing-box node required')
     end
     if (node.chain_proxy and node.chain_proxy ~= '' and node.chain_proxy ~= '0') or
         (node.detour and node.detour ~= '') or node.shadowtls == '1' or node.ech == '1' or
-        node.hysteria2_realms == '1' or (node.domain_resolver and node.domain_resolver ~= '') then
+        node.hysteria2_realms == '1' or (node.domain_resolver and node.domain_resolver ~= '' and
+        ((node.domain_resolver_dns and node.domain_resolver_dns ~= '') or
+         (node.domain_resolver_dns_https and node.domain_resolver_dns_https ~= ''))) then
         error('plain node with existing DNS required')
     end
+    node.type = 'sing-box'
     local previous = native.NO_RUN
     native.NO_RUN = true
     local ok, outbound = pcall(native.gen_outbound, 'psportal', node, TAG)
@@ -232,9 +237,17 @@ function M.transform(config, manifest, converter)
     return config
 end
 
+function M.active(manifest, activation)
+    if not manifest or not manifest.enabled then return false end
+    if type(activation) == 'table' and type(activation.enabled) == 'boolean' then
+        return activation.enabled
+    end
+    return manifest.autostart ~= false
+end
+
 function M.patch(raw)
     local manifest = read_manifest()
-    if not manifest or not manifest.enabled then return raw end
+    if not M.active(manifest, read_manifest(ACTIVATION)) then return raw end
     local config = json.parse(raw)
     if not config then error('invalid generated Sing-box configuration') end
     return json.stringify(M.transform(config, manifest), 1)

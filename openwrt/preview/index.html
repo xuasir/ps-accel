@@ -10,7 +10,8 @@ body{padding:16px 0}.preview-note{display:flex;align-items:center;justify-conten
 </style>
 <body>
 <div class="container">
-<div class="preview-note alert-message notice"><span>LuCI 原生风格预览 · 演示数据 · 操作改变模拟状态</span><div class="preview-actions"><select id="recording" class="cbi-input-select" aria-label="演示记录状态"><option value="normal">正常记录</option><option value="delayed">模拟采样延迟</option><option value="failed">模拟写入异常</option></select><select id="recovery" class="cbi-input-select" aria-label="演示恢复状态"><option value="normal">正常恢复</option><option value="cleanup">模拟清理失败</option><option value="query">模拟状态查询失败</option></select><button id="theme" class="btn cbi-button cbi-button-neutral" type="button">切换深色</button></div></div>
+<div class="preview-note alert-message notice"><span>界面预览 · 演示数据</span><button id="theme" class="btn cbi-button cbi-button-neutral" type="button">切换深色</button></div>
+<details class="preview-controls"><summary>演示选项</summary><div class="preview-actions"><select id="recording" class="cbi-input-select" aria-label="演示记录状态"><option value="normal">正常记录</option><option value="delayed">模拟采样延迟</option><option value="failed">模拟写入异常</option></select><select id="recovery" class="cbi-input-select" aria-label="演示恢复状态"><option value="normal">正常恢复</option><option value="cleanup">模拟清理失败</option><option value="query">模拟状态查询失败</option></select></div></details>
 <main id="app"></main>
 <script>
 window.E = function(tag, attrs, children) {
@@ -34,15 +35,15 @@ var state = {
  ok: true, config: { bridge:'br-lan',address:'10.0.0.250/24',ps5_ip:'10.0.0.100',portal_ip:'10.0.0.101',profile:'65' },
  configured:true, devices_configured:true,
  device_selectors:{portal:'02:00:00:00:00:02',ps5:'02:00:00:00:00:03'}, bridges:['br-lan'], autostart:false, running:false, mode:'active', recovery_required:false,
- baseline_saved:true, baseline_valid:true, baseline_reason:'设备、网桥与代码校验通过', modified:7,
+ baseline_saved:false, baseline_valid:false, baseline_reason:'保存配置后可启动增强', modified:7,
  last_modified:null, counts:{forwarded_out:28146}, control_mbps:0, uptime_seconds:0, foreign_relay:false,
  recovery_errors:[], job:{id:'preview-initial',state:'complete',action:'baseline',busy:false},
  observability:{status_fresh:true,write_errors:0,dropped_logs:0,coalesced_snapshots:0,last_error:''},
  logging:{mode:'compact',domains:true,tag:'Portal 升级 4.0',tag_since:Date.parse('2026-11-23T14:00:00+08:00')/1000},
- environment:{version:'0.1.6',model:'FastRhino R66S',architecture:'aarch64',kernel:'6.12.115',
+ environment:{version:'0.1.8',model:'FastRhino R66S',architecture:'aarch64',kernel:'6.12.115',
  firmware:'OpenWrt 25.12-SNAPSHOT',target:'rockchip/armv8',package_manager:'apk',host_forwarding:'1'},
  profiles:profileData.map(function(item){return {value:item[0],label:item[0]+' Mbps',description:item[1],target_mbps:Number(item[0]),experimental:item[0]==='200'};}),
- log:'[演示] LAN 网桥 br-lan 就绪\n[演示] PS5 与 Portal 设备配对完成\n[演示] BASELINE READY: connect Portal now\n[演示] 已保存连接测试，设备、网桥与代码校验通过',
+ log:'[演示] LAN 网桥 br-lan 就绪\n[演示] Portal 与 PS5 的设备身份已确认\n[演示] 码率配置已保存，目标 65 Mbps\n[演示] 启动增强后重新连接 Portal，检查画面与按键',
  events:'2026-11-23 14:20:18 INFO 已修改新连接请求，目标码率=65 Mbps\n2026-11-23 14:22:06 INFO 已完成设备网络恢复'
 };
 var runningSince = 0, instance, jobSequence = 0, probeDemo = {};
@@ -65,7 +66,7 @@ function demoExcluded(rule,exclusions) {
   !rule.includes('*') && demoMatches(rule,[exclusion]);});
 }
 var policyDemo = {
- enabled:false,hooked:false,applied:null,receipt:{},token:'',
+ enabled:false,autostart:true,hooked:false,applied:null,receipt:{},token:'',
  config:{portal:'10.0.0.101',ps5:'10.0.0.100',node:'preview-selected',ports:'443',
   domains:'auth.api.sonyentertainmentnetwork.com\nauth.api.playstation.com\nnp.ac.playstation.net\nremoteplay.dl.playstation.net',
   exclusions:'dwc.dl.playstation.net'},
@@ -85,7 +86,7 @@ function policySources(config) {
  });return result;
 }
 function policyStatus() {
- return {ok:true,enabled:policyDemo.enabled,config:policyDemo.config,nodes:policyDemo.nodes,
+ return {ok:true,enabled:policyDemo.enabled,autostart:policyDemo.autostart,config:policyDemo.config,nodes:policyDemo.nodes,
   devices:policyDemo.devices,active_config:policyDemo.applied || {},sources:policyDemo.applied?policySources(policyDemo.applied):{},
   blockers:[],receipt:policyDemo.receipt,dynamic_rules:dynamicDemoRules,
   environment:{passwall:'26.11.11-r376',singbox:'1.14.4',compatible:true,passwall_enabled:true,
@@ -184,11 +185,15 @@ window.rpc = { declare:function(spec) { return function() {
      state.device_selectors.portal!==portal.mac || state.device_selectors.ps5!==ps5.mac;
     state.config.bridge=args[0];state.config.portal_ip=args[1];state.config.ps5_ip=args[2];
     state.device_selectors={portal:portal.mac,ps5:ps5.mac};state.devices_configured=true;
-    if(changed){state.configured=false;state.baseline_valid=false;state.baseline_saved=false;state.baseline_reason='重新检查码率配置后进行连接测试';}
+    if(changed){state.configured=false;state.baseline_valid=false;state.baseline_saved=false;state.baseline_reason='重新保存码率增强配置后启动';}
     job('device_save');state.log='[演示] 设备配置已保存，透明代理与域名日志可独立使用。';
     resolve({ok:true});return;
    }
    if(spec.method==='psportal_status'){resolve(JSON.parse(JSON.stringify(policyStatus())));return;}
+   if(spec.method==='psportal_autostart'){
+    policyDemo.autostart=args[0]===1;
+    resolve({ok:true,autostart:policyDemo.autostart,enabled:policyDemo.enabled});return;
+   }
    if(spec.method==='psportal_probe'){
     var probeJob=job('psportal_probe',{state:'running',busy:true});
     var probeConfig=JSON.stringify(policyDemo.applied);
@@ -305,7 +310,7 @@ window.rpc = { declare:function(spec) { return function() {
    }
    if (spec.method === 'configure') {
     ['bridge','address','ps5_ip','portal_ip','profile'].forEach(function(key,i){state.config[key]=args[i];});
-    state.configured=true;state.baseline_valid=false;state.baseline_saved=false;state.baseline_reason='尚未完成连接测试';job('configure');
+    state.configured=true;state.baseline_valid=false;state.baseline_saved=false;state.baseline_reason='配置已保存，可启动增强';job('configure');
     state.log='[演示] 设备配对完成，请开始连接测试。';
    }
    if (spec.method === 'baseline' || spec.method === 'trial') {
@@ -336,7 +341,10 @@ window.rpc = { declare:function(spec) { return function() {
 }; } };
 window.view = { extend:function(object) { return object; } };
 window.L = { hasViewPermission:function() { return true; } };
-window.ui = { createHandlerFn:function(object, fn, name) { return function(event) { return fn.call(object,name,event); }; },
+window.ui = { createHandlerFn:function(object, fn, name) { return function(event) {
+ var target=event.currentTarget;target.disabled=true;
+ Promise.resolve(fn.call(object,name,event)).finally(function(){target.disabled=false;});
+}; },
  addNotification:function(_,element) {element.className='preview-alert alert-message warning';document.getElementById('app').prepend(element);} };
 window.poll = { add:function(fn, seconds) { window.setInterval(fn,seconds*1000); } };
 fetch('../luci/htdocs/luci-static/resources/view/ps-accel/settings.js').then(function(response){return response.text();}).then(function(source){

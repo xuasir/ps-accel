@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import socket
 import subprocess
@@ -50,27 +51,52 @@ LEASES = Path('/tmp/dhcp.leases')
 PROC = Path('/proc')
 LIVE_ROOT = Path('/tmp/etc/passwall')
 
-METADATA_LUA = '''local uci = require('luci.model.uci').cursor()
-local json = require('luci.jsonc')
-local result = {enabled=uci:get('passwall','@global[0]','enabled')=='1',nodes={}}
-local function get(section, key, default) return uci:get('passwall',section,key) or default end
-result.routing={client_proxy=get('@global[0]','client_proxy','1')=='1',
-  acl_enabled=get('@global[0]','acl_enable','0')=='1',
-  tcp_mode=get('@global[0]','tcp_proxy_mode','proxy'),
-  tcp_ports=get('@global_forwarding[0]','tcp_redir_ports','80,443'),
-  bypass_ports=get('@global_forwarding[0]','tcp_no_redir_ports','disable'),
-  ipv6=get('@global_forwarding[0]','ipv6_tproxy','0')=='1',
-  chn_list=get('@global[0]','chn_list','direct')}
-uci:foreach('passwall','nodes',function(s)
-  if s.type=='sing-box' and s.protocol and s.protocol:sub(1,1)~='_' then
-    result.nodes[#result.nodes+1]={id=s['.name'],label=s.remarks or s['.name'],protocol=s.protocol,
-      special=(s.chain_proxy and s.chain_proxy~='' and s.chain_proxy~='0') or
-        (s.detour and s.detour~='') or s.shadowtls=='1' or s.ech=='1' or s.hysteria2_realms=='1' or
-        (s.domain_resolver and s.domain_resolver~='') or false}
-  end
-end)
-print(json.stringify(result))
-'''
+def passwall_metadata():
+    """Read local nodes through UCI on both Lua and ucode-based LuCI firmware."""
+    result = port.command('uci', '-q', 'show', 'passwall', check=False, timeout=4)
+    if result.returncode:
+        raise RuntimeError('读取 PassWall 配置失败，请确认 PassWall 已安装并刷新节点')
+    sections = {}
+    for line in result.stdout.splitlines():
+        key, separator, raw = line.partition('=')
+        parts = key.split('.', 2)
+        if not separator or len(parts) < 2 or parts[0] != 'passwall':
+            continue
+        values = shlex.split(raw)
+        section = sections.setdefault(parts[1], {})
+        section[parts[2] if len(parts) == 3 else '.type'] = values[0] if len(values) == 1 else ''
+    global_config = next((s for s in sections.values() if s.get('.type') == 'global'), {})
+    forwarding = next((s for s in sections.values() if s.get('.type') == 'global_forwarding'), {})
+    nodes = []
+    for node_id, node in sections.items():
+        if node.get('.type') != 'nodes':
+            continue
+        core = node.get('type', '').lower().replace('_', '-').replace(' ', '')
+        protocol = node.get('protocol', '').lower()
+        reason = ''
+        if core not in ('sing-box', 'singbox'):
+            reason = '使用 ' + (node.get('type') or '其他核心') + '，请选择 Sing-box 节点'
+        elif protocol not in NATIVE_PROTOCOLS:
+            reason = '此节点协议或分流组待适配'
+        elif node.get('chain_proxy', '') not in ('', '0') or node.get('detour'):
+            reason = '此节点配置了链式代理'
+        elif any(node.get(key) == '1' for key in ('shadowtls', 'ech', 'hysteria2_realms')):
+            reason = '此节点的附加协议选项待适配'
+        elif node.get('domain_resolver') and (node.get('domain_resolver_dns') or node.get('domain_resolver_dns_https')):
+            reason = '此节点使用独立 DNS，请将节点 DNS 设为自动'
+        elif not re.fullmatch(r'[a-zA-Z0-9_-]{1,64}', node_id):
+            reason = '节点需要使用具名 UCI 配置'
+        nodes.append({'id': node_id, 'label': node.get('remarks') or node_id,
+                      'protocol': protocol, 'core': node.get('type', ''),
+                      'available': not reason, 'reason': reason})
+    return {'enabled': global_config.get('enabled') == '1', 'nodes': nodes,
+            'routing': {'client_proxy': global_config.get('client_proxy', '1') == '1',
+                        'acl_enabled': global_config.get('acl_enable', '0') == '1',
+                        'tcp_mode': global_config.get('tcp_proxy_mode', 'proxy'),
+                        'tcp_ports': forwarding.get('tcp_redir_ports', '80,443'),
+                        'bypass_ports': forwarding.get('tcp_no_redir_ports', 'disable'),
+                        'ipv6': forwarding.get('ipv6_tproxy', '0') == '1',
+                        'chn_list': global_config.get('chn_list', 'direct')}}
 
 
 class PolicyCancelled(RuntimeError):
@@ -83,6 +109,45 @@ def folder():
 
 def runtime():
     return port.RUNTIME / 'psportal'
+
+
+def autostart_enabled():
+    return read(folder() / 'startup.json').get('autostart', True) is True
+
+
+def policy_enabled(manifest):
+    if not manifest.get('enabled'):
+        return False
+    activation = read(runtime() / 'activation.json')
+    if type(activation.get('enabled')) is bool:
+        return activation['enabled']
+    return manifest.get('autostart', True) is True
+
+
+def set_autostart(enabled):
+    with lock():
+        manifest = read(folder() / 'manifest.json')
+        current = policy_enabled(manifest)
+        previous_setting = autostart_enabled()
+        paths = [folder() / 'startup.json', folder() / 'manifest.json', runtime() / 'activation.json']
+        previous = {p: p.read_bytes() if p.exists() else None for p in paths}
+        try:
+            port.atomic(runtime() / 'activation.json', {'enabled': current})
+            port.atomic(folder() / 'startup.json', {'autostart': enabled})
+            if manifest:
+                manifest['autostart'] = enabled
+                port.atomic(folder() / 'manifest.json', manifest)
+            port.command('/etc/init.d/ps-accel-policy', 'enable' if enabled else 'disable', timeout=5)
+        except Exception:
+            for path, data in previous.items():
+                if data is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    write_text(path, data.decode())
+            port.command('/etc/init.d/ps-accel-policy', 'enable' if previous_setting else 'disable',
+                         check=False, timeout=5)
+            raise
+    return {'ok': True, 'autostart': enabled, 'enabled': current}
 
 
 def read(path, default=None):
@@ -344,11 +409,12 @@ def tproxy_supported():
 
 def snapshot():
     errors, metadata, versions = [], {}, {}
+    node_error = ''
     try:
-        result = port.command('lua', '-e', METADATA_LUA, check=False, timeout=4)
-        metadata = json.loads(result.stdout or '{}') if result.returncode == 0 else {}
-    except (OSError, ValueError, subprocess.SubprocessError):
-        errors.append('需要固件已有的 PassWall Lua 接口')
+        metadata = passwall_metadata()
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+        node_error = 'PassWall 节点读取失败，请确认本机 PassWall 配置并刷新节点'
+        errors.append(node_error)
     try:
         result = port.command('/usr/bin/sing-box', 'version', check=False, timeout=3)
         match = re.search(r'sing-box version ([0-9.]+)', result.stdout)
@@ -369,7 +435,7 @@ def snapshot():
         errors.append('当前适配器需要已验证的 Sing-box 1.14.4')
     if not metadata.get('enabled'):
         errors.append('需要先启用现有 PassWall，再应用精确规则')
-    nodes = [x for x in metadata.get('nodes', []) if x.get('protocol') in NATIVE_PROTOCOLS and not x.get('special')]
+    nodes = metadata.get('nodes', [])
     configs = live_configs()
     if not configs:
         errors.append('需要运行现有 PassWall 的 Sing-box TCP 分流入口')
@@ -389,7 +455,7 @@ def snapshot():
     except OSError:
         adapter_hash = ''
         errors.append('精确分流适配程序待安装')
-    return {'versions': versions, 'nodes': nodes, 'devices': inventory(), 'errors': errors,
+    return {'versions': versions, 'nodes': nodes, 'node_error': node_error, 'devices': inventory(), 'errors': errors,
             'compatible': compatible, 'hooked': hooked, 'code_hash': code_hash,
             'configs': configs, 'enabled': bool(metadata.get('enabled')), 'uci_hash': uci_hash.hexdigest(),
             'adapter_hash': adapter_hash, 'routing': metadata.get('routing', {})}
@@ -435,6 +501,7 @@ def entry_scope(config, sources, env):
 def status():
     env = snapshot()
     manifest = read(folder() / 'manifest.json')
+    enabled = policy_enabled(manifest)
     config = read(folder() / 'draft.json', DEFAULTS)
     receipt = read(runtime() / 'receipt.json')
     errors = list(env['errors'])
@@ -450,7 +517,7 @@ def status():
     telemetry = read(runtime() / 'connections.json')
     revision = evidence_revision(manifest, sources)
     current = telemetry.get('revision') == revision
-    fresh = bool(current and manifest.get('enabled') and
+    fresh = bool(current and enabled and
                  0 <= time.time() - telemetry.get('epoch', 0) < 15) if type(telemetry.get('epoch')) in (int, float) else False
     if not current:
         telemetry.update(connections=[], matched_connections=0)
@@ -459,15 +526,16 @@ def status():
     telemetry['download_direct_verified'] = bool(fresh and telemetry.get('download_direct_verified'))
     scope['traffic_verified'] = telemetry['traffic_verified']
     probes = read(runtime() / 'probes.json')
-    probes['current_config'] = bool(manifest.get('enabled') and probes.get('revision') == revision)
+    probes['current_config'] = bool(enabled and probes.get('revision') == revision)
     return {'ok': True, 'config': config, 'active_config': manifest.get('config', {}),
-            'enabled': bool(manifest.get('enabled')),
+            'enabled': enabled, 'autostart': autostart_enabled(),
             'environment': {'passwall': '26.11.11-r376' if env['compatible'] else '',
                             'singbox': env['versions']['singbox'], 'compatible': env['compatible'],
                             'passwall_enabled': env['enabled'], 'hooked': env['hooked'],
                             'active_cores': len(env['configs']), 'attached_cores': attached,
                             'routing': env.get('routing', {})},
-            'nodes': env['nodes'], 'devices': env['devices'], 'sources': sources,
+            'nodes': env['nodes'], 'node_error': env.get('node_error', ''),
+            'devices': env['devices'], 'sources': sources,
             'blockers': errors, 'receipt': receipt, 'entry_scope': scope,
             'telemetry': telemetry, 'probes': probes,
             'dynamic_rules': dynamic_rule_info(),
@@ -479,8 +547,9 @@ def preview(request, validate_runtime=True):
     env = snapshot()
     sources, canonical = resolve(config, env['devices'])
     errors = list(env['errors'])
-    if not any(x['id'] == config['node'] for x in env['nodes']):
-        errors.append('请选择现有的原生 Sing-box 节点，首版支持普通节点')
+    selected = next((x for x in env['nodes'] if x['id'] == config['node']), None)
+    if not selected or selected.get('available') is False:
+        errors.append(selected.get('reason') if selected else '请选择本机 PassWall 的 Sing-box 节点')
     for role, ips in sources.items():
         if not ips:
             errors.append(('Portal' if role == 'portal' else 'PS5') + ' 当前地址待发现，请保持设备在线')
@@ -618,7 +687,7 @@ def apply(request, cancel=lambda: False):
         rules = rule_set(config, plan['sources'])
         if all(x['excluded'] for x in plan['rules']):
             raise RuntimeError('目标主机名均在直连排除列表中，请检查预览')
-        manifest = {'version': 1, 'enabled': True, 'owned': True, 'config': config,
+        manifest = {'version': 1, 'enabled': True, 'autostart': autostart_enabled(), 'owned': True, 'config': config,
                     'rules_path': str(folder() / 'rules.json'),
                     'direct_rules_path': str(folder() / 'direct-rules.json'),
                     'diagnostics': {'secret': read(folder() / 'manifest.json').get('diagnostics', {}).get('secret') or
@@ -630,14 +699,16 @@ def apply(request, cancel=lambda: False):
             raise RuntimeError('校验期间配置或设备状态已变化，请重新预览')
         if cancel():
             raise PolicyCancelled('精确分流应用已取消')
-        paths = [folder() / 'rules.json', folder() / 'direct-rules.json', folder() / 'manifest.json', folder() / 'draft.json', PASSWALL]
+        paths = [folder() / 'rules.json', folder() / 'direct-rules.json', folder() / 'manifest.json', folder() / 'draft.json',
+                 PASSWALL, runtime() / 'activation.json']
         previous = {p: p.read_bytes() if p.exists() else None for p in paths}
-        old_enabled = bool(read(folder() / 'manifest.json').get('enabled'))
+        old_enabled = policy_enabled(read(folder() / 'manifest.json'))
         restarted = False
         try:
             port.atomic(folder() / 'rules.json', rules)
             port.atomic(folder() / 'direct-rules.json', direct_rule_set(config, plan['sources']))
             port.atomic(folder() / 'manifest.json', manifest)
+            port.atomic(runtime() / 'activation.json', {'enabled': True})
             port.atomic(folder() / 'draft.json', config)
             if plan['restart_required']:
                 text = clean_hook(PASSWALL.read_text())
@@ -657,7 +728,7 @@ def apply(request, cancel=lambda: False):
                     raise RuntimeError('精确规则加载待确认，已请求恢复原配置')
             if cancel():
                 raise PolicyCancelled('精确分流应用已取消，正在恢复原配置')
-            for action in ('enable', 'start'):
+            for action in ('enable' if manifest['autostart'] else 'disable', 'start'):
                 result = port.command('/etc/init.d/ps-accel-policy', action, check=False, timeout=5)
                 if result.returncode:
                     raise RuntimeError('设备地址跟踪服务启动失败，正在恢复原规则')
@@ -731,7 +802,7 @@ def detach():
 def refresh_sources():
     with lock():
         manifest = read(folder() / 'manifest.json')
-        if not manifest.get('enabled') or not manifest.get('config'):
+        if not policy_enabled(manifest) or not manifest.get('config'):
             return
         sources, _ = resolve(manifest['config'], inventory())
         rules = rule_set(manifest['config'], sources)
@@ -744,9 +815,9 @@ def refresh_sources():
 
 
 def resume():
-    if read(folder() / 'manifest.json').get('enabled'):
+    if policy_enabled(read(folder() / 'manifest.json')):
         refresh_sources()
-        for action in ('enable', 'start'):
+        for action in ('enable' if autostart_enabled() else 'disable', 'start'):
             port.command('/etc/init.d/ps-accel-policy', action, timeout=5)
 
 
@@ -765,7 +836,7 @@ def watch():
                 refresh_sources()
                 next_sources = time.monotonic() + 10
             manifest = read(folder() / 'manifest.json')
-            if manifest.get('enabled'):
+            if policy_enabled(manifest):
                 sources, _ = resolve(manifest['config'], inventory())
                 port.atomic(runtime() / 'connections.json', tracker.sample(live_configs(), sources, manifest))
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
@@ -778,7 +849,7 @@ def watch():
 
 def probe_connections(cancel=lambda: False):
     manifest = read(folder() / 'manifest.json')
-    if not manifest.get('enabled'):
+    if not policy_enabled(manifest):
         raise RuntimeError('启用透明代理后检测所选出口')
     expected = manifest.get('expected_outbounds', {})
     configs = [item for item in live_configs()

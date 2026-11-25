@@ -68,7 +68,6 @@ class ForwardingIsolationTests(unittest.TestCase):
             return value
 
         with (
-            patch.object(engine, 'baseline_valid', return_value=True),
             patch.object(net, 'state_for', return_value=self.state),
             patch.object(net, 'Lock') as lock,
             patch.object(net, 'open_socket'),
@@ -78,7 +77,7 @@ class ForwardingIsolationTests(unittest.TestCase):
             patch.object(engine.signal, 'signal', side_effect=lambda sig, fn: handlers.update({sig: fn})),
             patch.object(engine, 'Telemetry', side_effect=recorder),
         ):
-            counts = engine.run(self.config, self.root, generation='new-launch')
+            counts = engine.run(self.config, self.root, generation='new-launch', require_baseline=False)
         self.assertEqual(counts['forwarded_out'], 40)
         self.assertEqual(counts['unique_modified_startups'], 1)
         forwarded = [call.args[1] for call in send.call_args_list if isinstance(call.args[1], bytes)]

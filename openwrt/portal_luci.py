@@ -39,6 +39,7 @@ METHODS = {'status': {}, 'details': {}, 'devices': {}, 'device_save': {key: '' f
            'logging': {'mode': '', 'domains': 0, 'tag': ''}, 'domains': {'incident': ''}, 'incident': {'note': ''},
            'baseline': {}, 'trial': {}, 'start': {'autostart': 0}, 'stop': {}, 'repair': {}, 'doctor': {}}
 METHODS.update({'psportal_status': {}, 'psportal_preview': {key: '' for key in policy.FIELDS},
+                'psportal_autostart': {'autostart': 0},
                 'psportal_save': {key: '' for key in policy.FIELDS},
                 'psportal_apply': dict({key: '' for key in policy.FIELDS}, token='', confirm_restart=0),
                 'psportal_disable': {}, 'psportal_probe': {}})
@@ -236,15 +237,18 @@ def status():
 
 
 def details():
-    """Static configuration and full baseline validation, refreshed on changes."""
+    """Static configuration and optional connection diagnostics, refreshed on changes."""
     revision = port.configuration_revision()
     warnings = []
     config = {key: '65' if key == 'profile' else '' for key in port.Settings.__dataclass_fields__}
     values = {}
+    settings_valid = False
     try:
         values = port.uci_values()
         config.update({key: values.get(key, config[key]) for key in config})
-        baseline = port.baseline_state(port.Settings(**config).validate())
+        settings = port.Settings(**config).validate()
+        settings_valid = True
+        baseline = port.baseline_state(settings)
     except READ_ERRORS as exc:
         baseline = {'valid': False, 'reason': '配置读取或校验失败，请检查设备配置'}
         warnings.append(str(exc))
@@ -261,7 +265,8 @@ def details():
         warnings.append('日志偏好读取失败：' + str(exc))
     binding = port.device_binding(values)
     enrollment = optional(port.PERSIST / 'auto-config.json')
-    paired = (enrollment.get('network') == {'interface': port.IFACE, 'ps5_ip': config['ps5_ip'],
+    paired = (settings_valid and bool(binding) and enrollment.get('profile') == config['profile'] and
+              enrollment.get('network') == {'interface': port.IFACE, 'ps5_ip': config['ps5_ip'],
                                             'portal_ip': config['portal_ip']})
     return {'ok': True, 'config': config, 'configured': paired,
             'devices_configured': bool(binding),
@@ -280,7 +285,7 @@ def devices():
     binding = port.device_binding(values)
     return {'ok': True, 'config': {key: values.get(key, '') for key in port.DEVICE_FIELDS},
             'configured': bool(binding), 'binding': binding, 'devices': policy.inventory(),
-            'proxy_enabled': bool(policy.read(policy.folder() / 'manifest.json').get('enabled'))}
+            'proxy_enabled': policy.policy_enabled(policy.read(policy.folder() / 'manifest.json'))}
 
 
 def save_devices(request):
@@ -290,7 +295,7 @@ def save_devices(request):
         if (port.ENGINE_LOCK.exists() or (port.RUNTIME / 'recovery-required').exists()
                 or port.HANDLE.exists() or (port.SYSNET / port.HOST).exists()):
             raise RuntimeError('请先停止码率增强并完成网络恢复，再保存设备配置')
-        if policy.read(policy.folder() / 'manifest.json').get('enabled'):
+        if policy.policy_enabled(policy.read(policy.folder() / 'manifest.json')):
             raise RuntimeError('请先停用透明代理，再保存设备配置')
         if not (port.SYSNET / request['bridge'] / 'bridge').is_dir():
             raise ValueError('所选 LAN 网桥待就绪，请检查设备所在网络')
@@ -598,7 +603,7 @@ def validate(method, request):
     if method == 'incident' and (not isinstance(request['note'], str) or not request['note'].strip()
                                 or len(request['note']) > 300 or any(ord(c) < 32 for c in request['note'])):
         raise ValueError('失败描述使用 1 至 300 字的单行文本')
-    if method == 'start' and (type(request['autostart']) is not int or request['autostart'] not in (0, 1)):
+    if method in ('start', 'psportal_autostart') and (type(request['autostart']) is not int or request['autostart'] not in (0, 1)):
         raise ValueError('Invalid autostart setting')
     if method in ('psportal_preview', 'psportal_save', 'psportal_apply'):
         policy.normalize({key: request[key] for key in policy.FIELDS})
@@ -635,6 +640,11 @@ def dispatch(method, request):
         return policy.preview(request)
     if method == 'psportal_save':
         return policy.save(request)
+    if method == 'psportal_autostart':
+        with control_lock():
+            if current_job().get('busy'):
+                raise RuntimeError('代理任务进行中，请等待完成后设置开机启用')
+            return policy.set_autostart(bool(request['autostart']))
     with control_lock():
         old = current_job()
         if old.get('busy'):
@@ -871,7 +881,7 @@ def worker(job_id):
             argv = [CLI, 'try', '--seconds', '90'] if action == 'trial' else [CLI, action]
             run_child(job_id, argv, cancellable=action in ('baseline', 'trial', 'doctor'))
         elif action == 'start':
-            port.verify_baseline(port.Settings.load())
+            port.verify_configuration(port.Settings.load())
             checked('uci', 'set', 'ps_accel.main.enabled=1')
             checked('uci', 'commit', 'ps_accel')
             checked(SERVICE, 'enable' if request['autostart'] else 'disable')
