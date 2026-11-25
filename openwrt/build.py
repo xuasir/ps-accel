@@ -9,10 +9,10 @@ import tarfile
 
 ROOT = Path(__file__).resolve().parent
 OUT = ROOT / 'release-assets'
-VERSION = '0.1.8-1'
+VERSION = '0.1.9-1'
 ENGINE = ['portal_auto.py', 'portal_auto_platform.py', 'portal_active_probe.py',
           'portal_capture.py', 'portal_egress_witness.py', 'portal_windows_network.py',
-          'protocol.py', 'profiles.py', 'telemetry.py', 'observability.py', 'domain_tracker.py',
+          'protocol.py', 'profiles.py', 'telemetry.py', 'observability.py', 'stream_quality.py', 'domain_tracker.py',
           'portal_observe.py', 'portal_policy.py', 'sony_domains.py', 'proxy_telemetry.py',
           'psportal_adapter.lua', 'LICENSE', 'requirements.txt', 'UPSTREAM.md']
 

@@ -318,7 +318,7 @@ test('hidden log panels generate only dynamic status polls', async () => {
  await h.app.refresh(); await settle();
  assert.deepEqual(h.calls.map(call => call.method), ['status']);
  assert.equal(h.poll.seconds, 3);
- h.app.selectStage('bitrate', 'logs'); await h.app.refreshLogs();
+ h.app.selectStage('bitrate', 'logs'); await h.app.refreshLogs(true);
  assert.equal(h.app.logNode.textContent, 'bitrate output');
  assert.deepEqual(h.calls.filter(call => call.method === 'logs').map(call => call.args), [['bitrate']]);
  h.app.logTab = 'events'; await h.app.refreshLogs();
@@ -401,7 +401,7 @@ test('an older request finishing leaves the newer stop request pending', async (
 test('a blocked log response allows status polling and service controls to continue', async () => {
  const h = harness({ manualTimers: true }); await h.init();
  h.handlers.logs = () => new Promise(() => {});
- h.app.selectStage('bitrate', 'logs'); const log = h.app.refreshLogs(); await settle();
+ h.app.selectStage('bitrate', 'logs'); const log = h.app.refreshLogs(true); await settle();
  h.status.modified = 42;
  await h.app.refresh();
  assert.equal(h.app.countNode.textContent, '42');
@@ -463,6 +463,68 @@ test('a remaining orphan enables stop and keeps repair waiting for its exit', as
 });
 
 const elementText = node => node.textContent + node.children.map(elementText).join(' ');
+
+function qualitySample() {
+ return { state: 'degraded', source: 'client_feedback', requested_profile: '65', request_observed: true,
+  feedback_fresh: true, report_fresh: true, loss_percent: 3, received: 2910, lost: 90,
+  corrupt_reports: 2, idr_requests: 1, feedback_samples: 30,
+  relay: { receive_stats_available: true, dropped: 0, dropped_total: 0, processing_p95_ms: .25 },
+  advice: { kind: 'lower', reason: 'sustained_loss', profile: '45', sustained_seconds: 6, loss_percent: 3 } };
+}
+
+test('quality advice renders without selecting a profile or sending writes', async () => {
+ const h = harness(); await h.init();
+ h.status.running = h.status.engine_alive = true; h.status.quality = qualitySample();
+ h.calls.length = 0; await h.app.refresh();
+ assert.equal(h.app.qualityNode.textContent, '3.00%');
+ assert.match(h.app.qualityDetail.textContent, /坏帧报告 2 \/ 关键帧请求 1/);
+ assert.match(h.app.relayQualityNode.textContent, /0.25 ms/);
+ assert.match(h.app.qualityAdvice.textContent, /建议试用 45 Mbps/);
+ assert.equal(h.app.qualityAdvice.dataset.advice, 'lower');
+ assert.equal(h.app.selectedProfile, '65');
+ assert.equal(h.app.buttons.profile.disabled, true);
+ assert.deepEqual(h.calls.map(call => call.method), ['status']);
+ h.status.quality.request_observed = false;
+ h.status.quality.advice = {kind:'wait',reason:'waiting_startup',profile:null};
+ await h.app.refresh();
+ assert.match(h.app.qualityAdvice.textContent, /重新连接 Portal/);
+ assert.equal(h.app.selectedProfile, '65');
+});
+
+test('quality expiry and relay drops replace the profile recommendation', async () => {
+ const h = harness(); await h.init();
+ h.status.running = h.status.engine_alive = true; h.status.quality = qualitySample();
+ h.status.quality.state = 'stale'; h.status.quality.feedback_fresh = false;
+ await h.app.refresh();
+ assert.equal(h.app.qualityNode.textContent, '数据过期');
+ assert.equal(h.app.qualityAdvice.dataset.advice, 'wait');
+ assert.doesNotMatch(h.app.qualityAdvice.textContent, /45 Mbps/);
+ h.status.quality = qualitySample(); h.status.quality.state = 'relay_overload';
+ h.status.quality.relay.dropped = h.status.quality.relay.dropped_total = 3;
+ h.status.quality.advice = { kind: 'check_relay', reason: 'receive_drops', profile: null };
+ await h.app.refresh();
+ assert.match(h.app.qualityAdvice.textContent, /优先检查路由器负载/);
+ assert.match(h.app.relayQualityDetail.textContent, /接收队列丢包 3/);
+ assert.equal(h.app.qualityAdvice.dataset.advice, 'check_relay');
+ assert.equal(h.app.selectedProfile, '65');
+});
+
+test('read-only users see quality states while existing profile controls retain permissions', async () => {
+ const h = harness({ permission: false }); await h.init();
+ h.status.running = h.status.engine_alive = true; h.status.quality = qualitySample();
+ await h.app.refresh();
+ assert.match(h.app.qualityAdvice.textContent, /建议试用 45 Mbps/);
+ assert.equal(h.app.profileButtons.every(button => button.disabled), true);
+ assert.equal(h.app.buttons.profile.disabled, true);
+ for (const [state, label] of [['waiting', '等待反馈'], ['unsupported', '格式待适配'], ['unavailable', '采集异常']]) {
+  h.status.quality = { state, report_fresh: true, feedback_fresh: false, advice: { kind: 'wait' } };
+  await h.app.refresh();
+  assert.equal(h.app.qualityNode.textContent, label);
+  assert.doesNotMatch(h.app.qualityAdvice.textContent, /45 Mbps/);
+ }
+ h.status.running = false; await h.app.refresh();
+ assert.equal(h.app.qualityNode.textContent, '等待启动');
+});
 
 test('domain views load on demand and compact polling reuses the ten-second sample', async () => {
  const h = harness(); await h.init(); h.calls.length = 0;
@@ -1008,9 +1070,9 @@ test('a completed connectivity probe preserves an edited proxy draft', async () 
  assert.ok(h.calls.some(call => call.method === 'psportal_probe'));
  assert.equal(h.app.policyInputs.domains.value, 'edited.auth.np.ac.playstation.net');
  assert.equal(h.app.policyTouched.domains, true);
- assert.match(h.app.policyNotice.textContent, /出口检测完成/);
+ assert.match(h.app.policyNotice.textContent, /连接检测完成/);
  h.app.update({...h.app.latest,job:{id:'probe-cancelled',action:'psportal_probe',state:'cancelled',busy:false}});
- assert.match(h.app.policyNotice.textContent, /出口检测已取消/);
+ assert.match(h.app.policyNotice.textContent, /连接检测已取消/);
  h.app.update({...h.app.latest,job:{id:'probe-failed',action:'psportal_probe',state:'failed',busy:false,error:'检测入口待检查'}});
  assert.equal(h.app.policyNotice.textContent, '检测入口待检查');
  assert.equal(h.app.policyNotice.attributes['data-error'], 'true');

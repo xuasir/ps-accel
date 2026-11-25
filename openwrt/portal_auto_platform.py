@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import struct
 import subprocess
 import sys
 import time
@@ -107,6 +108,16 @@ def receive(sock):
         return None
     _, frame, _ = sock.recv_raw()
     return frame
+
+
+def receive_statistics(sock):
+    """Read/reset this Linux capture socket's packet/drop counters."""
+    if sys.platform != 'linux' or sock is None:
+        return None
+    try:
+        return struct.unpack('=II', sock.ins.getsockopt(263, 6, 8))  # SOL_PACKET, PACKET_STATISTICS
+    except (AttributeError, OSError, TypeError, struct.error):
+        return None
 
 
 def send(sock, frame):

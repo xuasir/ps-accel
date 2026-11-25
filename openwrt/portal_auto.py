@@ -20,6 +20,7 @@ import portal_auto_platform as net
 from profiles import PROFILES
 from telemetry import Telemetry
 from observability import new_incident
+from stream_quality import StreamQuality, unavailable_quality
 
 ROOT = Path(__file__).resolve().parent
 LOG = logging.getLogger('portal-auto')
@@ -51,7 +52,7 @@ def config(path):
 def fingerprint(c):
     binding = {key: value for key, value in c.items() if key != 'profile'}
     digest = hashlib.sha256(json.dumps(binding, sort_keys=True).encode())
-    for name in ('portal_auto.py', 'portal_auto_platform.py', 'portal_active_probe.py', 'portal_windows_network.py', 'protocol.py', 'profiles.py', 'telemetry.py', 'observability.py'):
+    for name in ('portal_auto.py', 'portal_auto_platform.py', 'portal_active_probe.py', 'portal_windows_network.py', 'protocol.py', 'profiles.py', 'telemetry.py', 'observability.py', 'stream_quality.py'):
         digest.update((ROOT / name).read_bytes())
     return digest.hexdigest()
 
@@ -185,6 +186,18 @@ def run(c, runtime, active=True, seconds=None, generation='', preferences=None, 
     last_mutation = None
     last_rate_time = started
     last_rate_bytes = 0
+    quality = StreamQuality()
+    def quality_snapshot(now, running=True):
+        nonlocal quality
+        if quality is not None:
+            try:
+                if running:
+                    quality.receive_statistics(net.receive_statistics(rx), now)
+                return quality.snapshot(now, c['profile'], active, running)
+            except Exception:
+                quality = None
+        return unavailable_quality(c['profile'], running)
+
     def stop(_sig, _frame):
         nonlocal running
         running = False
@@ -245,14 +258,16 @@ def run(c, runtime, active=True, seconds=None, generation='', preferences=None, 
                     'guardian_pid': guard.pid, 'mode': 'active' if active else 'baseline', 'profile': c['profile'],
                     'counts': dict(counts), 'last_mutation': last_mutation,
                     'uptime_seconds': round(now - started, 1), 'control_mbps': round(control_mbps, 3),
+                    'quality': quality_snapshot(now),
                     'limit': 'control_mbps 记录 Portal 到 PS5 的中继流量；视频回程使用设备直达路径。'}
                 if telemetry is not None:
                     telemetry.snapshot(snapshot)
                 last_rate_time, last_rate_bytes = now, counts['forwarded_bytes']
-                next_status = now + (telemetry.snapshot_interval if telemetry is not None else 10)
+                next_status = now + min(2, telemetry.snapshot_interval if telemetry is not None else 2)
             frame = net.receive(rx)
             if not frame:
                 continue
+            processing_started = time.monotonic()
             result = outbound(frame, state, active)
             if not result:
                 continue
@@ -260,6 +275,14 @@ def run(c, runtime, active=True, seconds=None, generation='', preferences=None, 
             net.send(tx, forwarded)
             counts['forwarded_out'] += 1
             counts['forwarded_bytes'] += len(forwarded)
+            if quality is not None:
+                try:
+                    observed_at = time.monotonic()
+                    quality.observe_frame(frame, payload, observed_at, changed)
+                    quality.forwarded(observed_at, (time.monotonic() - processing_started) * 1000)
+                except Exception:
+                    # Quality collection has no authority over forwarding/recovery.
+                    quality = None
             if changed:
                 counts['modified_packets_including_retransmits'] += 1
                 ident = (payload[1:5], payload[17:21])
@@ -299,7 +322,8 @@ def run(c, runtime, active=True, seconds=None, generation='', preferences=None, 
         snapshot = {'time': utc(), 'state': 'stopped' if not errors else 'recovery_failed',
                    'counts': dict(counts), 'last_mutation': last_mutation, 'errors': errors,
                    'mode': 'active' if active else 'baseline', 'profile': c['profile'],
-                   'uptime_seconds': round(time.monotonic() - started, 1), 'control_mbps': 0}
+                   'uptime_seconds': round(time.monotonic() - started, 1), 'control_mbps': 0,
+                   'quality': quality_snapshot(time.monotonic(), running=False)}
         if telemetry is not None:
             telemetry.snapshot(snapshot)
             if errors:

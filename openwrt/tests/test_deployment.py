@@ -79,6 +79,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(installed.returncode, 0, installed.stderr.decode())
         self.assertTrue((target / 'usr/lib/ps-accel/profiles.py').exists())
         self.assertTrue((target / 'usr/lib/ps-accel/telemetry.py').exists())
+        self.assertTrue((target / 'usr/lib/ps-accel/stream_quality.py').exists())
         self.assertTrue((target / 'usr/lib/ps-accel/portal_observe.py').exists())
         self.assertTrue((target / 'usr/lib/ps-accel/portal_policy.py').exists())
         self.assertTrue((target / 'usr/lib/ps-accel/psportal_adapter.lua').exists())

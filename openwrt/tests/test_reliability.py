@@ -95,8 +95,10 @@ class ReliabilityTests(unittest.TestCase):
         self.stack.enter_context(patch.object(api.time, 'sleep', self.clock.sleep))
 
     def start_prerequisites(self):
+        port.atomic(port.PERSIST / 'auto-config.json', {
+            'network': self.settings.engine(), 'profile': self.settings.profile,
+            'ps5_mac': '02:00:00:00:00:02', 'portal_mac': '02:00:00:00:00:03'})
         self.stack.enter_context(patch.object(port.Settings, 'load', return_value=self.settings))
-        self.stack.enter_context(patch.object(port, 'verify_baseline'))
         self.stack.enter_context(patch.object(api, 'checked'))
 
     def test_task_record_failure_terminates_and_reaps_a_real_child(self):

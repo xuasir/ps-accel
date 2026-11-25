@@ -155,6 +155,7 @@ class EnhancementTests(unittest.TestCase):
         current = {'environment': {'model': 'FastRhino R66S'}, 'config': port.asdict(self.settings),
                    'configured': True, 'running': False, 'mode': 'active', 'modified': 7, 'control_mbps': 0,
                    'uptime_seconds': 0, 'foreign_relay': False, 'counts': {'forwarded_out': 42},
+                   'quality': {'state': 'waiting', 'source': 'client_feedback'},
                    'baseline_valid': True, 'baseline_reason': '校验通过', 'recovery_required': False,
                    'recovery_errors': ['10.0.0.101 02:00:00:00:00:03 unreachable'],
                    'job': {'action': 'doctor', 'state': 'failed', 'error': '10.0.0.100 failed'},
@@ -164,6 +165,7 @@ class EnhancementTests(unittest.TestCase):
         for private in ('10.0.0.100', '10.0.0.101', '10.0.0.250', '02:00:00:00:00:03', 'private-session-id'):
             self.assertNotIn(private, serialized)
         self.assertIn('FastRhino R66S', serialized)
+        self.assertEqual(json.loads(serialized)['quality'], current['quality'])
 
     def test_diagnostics_rpc_stays_read_only(self):
         with patch.object(api, 'diagnostics', return_value={'ok': True}) as export:

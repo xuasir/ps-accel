@@ -11,7 +11,7 @@ body{padding:16px 0}.preview-note{display:flex;align-items:center;justify-conten
 <body>
 <div class="container">
 <div class="preview-note alert-message notice"><span>界面预览 · 演示数据</span><button id="theme" class="btn cbi-button cbi-button-neutral" type="button">切换深色</button></div>
-<details class="preview-controls"><summary>演示选项</summary><div class="preview-actions"><select id="recording" class="cbi-input-select" aria-label="演示记录状态"><option value="normal">正常记录</option><option value="delayed">模拟采样延迟</option><option value="failed">模拟写入异常</option></select><select id="recovery" class="cbi-input-select" aria-label="演示恢复状态"><option value="normal">正常恢复</option><option value="cleanup">模拟清理失败</option><option value="query">模拟状态查询失败</option></select></div></details>
+<details class="preview-controls"><summary>演示选项</summary><div class="preview-actions"><select id="quality" class="cbi-input-select" aria-label="启动增强后的质量演示"><option value="stable">正常质量反馈</option><option value="loss">持续丢失与降档建议</option><option value="relay">中继接收队列丢包</option><option value="waiting">等待质量反馈</option><option value="unsupported">反馈格式待适配</option><option value="stale">质量数据过期</option></select><select id="recording" class="cbi-input-select" aria-label="演示记录状态"><option value="normal">正常记录</option><option value="delayed">模拟采样延迟</option><option value="failed">模拟写入异常</option></select><select id="recovery" class="cbi-input-select" aria-label="演示恢复状态"><option value="normal">正常恢复</option><option value="cleanup">模拟清理失败</option><option value="query">模拟状态查询失败</option></select></div></details>
 <main id="app"></main>
 <script>
 window.E = function(tag, attrs, children) {
@@ -40,13 +40,33 @@ var state = {
  recovery_errors:[], job:{id:'preview-initial',state:'complete',action:'baseline',busy:false},
  observability:{status_fresh:true,write_errors:0,dropped_logs:0,coalesced_snapshots:0,last_error:''},
  logging:{mode:'compact',domains:true,tag:'Portal 升级 4.0',tag_since:Date.parse('2026-11-23T14:00:00+08:00')/1000},
- environment:{version:'0.1.8',model:'FastRhino R66S',architecture:'aarch64',kernel:'6.12.115',
+ environment:{version:'0.1.9',model:'FastRhino R66S',architecture:'aarch64',kernel:'6.12.115',
  firmware:'OpenWrt 25.12-SNAPSHOT',target:'rockchip/armv8',package_manager:'apk',host_forwarding:'1'},
  profiles:profileData.map(function(item){return {value:item[0],label:item[0]+' Mbps',description:item[1],target_mbps:Number(item[0]),experimental:item[0]==='200'};}),
  log:'[演示] LAN 网桥 br-lan 就绪\n[演示] Portal 与 PS5 的设备身份已确认\n[演示] 码率配置已保存，目标 65 Mbps\n[演示] 启动增强后重新连接 Portal，检查画面与按键',
  events:'2026-11-23 14:20:18 INFO 已修改新连接请求，目标码率=65 Mbps\n2026-11-23 14:22:06 INFO 已完成设备网络恢复'
 };
-var runningSince = 0, instance, jobSequence = 0, probeDemo = {};
+var runningSince = 0, instance, jobSequence = 0, probeDemo = {}, qualityDemo = 'stable';
+function demoQuality() {
+ var loss=qualityDemo==='loss', waiting=qualityDemo==='waiting', stale=qualityDemo==='stale';
+ var unsupported=qualityDemo==='unsupported', relay=qualityDemo==='relay';
+ var profiles=profileData.map(function(item){return item[0];}), index=profiles.indexOf(state.config.profile);
+ var fresh=state.running && !waiting && !stale && !unsupported && state.observability.status_fresh;
+ var kind=relay?'check_relay':loss?(index?'lower':'minimum'):fresh?'keep':'wait';
+ return {state:!state.running?'stopped':relay?'relay_overload':loss?'degraded':waiting?'waiting':
+  stale?'stale':unsupported?'unsupported':'healthy', source:'client_feedback', window_seconds:12,
+  requested_profile:state.config.profile, request_observed:true, client_version:20, feedback_fresh:!!fresh,
+  report_fresh:!!state.observability.status_fresh, feedback_age_seconds:stale?8:fresh?0.2:null,
+  received:fresh?14400:0, lost:fresh?(loss?600:22):0, loss_percent:fresh?(loss?4:.15):null,
+  feedback_reports:fresh?60:0, feedback_samples:fresh?60:0,
+  corrupt_reports:loss?3:0, idr_requests:loss?1:0, unknown_feedback:unsupported?10:0,
+  relay:{receive_stats_available:true,received:800,dropped:relay?8:0,dropped_total:relay?8:0,
+   processing_samples:800,processing_p95_ms:.25},
+  advice:{kind:!state.running?'stopped':kind, reason:relay?'receive_drops':loss?'sustained_loss':
+   stale?'feedback_stale':unsupported?'feedback_layout':waiting?'waiting_feedback':'feedback_stable',
+   profile:state.running && loss && index?profiles[index-1]:null,
+   sustained_seconds:loss?6:0,loss_percent:loss?4:null}};
+}
 var dynamicDemoRules = ['*.auth.np.ac.playstation.net', '*.np.communication.playstation.net', 'gsconnect.*',
  '*.gsconnect.playstation.net', '*signaling*', '*.remoteplay.playstation.net'].map(function(domain) {
  return {domain:domain,builtin:true};
@@ -242,6 +262,7 @@ window.rpc = { declare:function(spec) { return function() {
      state.control_mbps = [0.018,0.024,0.021,0.029,0.017,0.026][Math.floor(state.uptime_seconds/3)%6];
      state.counts.forwarded_out += 73;
     }
+    state.quality = demoQuality();
     state.sample_time = state.observability.status_fresh ? new Date().toISOString() : null;
     var dynamic=JSON.parse(JSON.stringify(state));
     ['config','configured','devices_configured','device_selectors','bridges','autostart','baseline_saved','baseline_valid','baseline_reason',
@@ -360,6 +381,11 @@ document.getElementById('recording').addEventListener('change',function(){
  var delayed=this.value==='delayed', failed=this.value==='failed';
  state.observability={status_fresh:!delayed,write_errors:failed?3:0,dropped_logs:failed?2:0,
   coalesced_snapshots:delayed?12:0,last_error:failed?'[演示] 日志写入失败':''};
+ state.quality=demoQuality();
+ if(instance) instance.update(JSON.parse(JSON.stringify(state)));
+});
+document.getElementById('quality').addEventListener('change',function(){
+ qualityDemo=this.value;state.quality=demoQuality();
  if(instance) instance.update(JSON.parse(JSON.stringify(state)));
 });
 document.getElementById('recovery').addEventListener('change',function(){

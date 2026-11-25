@@ -97,6 +97,54 @@ class ForwardingIsolationTests(unittest.TestCase):
         self.assertGreaterEqual(recorders[0].health()['write_errors'], 2)
         self.assertFalse((self.root / 'recovery-required').exists())
 
+    def test_quality_collection_failure_preserves_forwarding_and_recovery(self):
+        recorders = []
+        with patch.object(engine.StreamQuality, 'observe_frame', side_effect=RuntimeError('quality unavailable')) as collect:
+            self.run_relay(lambda: True, recorders)
+        collect.assert_called_once()
+        self.assertFalse((self.root / 'recovery-required').exists())
+
+    def test_quality_snapshot_failure_preserves_forwarding_and_recovery(self):
+        recorders = []
+        with patch.object(engine.StreamQuality, 'snapshot', side_effect=RuntimeError('quality snapshot unavailable')) as collect:
+            self.run_relay(lambda: True, recorders)
+        collect.assert_called_once()
+        self.assertFalse((self.root / 'recovery-required').exists())
+
+    def test_passive_feedback_preserves_payload_and_authentication_bytes(self):
+        from test_stream_quality import feedback
+        quality = engine.StreamQuality()
+        for index, payload in enumerate((feedback(), feedback() + b'unknown-layout')):
+            frame = bytes(Ether(src=self.state['portal_mac'], dst=self.state['own_mac']) /
+                          IP(src=net.PORTAL, dst=net.PS5) / UDP(sport=50000, dport=9296) / Raw(payload))
+            with patch.object(engine.probe, 'network', net):
+                forwarded, observed, direction, changed = engine.outbound(frame, self.state)
+            self.assertFalse(changed)
+            self.assertEqual(direction, 'out')
+            self.assertEqual(forwarded[14:], frame[14:])
+            self.assertEqual(observed, payload)
+            quality.observe_frame(frame, observed, index)
+        self.assertEqual(quality.snapshot(1.1, '65')['unknown_feedback'], 1)
+        self.assertFalse(quality.snapshot(1.1, '65')['request_observed'])
+        payload, *_ = fixture()
+        frame = bytes(Ether(src=self.state['portal_mac'], dst=self.state['own_mac']) /
+                      IP(src=net.PORTAL, dst=net.PS5) / UDP(sport=50000, dport=9296) / Raw(payload))
+        with patch.object(engine.probe, 'network', net):
+            _, observed, _, changed = engine.outbound(frame, self.state)
+        self.assertTrue(changed)
+        quality.observe_frame(frame, observed, 2, changed)
+        self.assertTrue(quality.snapshot(2.1, '65')['request_observed'])
+
+    def test_linux_receive_statistics_is_optional_and_returns_deltas(self):
+        import struct
+        sock = MagicMock()
+        sock.ins.getsockopt.side_effect = [struct.pack('=II', 10, 2), struct.pack('=II', 5, 0), OSError('unsupported')]
+        with patch.object(net.sys, 'platform', 'linux'):
+            self.assertEqual(net.receive_statistics(sock), (10, 2))
+            self.assertEqual(net.receive_statistics(sock), (5, 0))
+            self.assertIsNone(net.receive_statistics(sock))
+        sock.ins.getsockopt.assert_called_with(263, 6, 8)
+
     def test_blocked_diagnostic_io_preserves_forwarding_and_bounded_shutdown(self):
         entered, release = threading.Event(), threading.Event()
         recorders = []

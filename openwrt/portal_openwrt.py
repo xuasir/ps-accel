@@ -40,7 +40,8 @@ ENGINE_LOCK = Path('/var/run/portal-lab-capture.lock')
 SYSNET = Path('/sys/class/net')
 CONFIG_FILE = Path('/etc/config/ps_accel')
 FINGERPRINT_FILES = ('portal_auto.py', 'portal_auto_platform.py', 'portal_active_probe.py',
-                     'portal_windows_network.py', 'protocol.py', 'profiles.py', 'telemetry.py', 'observability.py')
+                     'portal_windows_network.py', 'protocol.py', 'profiles.py', 'telemetry.py', 'observability.py',
+                     'stream_quality.py')
 
 
 class ControllerBusy(RuntimeError):

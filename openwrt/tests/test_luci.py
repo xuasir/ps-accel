@@ -122,6 +122,30 @@ class LuCITests(unittest.TestCase):
                 port.atomic(port.RUNTIME / 'status.json', {'state': 'running', 'pid': 123, 'time': now})
                 self.assertTrue(api.status()['running'])
 
+    def test_quality_status_expires_advice_without_changing_configuration(self):
+        from test_stream_quality import enhanced_quality, feed_seconds
+        quality = enhanced_quality()
+        feed_seconds(quality, [3] * 6)
+        sample = quality.snapshot(6.1, '65')
+        sample.update(payload='private-payload', session_key='private-key')
+        now = datetime.datetime.now(datetime.timezone.utc)
+        report = {'state': 'running', 'pid': 123, 'mode': 'active', 'quality': sample,
+                  'time': now.isoformat()}
+        port.atomic(port.RUNTIME / 'status.json', report)
+        with patch.object(port, 'pids', return_value=[123]) as processes, patch.object(port, 'command') as save:
+            current = api.status()
+            self.assertEqual(current['quality']['advice']['profile'], '45')
+            self.assertNotIn('private-', json.dumps(current['quality']))
+            processes.assert_called_once()
+            save.assert_not_called()
+            report['time'] = (now - datetime.timedelta(seconds=4.9)).isoformat()
+            port.atomic(port.RUNTIME / 'status.json', report)
+            current = api.status()
+            self.assertTrue(current['running'])
+            self.assertEqual(current['quality']['state'], 'stale')
+            self.assertIsNone(current['quality']['advice']['profile'])
+            save.assert_not_called()
+
     def test_trial_is_bounded_and_does_not_pass_arbitrary_args(self):
         job = self.job('trial')
         with patch.object(api, 'run_child') as run:

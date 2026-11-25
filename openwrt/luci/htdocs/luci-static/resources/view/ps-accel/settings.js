@@ -1124,6 +1124,67 @@ return view.extend({
   });
  },
 
+ updateQuality: function(data) {
+  var quality = data.quality || {}, relay = quality.relay || {}, advice = quality.advice || {};
+  var labels = { waiting: '等待反馈', collecting: '采集中', healthy: '反馈平稳', degraded: '持续丢失',
+   relay_overload: '中继待检查', stale: '数据过期', unsupported: '格式待适配',
+   disconnected: '连接已结束', stopped: '等待启动', unavailable: '采集异常' };
+  var state = data.running ? quality.state || 'waiting' : 'stopped';
+  var fresh = !!(data.running && data.quality && quality.report_fresh !== false &&
+   (data.observability || {}).status_fresh !== false && data.state_known !== false && !this.connectionError);
+  if (data.running && !fresh) state = 'stale';
+  var feedbackFresh = fresh && quality.feedback_fresh === true;
+  var loss = quality.loss_percent;
+  this.qualityNode.textContent = feedbackFresh && typeof loss === 'number' && isFinite(loss) ? loss.toFixed(2) + '%' : labels[state] || '等待反馈';
+  this.qualityDetail.textContent = feedbackFresh ? (labels[state] || '采集中') + ' · 近 12 秒 · 接收 ' +
+   Number(quality.received || 0) + ' / 丢失 ' + Number(quality.lost || 0) + ' · 坏帧报告 ' +
+   Number(quality.corrupt_reports || 0) + ' / 关键帧请求 ' + Number(quality.idr_requests || 0) :
+   state === 'unsupported' ? '已收到质量报文，等待适配客户端反馈格式。' : '等待当前连接的有效接收／丢失反馈。';
+  var p95 = relay.processing_p95_ms;
+  this.relayQualityNode.textContent = fresh && typeof p95 === 'number' && isFinite(p95) ? '≤ ' + p95 + ' ms' : '—';
+  this.relayQualityDetail.textContent = fresh ? '近 12 秒转发处理 p95 · ' +
+   (relay.receive_stats_available ? '接收队列丢包 ' + Number(relay.dropped || 0) + '（累计 ' + Number(relay.dropped_total || 0) + '）' :
+    '接收队列统计待支持') : '等待中继处理与接收队列采样。';
+  var kind = advice.kind || 'wait', reason = advice.reason || 'waiting_feedback';
+  var profile = quality.requested_profile || (data.config || {}).profile || '65';
+  var message = '等待 Portal 回传质量信息，积累至少 6 秒有效样本后评估档位。';
+  if (!data.running) {
+   kind = 'stopped'; message = '启动增强并重新连接 Portal，开始采集当前连接的质量。';
+  } else if (!fresh || state === 'stale') {
+   kind = 'wait'; message = '质量数据已过期，等待新反馈后重新评估档位。';
+  } else if (state === 'unsupported') {
+   kind = 'wait'; message = '客户端反馈格式待适配，继续结合 Portal 画面与按键表现观察。';
+  } else if (state === 'unavailable') {
+   kind = 'unavailable'; message = '质量采集暂时异常，转发与恢复继续按服务状态运行。';
+  } else if (kind === 'check_relay') {
+   message = reason === 'receive_drops' ? '中继接收队列出现丢包，优先检查路由器负载与并行任务，再复测当前档位。' :
+    '中继转发处理出现多次停顿，优先检查路由器负载与并行任务，再复测当前档位。';
+  } else if (data.mode === 'baseline' || kind === 'baseline') {
+   kind = 'baseline'; message = '连接测试正在采集质量；正式启动增强后，再评估当前档位。';
+  } else if (reason === 'session_ended') {
+   kind = 'wait'; message = '本次连接已结束，等待重新连接后采集。';
+  } else if (reason === 'waiting_startup') {
+   kind = 'wait'; message = '已采集当前串流质量。重新连接 Portal，观察到当前档位的新连接后再评估降档。';
+  } else if (kind === 'lower' && feedbackFresh && advice.profile) {
+   if (profile !== (data.config || {}).profile) {
+    kind = 'wait'; message = '档位正在切换，等待新连接的质量反馈。';
+   } else {
+    var evidenceLoss = typeof advice.loss_percent === 'number' ? '，报告丢失 ' + advice.loss_percent.toFixed(2) + '%' : '';
+    message = '客户端连续 ' + Number(advice.sustained_seconds || 6) + ' 秒出现丢失' + evidenceLoss +
+     (reason === 'loss_and_frames' ? '，伴随坏帧或关键帧请求' : '') + '。建议试用 ' + advice.profile +
+     ' Mbps：在码率配置中选择并保存，重新连接 Portal 后比较画面与按键。';
+   }
+  } else if (kind === 'minimum' && feedbackFresh) {
+   message = '当前 ' + profile + ' Mbps 已是最低档位；优先改善无线信号、减少同一 AP 争用后重连复测。';
+  } else if (kind === 'keep' && feedbackFresh) {
+   message = '近期客户端反馈平稳，继续使用 ' + profile + ' Mbps，并结合 Portal 画面与按键表现观察。';
+  } else if (reason === 'collecting_evidence') {
+   message = '正在积累质量样本；持续丢失或丢失伴随坏帧时，会建议试用下一低档。';
+  }
+  this.qualityAdvice.textContent = message;
+  this.qualityAdvice.setAttribute('data-advice', kind);
+ },
+
  update: function(data) {
   if (!data || !data.ok) return;
   var previousConfig = (this.latest || {}).config || {};
@@ -1304,6 +1365,7 @@ return view.extend({
    Number(observability.coalesced_snapshots || 0) + ' 次' +
    ' · 合并事件 ' + Number(observability.suppressed_logs || 0) + ' 条' +
    (observability.last_error ? '。最近记录错误：' + observability.last_error : '。');
+  this.updateQuality(data);
 
   var message = data.configured ? '配置已就绪。启动增强后重新连接 Portal，检查画面与按键；调整码率后重新连接生效。' :
    devicesReady ? '填写中继独立地址并保存配置，然后启动增强。' : '进入设备配置，保存 Portal / PS5 的内网地址。';
@@ -1366,6 +1428,9 @@ return view.extend({
   this.proxyNavNode = E('span', { 'class': 'pa-nav-state' }, '点击查看状态');
   this.stateNode = E('span', {}, '正在读取'); this.profileNode = E('span'); this.countNode = E('span');
   this.rateNode = E('span'); this.uptimeNode = E('div', { 'class': 'pa-detail' });
+  this.qualityNode = E('span'); this.qualityDetail = E('div', { 'class': 'pa-detail' });
+  this.relayQualityNode = E('span'); this.relayQualityDetail = E('div', { 'class': 'pa-detail' });
+  this.qualityAdvice = E('div', { 'class': 'pa-notice alert-message notice', role: 'status', 'aria-live': 'polite' });
   this.selectionNode = E('div', { 'class': 'pa-selection' });
   this.routerNode = E('b'); this.portalNode = E('span'); this.ps5Node = E('span'); this.bridgeNode = E('span');
   this.baselineNode = E('div', { 'class': 'pa-step-desc' }); this.recoveryNode = E('div', { 'class': 'pa-step-desc' });
@@ -1509,8 +1574,12 @@ return view.extend({
    stat('增强状态', this.stateNode, '', this.uptimeNode),
    stat('目标请求码率', this.profileNode, 'Mbps', detail('新连接握手使用的请求值')),
    stat('已增强连接', this.countNode, '次', detail('同一握手的重传合并计数')),
-   stat('控制转发', this.rateNode, 'Mbps', bars) ]));
-  var bitrateRuntime = panel('运行状态', [bitrateStats, this.messageNode,
+   stat('控制转发', this.rateNode, 'Mbps', bars),
+   stat('客户端报告丢失', this.qualityNode, '', this.qualityDetail),
+   stat('中继处理', this.relayQualityNode, '', this.relayQualityDetail) ]));
+  var bitrateRuntime = panel('运行状态', [bitrateStats, this.qualityAdvice,
+   E('p', { 'class': 'pa-caption' }, '客户端回传计数用于评估接收质量；降档建议保持只读，实际画质与响应结合 Portal 表现复测。'),
+   this.messageNode,
    E('div', { 'class': 'pa-actions' }, [this.button('start', '启动增强', 'primary'), this.button('stop', '停止并恢复', 'danger'),
     this.button('doctor', '环境检查'), this.button('repair', '恢复网络', 'danger')]),
    E('label', { 'class': 'pa-toggle', 'for': 'psa-autostart' }, [this.autostart, '开机启用'])

@@ -17,6 +17,7 @@ import re
 import portal_openwrt as port
 import portal_policy as policy
 from profiles import public_profiles
+from stream_quality import public_quality
 from domain_tracker import host_name
 from sony_domains import candidates, domain_info, dynamic_rule_info
 from observability import (LogPreferences, OBSERVATION_LIMIT, correlate, load_preferences, merge_events, new_incident,
@@ -181,6 +182,7 @@ def status():
     job = current_job()
     report = optional(port.RUNTIME / 'status.json')
     warnings = []
+    age = None
     try:
         peers = port.pids()
         state_known = True
@@ -232,6 +234,8 @@ def status():
             'control_mbps': report.get('control_mbps', 0) if running and stats_fresh else 0,
             'uptime_seconds': elapsed if running and managed else report.get('uptime_seconds', 0) if running else 0,
             'observability': observability,
+            'quality': public_quality(report.get('quality') if stats_fresh or not running else None,
+                                      age, running, stats_fresh, managed.get('mode', report.get('mode'))),
             'foreign_relay': bool(lock_owner and lock_owner != own_engine),
             'recovery_errors': recovery.get('errors', report.get('errors', []))}
 
@@ -534,6 +538,7 @@ def diagnostics():
             'profile': current['config'].get('profile'),
             'observability': dict(current.get('observability', {}),
                                   last_error=redact(current.get('observability', {}).get('last_error', ''))),
+            'quality': current['quality'],
             'domain_diagnostics': redact_domain_data(domain_report),
             'logging': redact_domain_data(current.get('logging', {})),
             'privacy': '诊断文件包含域名、公共解析地址与失败证据；设备地址、MAC 与会话报文保留在路由器本地。'}
