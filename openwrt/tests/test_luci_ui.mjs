@@ -134,15 +134,19 @@ async function policyTab(h) {
  await settle();
 }
 
-test('native list controls use only proxy and direct domains and follow the local core', async () => {
+test('native list controls follow the configured node core', async () => {
  const h = harness(); await h.init(); await policyTab(h);
  assert.deepEqual(Object.keys(h.app.policyInputs), ['node', 'domains', 'exclusions']);
  assert.deepEqual(Object.keys(h.app.policyButtons), ['save', 'apply', 'reload', 'direct', 'release', 'cancel']);
  assert.equal(h.app.policyButtons.apply.disabled, false);
  assert.match(nodeText(h.app.mainPanels.proxy), /两设备专属域名规则|应用设备规则/);
  assert.doesNotMatch(nodeText(h.app.mainPanels.proxy), /选择代理节点|检测出口|TCP 端口|开机启用/);
+ assert.match(h.app.policyEnvironment.textContent, /xray/);
+ h.policyData.config.node = 'sing_a';
+ h.policyData.file_config.node = 'sing_a';
  h.policyData.environment.selected_core = 'sing-box'; h.policyData.enabled = false; h.policyData.running = false;
  await h.app.refreshPolicy(true);
+ assert.equal(h.app.policyInputs.node.value, 'sing_a');
  assert.match(h.app.policyEnvironment.textContent, /sing-box/);
  assert.equal(h.app.policyButtons.apply.disabled, false);
 });

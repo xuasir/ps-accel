@@ -78,7 +78,11 @@ class AlignmentTests(unittest.TestCase):
         for host, category in expected.items():
             self.assertEqual(sony.classify_sony_domain(host), category)
         self.assertEqual(sony.domain_info(sony.FIRMWARE_HOST)['suggestion'], 'direct')
-        self.assertTrue(set(sony.CONNECTIVITY_HOSTS) <= set(policy.DEFAULTS['domains'].splitlines()))
+        for host in sony.CONNECTIVITY_HOSTS:
+            with self.subTest(host=host):
+                info = sony.domain_info(host)
+                self.assertEqual(info['purpose'], 'connectivity')
+                self.assertEqual(info['suggestion'], 'proxy')
 
     def test_candidates_preserve_explicit_exclusions_and_complete_only_full_hosts(self):
         host = 'region.np.communication.playstation.net'
