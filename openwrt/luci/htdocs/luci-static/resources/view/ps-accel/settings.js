@@ -21,18 +21,21 @@ var callDomains = rpc.declare({ object: 'ps-accel', method: 'domains', params: [
 var callDomainMonitor = rpc.declare({ object: 'ps-accel', method: 'domain_monitor', params: [ 'batch', 'incident' ], expect: {} });
 var callDomainBatchStart = rpc.declare({ object: 'ps-accel', method: 'domain_batch_start', expect: {} });
 var callIncident = rpc.declare({ object: 'ps-accel', method: 'incident', params: [ 'note' ], expect: {} });
-var policyFields = [ 'domains', 'exclusions' ];
+var policyFields = [ 'domains', 'exclusions', 'node' ];
+var proxyActions = [ 'psportal_apply', 'psportal_direct', 'psportal_release' ];
 var maxPolicyRules = 4096;
 var callPolicyStatus = rpc.declare({ object: 'ps-accel', method: 'psportal_status', expect: {} });
 var callPolicySave = rpc.declare({ object: 'ps-accel', method: 'psportal_save', params: policyFields.concat(['revision']), expect: {} });
 var callPolicyApply = rpc.declare({ object: 'ps-accel', method: 'psportal_apply', params: policyFields.concat(['revision']), expect: {} });
+var callPolicyDirect = rpc.declare({ object: 'ps-accel', method: 'psportal_direct', params: ['revision'], expect: {} });
+var callPolicyRelease = rpc.declare({ object: 'ps-accel', method: 'psportal_release', params: ['revision'], expect: {} });
 var calls = {};
 [ 'baseline', 'trial', 'stop', 'repair', 'doctor' ].forEach(function(name) {
  calls[name] = rpc.declare({ object: 'ps-accel', method: name, expect: {} });
 });
 var actionNames = { device_save: '确认设备', configure: '检查码率配置', profile: '应用码率', baseline: '连接测试',
  trial: '试运行', start: '启动码率增强', stop: '停止任务', repair: '网络恢复', doctor: '环境检查',
- psportal_apply: '应用 PassWall 名单' };
+ psportal_apply: '应用设备规则', psportal_direct: '两设备全部直连', psportal_release: '解除设备接管' };
 var profilePhases = { stopping: '正在恢复旧连接', saving: '正在保存新码率',
  starting: '正在启动新档位', rollback: '正在恢复原档位',
  waiting_exit: '正在等待进程退出', repairing: '正在恢复与清理网络' };
@@ -50,7 +53,7 @@ function jobFeature(action) {
 }
 function policyHosts(text) {
  return (text || '').split('\n').map(function(name) { return name.trim().toLowerCase().replace(/^full:/, '').replace(/\.$/, ''); })
-  .filter(function(name, index, names) { return validHost(name) && names.indexOf(name) === index; });
+  .filter(function(name, index, names) { return validHost(name.replace(/^domain:/, '')) && names.indexOf(name) === index; });
 }
 function validHost(name) {
  return name.length <= 253 && name.indexOf('.') > 0 && !/^\d+(\.\d+){3}$/.test(name) &&
@@ -58,7 +61,8 @@ function validHost(name) {
 }
 function policyMatches(host, rules) {
  host = host.toLowerCase().replace(/\.$/, '');
- return !!host && rules.some(function(rule) { return host === rule || host.endsWith('.' + rule); });
+ return !!host && rules.some(function(rule) { return rule.indexOf('domain:') === 0 ?
+  host === rule.slice(7) || host.endsWith('.' + rule.slice(7)) : host === rule; });
 }
 function policyListEdit(text, domain, remove) {
  var lines = (text || '').split('\n').filter(function(line) {
@@ -510,10 +514,10 @@ return view.extend({
   this.policyInputs[target].value = policyListEdit(this.policyInputs[target].value, domain, false);
   this.policyInputs[other].value = policyListEdit(this.policyInputs[other].value, domain, true);
   this.policyTouched[target] = this.policyTouched[other] = true;
-  this.policyConfigNotice.textContent = this.policyDraftState.textContent = '名单草稿已调整，保存并应用后生效。';
+  this.policyConfigNotice.textContent = this.policyDraftState.textContent = '设备名单草稿已调整，应用设备规则后生效。';
   this.policyConfigNotice.setAttribute('data-error', 'false');
   this.domainActionText.textContent = domain + (target === 'domains' ? ' 已加入代理名单草稿。' : ' 已移出代理并加入直连名单草稿。') +
-   '保存并应用后由 PassWall 加载。';
+   '应用设备规则后由 PassWall 加载。';
   this.domainActionNotice.hidden = false; this.domainActionNotice.setAttribute('data-error', 'false');
   this.updatePolicyControls();
   if (this.domainData) this.renderDomains(this.domainData);
@@ -576,8 +580,9 @@ return view.extend({
  domainRuleActions: function(domain) {
   var self = this, names = policyHosts(this.policyInputs.domains.value), direct = policyHosts(this.policyInputs.exclusions.value);
   var excluded = policyMatches(domain, direct), included = policyMatches(domain, names);
-  return E('div', {}, [ E('div', { 'class': 'pa-domain-rule' }, (Object.keys(this.policyTouched).length ? '草稿 · ' : '本机名单 · ') +
-   (excluded ? '直连名单' : included ? '代理名单' : 'PassWall 默认策略')),
+  return E('div', {}, [ E('div', { 'class': 'pa-domain-rule' }, (Object.keys(this.policyTouched).length ||
+   (this.policyData || {}).pending_apply || !(this.policyData || {}).loaded ? '草稿 · ' : '设备名单 · ') +
+   (excluded ? '直连名单' : included ? '代理名单' : '默认直连')),
    E('div', { 'class': 'pa-domain-row-actions' }, [['domains', '加入代理'], ['remove', '移出代理']].map(function(item) {
     var chosen = item[0] === 'domains' ? included && !excluded : excluded && names.indexOf(domain) < 0;
     var disabled = self.readonly || self.policyPending || self.pending || !!(self.latest.job || {}).busy ||
@@ -911,34 +916,49 @@ return view.extend({
   this.policyRequest = rpcRequest(callPolicyStatus).then(function(data) {
    self.policyData = data; self.policyEnvironmentError = false;
    var environment = data.environment || {}, config = data.config || {}, receipt = data.receipt || {};
-   self.policyState.textContent = self.proxyNavNode.textContent = !data.available ? '等待本机 PassWall' :
-    data.running && data.enabled ? 'PassWall 正在运行' : data.enabled ? '运行状态待确认' : 'PassWall 已关闭';
-   self.policyEnvironment.textContent = '当前核心 · ' + ((environment.cores || []).join(' / ') || '由 PassWall 当前配置决定');
+   var state = !data.available ? '等待本机 PassWall' : data.policy_mode === 'released' ? '设备接管已解除' :
+    !data.loaded ? '设备配置等待加载' : data.policy_mode === 'direct' ? '两设备全部直连' : '设备域名代理';
+   self.policyState.textContent = self.proxyNavNode.textContent = state;
+   self.policyEnvironment.textContent = '分流核心 · ' + (environment.selected_core || '选择本机代理出口后确定') +
+    ' · 配置由 PassWall 原生生成';
    self.policyRequirements.textContent = (data.warnings || []).join('；');
-   self.policyBlockers.textContent = (data.blockers || []).join('；');
+   self.policyBlockers.textContent = (data.blockers || []).join('；') ||
+    (data.available && !data.devices_ready ? '在设备配置确认 Portal 和 PS5 后，应用设备接管。' : '');
    self.policyBlockers.hidden = !self.policyBlockers.textContent;
    var touched = Object.keys(self.policyTouched).length;
+   self.policyNodePicker.setOptions((data.nodes || []).map(function(node) {
+    return {value:node.id,label:node.label,detail:(node.core || '其他类型') + ' · ' + (node.protocol || '') +
+     (node.reason ? ' · ' + node.reason : ''),available:node.available !== false};
+   }));
    if (!touched && data.available) {
     policyFields.forEach(function(key) { self.policyInputs[key].value = typeof config[key] === 'string' ? config[key] : ''; });
     self.policyRevision = data.revision; self.policyConflict = false;
    } else if (touched && data.available) {
-    self.policyConflict = self.policyRevision !== data.revision;
+    if (self.policyModeRefresh) { self.policyRevision = data.revision; self.policyConflict = false; }
+    else self.policyConflict = self.policyRevision !== data.revision;
    }
+   self.policyModeRefresh = false;
+   self.policyNodePicker.setValue(self.policyInputs.node.value);
    if (self.policyConflict) {
-    self.policyConfigNotice.textContent = '本机名单已发生外部修改，当前编辑已保留。点击“重新读取本机名单”后整理并保存。';
+    self.policyConfigNotice.textContent = '设备规则或 PassWall 配置已发生外部修改，当前编辑已保留。重新读取后整理并保存。';
     self.policyConfigNotice.setAttribute('data-error', 'true');
    }
-   self.policyFileCounts.textContent = '本机名单 · 代理 ' + Number((data.counts || {}).domains || 0) +
-    ' 个域名 · 直连 ' + Number((data.counts || {}).exclusions || 0) + ' 个域名';
-   var switches = data.switches || {};
-   self.policyCoverage.textContent = '名单按 PassWall 当前客户端及 ACL 接管范围生效。代理名单开关 · ' +
-    (switches.proxy_list_enabled ? '开启' : '关闭') + '；直连名单开关 · ' + (switches.direct_list_enabled ? '开启' : '关闭') + '。';
-   self.policyPendingState.textContent = data.config_source === 'migration' ? '旧域名已整理为待保存草稿' :
-    data.pending_apply ? '名单文件存在待加载修改，点击保存并应用。' : '沿用本机 PassWall 的名单与加载状态。';
-   self.policyDraftState.textContent = touched ? '名单草稿正在编辑，保存并应用后生效。' :
-    data.config_source === 'migration' ? '检查迁移后的域名名单，再保存并应用。' : '';
-   self.policyRulesPath.textContent = '名单目录 · ' + (environment.rules_path || '待确认');
-   self.policyAppliedTime.textContent = receipt.applied_at ? '最近应用 · ' + localTime(receipt.applied_at * 1000) : '应用状态由本机 PassWall 管理';
+   self.policyFileCounts.textContent = '设备名单 · 代理 ' + Number((data.counts || {}).domains || 0) +
+    ' 条规则 · 直连 ' + Number((data.counts || {}).exclusions || 0) + ' 条规则';
+   var group = data.device_group || {};
+   self.policyCoverage.textContent = ['portal', 'ps5'].map(function(role) {
+    var device = group[role] || {};
+    return (role === 'portal' ? 'Portal' : 'PS5') + ' · ' + (device.ip || '待确认') + ' · ' + (device.mac || '待确认 MAC');
+   }).join('；');
+   self.policyPendingState.textContent = data.policy_mode === 'direct' && data.loaded ?
+    '两台设备全部直连，域名名单保留为下次启用分流的草稿。' : data.policy_mode === 'released' ?
+    '两台设备沿用原 PassWall 策略，应用设备规则后启用专属接管。' :
+    data.pending_apply ? '草稿或设备配置存在待加载修改，点击应用设备规则。' :
+    '直连名单优先，代理名单使用所选出口，其余流量默认直连。';
+   self.policyDraftState.textContent = touched ? '设备名单草稿正在编辑，应用设备规则后生效。' :
+    data.config_source === 'empty' ? '两份名单初始为空，可手动填写或从域名监控加入。' : '';
+   self.policyRulesPath.textContent = '专属规则组 · ' + (environment.rules_path || '待确认');
+   self.policyAppliedTime.textContent = receipt.applied_at ? '最近应用 · ' + localTime(receipt.applied_at * 1000) : '等待应用设备接管';
    var telemetry = data.telemetry || {};
    self.policyCoreSummary.textContent = telemetry.fresh && telemetry.sampled_cores ?
     '域名流量正在按批次采样，详情见域名监控。' : telemetry.limit || '域名流量等待本机可用的连接统计接口。';
@@ -946,22 +966,30 @@ return view.extend({
    if (self.domainData) self.renderDomains(self.domainData);
   }).catch(function(error) {
    self.policyEnvironmentError = true;
-   self.policyState.textContent = self.proxyNavNode.textContent = '名单读取待确认';
-   self.policyBlockers.textContent = '本机名单读取失败：' + error.message; self.policyBlockers.hidden = false;
+   self.policyState.textContent = self.proxyNavNode.textContent = '设备规则读取待确认';
+   self.policyBlockers.textContent = '设备规则读取失败：' + error.message; self.policyBlockers.hidden = false;
   }).finally(function() { self.policyRequest = null; self.updatePolicyControls(); });
   return this.policyRequest;
  },
 
  updatePolicyControls: function() {
   if (!this.policyButtons) return;
-  var job = ((this.latest || {}).job || {});
+  var job = ((this.latest || {}).job || {}), data = this.policyData || {};
   var busy = !!this.policyPending || !!this.pending || !!job.busy;
-  var ready = !!(this.policyData || {}).available && !!this.policyRevision && !this.policyEnvironmentError;
-  this.policyButtons.save.disabled = this.policyButtons.apply.disabled = this.readonly || busy || !ready || !!this.policyConflict;
+  var ready = !!data.available && !!this.policyRevision && !this.policyEnvironmentError;
+  var scopeReady = ready && !!data.devices_ready && !(data.blockers || []).length && !this.policyConflict;
+  var node = (data.nodes || []).find(function(item) { return item.id === this.policyInputs.node.value; }, this);
+  this.policyEnvironment.textContent = '分流核心 · ' + (node && node.available !== false ? node.core : '选择本机代理出口后确定') +
+   ' · 配置由 PassWall 原生生成';
+  this.policyButtons.save.disabled = this.readonly || busy || !ready || !!this.policyConflict;
+  this.policyButtons.apply.disabled = this.readonly || busy || !scopeReady || !node || node.available === false;
+  this.policyButtons.direct.disabled = this.readonly || busy || !scopeReady || (data.policy_mode === 'direct' && data.loaded);
+  this.policyButtons.release.disabled = this.readonly || busy || !ready || !data.can_release || !!this.policyConflict;
   this.policyButtons.reload.disabled = busy || !!this.policyRequest;
-  this.policyButtons.cancel.hidden = !job.busy || job.action !== 'psportal_apply';
-  this.policyButtons.cancel.disabled = this.readonly || this.pendingAction === 'stop' || !job.busy || job.action !== 'psportal_apply';
+  this.policyButtons.cancel.hidden = !job.busy || proxyActions.indexOf(job.action) < 0;
+  this.policyButtons.cancel.disabled = this.readonly || this.pendingAction === 'stop' || !job.busy || proxyActions.indexOf(job.action) < 0;
   policyFields.forEach(function(key) { this.policyInputs[key].disabled = this.readonly || busy || !ready; }, this);
+  this.policyNodePicker.sync();
   (this.domainActionButtons || []).forEach(function(button) {
    button.disabled = this.readonly || busy || !ready || !!this.policyRequest || this.domainSelectionPending ||
     button.dataset.chosen === 'true' || !validHost(button.dataset.domain);
@@ -970,19 +998,24 @@ return view.extend({
 
  policyAction: function(name) {
   if (name === 'cancel') return !this.policyButtons.cancel.disabled ? this.run('stop') : Promise.resolve();
-  if (['save', 'apply'].indexOf(name) < 0 || this.policyButtons[name].disabled || this.policyPending ||
+  if (['save', 'apply', 'direct', 'release'].indexOf(name) < 0 || this.policyButtons[name].disabled || this.policyPending ||
       this.readonly || this.pending || !!(this.latest.job || {}).busy) return Promise.resolve();
-  var self = this, values = this.policyValues();
+  var self = this, values = this.policyValues(), revision = this.policyRevision;
   this.policyPending = true; this.update(this.latest);
-  return rpcRequest(function() { return (name === 'save' ? callPolicySave : callPolicyApply).apply(null, values); }).then(function(result) {
+  return rpcRequest(function() {
+   if (name === 'direct') return callPolicyDirect(revision);
+   if (name === 'release') return callPolicyRelease(revision);
+   return (name === 'save' ? callPolicySave : callPolicyApply).apply(null, values);
+  }).then(function(result) {
    if (name === 'save') {
     self.policyTouched = {}; self.policyConflict = false; self.policyRevision = result.revision;
     policyFields.forEach(function(key) { self.policyInputs[key].value = result.config[key]; });
+    self.policyNodePicker.setValue(result.config.node);
    }
    self.policyNotice.textContent = self.policyConfigNotice.textContent = name === 'save' ? result.notice :
-    '正在保存并应用本机 PassWall 名单，请等待任务完成。';
+    '正在' + ({apply:'应用设备规则',direct:'将两设备切换为全部直连',release:'解除设备接管'}[name]) + '，请等待任务完成。';
    self.policyNotice.setAttribute('data-error', 'false'); self.policyConfigNotice.setAttribute('data-error', 'false');
-   if (name === 'apply') self.selectStage('proxy', 'runtime');
+   if (name !== 'save') self.selectStage('proxy', 'runtime');
   }).catch(function(error) {
    self.policyNotice.textContent = self.policyConfigNotice.textContent = error.message;
    self.policyNotice.setAttribute('data-error', 'true'); self.policyConfigNotice.setAttribute('data-error', 'true');
@@ -1008,18 +1041,17 @@ return view.extend({
   this.policyDraftState = E('p', { 'class': 'pa-caption' });
   this.policyConfigNotice = E('p', { 'class': 'pa-caption', role: 'status', 'aria-live': 'polite' });
   this.policyNotice = E('div', { 'class': 'pa-notice alert-message notice', role: 'status', 'aria-live': 'polite' });
-  function field(key, label) {
-   var input = luciControl('textarea', { rows: 8, maxlength: 262144, spellcheck: 'false' });
+  function field(key, label, input, help) {
    input.id = 'psa-policy-' + key; self.policyInputs[key] = input;
    function changed() {
     self.policyTouched[key] = true;
-    self.policyConfigNotice.textContent = self.policyDraftState.textContent = '名单草稿已调整，保存并应用后生效。';
+    self.policyConfigNotice.textContent = self.policyDraftState.textContent = '设备规则草稿已调整，应用设备规则后生效。';
     self.policyConfigNotice.setAttribute('data-error', 'false');
     self.updatePolicyControls();
     if (self.domainData) self.renderDomains(self.domainData);
    }
-   input.addEventListener('input', changed); input.addEventListener('change', changed);
-   return formField(input, label, '每行一个域名；保留现有注释及 geosite: 规则。');
+   input.addEventListener('input', changed); input.addEventListener('change', changed); input.choiceChanged = changed;
+   return formField(input, label, help);
   }
   function button(name, label, kind) {
    var node = E('button', { type: 'button', 'class': buttonClass(kind), click: function() {
@@ -1027,23 +1059,28 @@ return view.extend({
    } }, label);
    self.policyButtons[name] = node; return node;
   }
-  var config = this.panel('PassWall 域名名单', [
-   E('div', { 'class': 'pa-form' }, [field('domains', '代理域名'), field('exclusions', '直连域名')]),
-   E('p', { 'class': 'pa-caption' }, '按 PassWall 的主域及子域语义匹配。节点、DNS、端口和接管范围由本机 PassWall 管理。'),
-   E('div', { 'class': 'pa-actions' }, [button('save', '保存名单'), button('apply', '保存并应用', 'primary'),
-    button('reload', '重新读取本机名单')]),
-   E('p', { 'class': 'pa-caption' }, '保存并应用会调用 PassWall 重新加载，当前连接可能重连。PassWall 已停止时，名单在下次启动加载。'),
+  var nodeInput = choiceControl(luciControl('input', { type: 'hidden' }), '选择本机代理出口', false);
+  this.policyNodePicker = nodeInput.choicePicker;
+  var config = this.panel('两设备专属域名规则', [
+   field('node', '代理出口', nodeInput, '引用 PassWall 已保存的 Xray / Sing-box 节点，分流组使用其中的实际出口。'),
+   E('div', { 'class': 'pa-form' }, [
+    field('domains', '代理域名', luciControl('textarea', { rows:8,maxlength:262144,spellcheck:'false' }), '初始为空，每行完整域名，默认精确匹配。'),
+    field('exclusions', '直连域名', luciControl('textarea', { rows:8,maxlength:262144,spellcheck:'false' }), '初始为空，每行完整域名，直连优先。')]),
+   E('p', { 'class': 'pa-caption' }, '普通域名写入为 full: 精确分流规则；domain:example.com 显式匹配主域与子域。现有注释及 geosite: 条目保留。'),
+   E('div', { 'class': 'pa-actions' }, [button('save', '保存设备草稿'), button('apply', '应用设备规则', 'primary'),
+    button('reload', '重新读取设备规则')]),
+   E('p', { 'class': 'pa-caption' }, '应用会调用 PassWall 重新加载，现有连接可能重连。PassWall 的开机启动和 IPv6 转发沿用本机设置。'),
    this.policyDraftState, this.policyConfigNotice
   ]);
-  var runtime = this.panel('本机 PassWall', [
-   this.policyEnvironment, this.policyFileCounts, this.policyPendingState, this.policyCoverage, this.policyRequirements,
+  var runtime = this.panel('Portal / PS5 专属接管', [
+   this.policyCoverage, this.policyEnvironment, this.policyFileCounts, this.policyPendingState, this.policyRequirements,
+   E('p', { 'class': 'pa-caption' }, '局域网串流与默认出口保持直连；两份名单仅供当前设备组使用。'),
    this.policyNotice, this.policyBlockers,
-   E('div', { 'class': 'pa-actions' }, [E('a', { 'class': buttonClass(),
-    href: L.url ? L.url('admin', 'services', 'passwall') : '/cgi-bin/luci/admin/services/passwall' }, '打开 PassWall'),
-    button('cancel', '取消应用任务')])
+   E('div', { 'class': 'pa-actions' }, [button('direct', '两设备全部直连'), button('release', '解除设备接管'),
+    E('a', { 'class': buttonClass(), href:L.url ? L.url('admin','services','passwall','acl') :
+     '/cgi-bin/luci/admin/services/passwall/acl' }, 'PassWall 访问控制'), button('cancel', '取消接管任务')])
   ], this.policyState);
-  var diagnostics = E('div', {}, [this.policyCoreSummary, this.policyRulesPath, this.policyAppliedTime]);
-  return {config: config, runtime: runtime, diagnostics: diagnostics};
+  return {config:config,runtime:runtime,diagnostics:E('div', {}, [this.policyCoreSummary,this.policyRulesPath,this.policyAppliedTime])};
  },
 
  run: function(name) {
@@ -1188,14 +1225,19 @@ return view.extend({
   });
   this.updatePolicyControls();
   this.updateDomainControls();
-  if (proxyJob.action === 'psportal_apply') {
-   if (proxyJob.busy) this.policyConfigNotice.textContent = this.policyNotice.textContent = '正在应用 PassWall 名单，请等待完成。';
+  if (proxyActions.indexOf(proxyJob.action) >= 0) {
+   if (proxyJob.busy) this.policyConfigNotice.textContent = this.policyNotice.textContent = actionNames[proxyJob.action] + '中，请等待完成。';
    else if (proxyJob.id !== this.policyJob) {
     this.policyJob = proxyJob.id;
-    if (proxyJob.state === 'complete') { this.policyTouched = {}; this.policyConflict = false; this.domainActionNotice.hidden = true; }
-    this.policyConfigNotice.textContent = this.policyNotice.textContent = proxyJob.state === 'failed' ? proxyJob.error || '名单应用失败，请查看任务日志。' :
-     proxyJob.state === 'cancelled' ? '名单应用已取消，原名单已恢复。' :
-     proxyJob.pending_apply ? '名单已保存，PassWall 下次启动将加载。' : '名单已保存并调用 PassWall 重新加载。';
+    if (proxyJob.state === 'complete') {
+     if (proxyJob.action === 'psportal_apply') { this.policyTouched = {}; this.domainActionNotice.hidden = true; }
+     else this.policyModeRefresh = true;
+     this.policyConflict = false;
+    }
+    this.policyConfigNotice.textContent = this.policyNotice.textContent = proxyJob.state === 'failed' ? proxyJob.error || '设备接管失败，请查看任务日志。' :
+     proxyJob.state === 'cancelled' ? '设备接管任务已取消，原策略已恢复。' : proxyJob.pending_apply ?
+     '设备配置已保存，PassWall 启动后加载。' : ({psportal_apply:'两设备域名规则已应用，其余流量默认直连。',
+      psportal_direct:'Portal 和 PS5 已切换为全部直连。',psportal_release:'设备接管已解除，两台设备恢复原 PassWall 策略。'}[proxyJob.action]);
     this.policyNotice.setAttribute('data-error', String(proxyJob.state === 'failed'));
     this.policyConfigNotice.setAttribute('data-error', String(proxyJob.state === 'failed'));
     this.nextPolicyRead = 0; this.refreshPolicy(true);
@@ -1299,7 +1341,7 @@ return view.extend({
   if (!deviceJob.busy && (data.running || data.engine_alive))
    deviceMessage += ' 码率增强运行中，停止并完成网络恢复后可保存设备配置。';
   if (!deviceJob.busy && (this.deviceData || {}).proxy_enabled)
-   deviceMessage += ' 旧版透明代理规则待迁移，请完成插件升级后保存设备配置。';
+   deviceMessage += ' 设备专属访问控制正在接管，先在透明代理中解除接管后保存设备配置。';
   this.deviceNotice.textContent = deviceMessage;
   this.deviceNotice.setAttribute('data-error', String(this.pendingAction !== 'device_save' &&
    (!!this.deviceSaveError || deviceJob.action === 'device_save' && deviceJob.state === 'failed')));
@@ -1664,7 +1706,7 @@ return view.extend({
    } }, [E('summary', {}, '日志与诊断'), panels.logs]); logs.open = true;
    self.stagePanels[name] = {config:config, runtime:runtime, logs:logs};
    return E('div', { id: 'psa-pane-' + name, 'class': 'pa-tab-panel pa-basic', role: 'tabpanel',
-    'aria-labelledby': 'psa-tab-' + name }, [name === 'proxy' ? E('span') : scope(), runtime, config, logs]);
+    'aria-labelledby': 'psa-tab-' + name }, [scope(), runtime, config, logs]);
   }
   this.mainPanels.devices = E('div', { id: 'psa-pane-devices', 'class': 'pa-tab-panel', role: 'tabpanel',
    'aria-labelledby': 'psa-tab-devices' }, [

@@ -56,7 +56,7 @@ class LuCITests(unittest.TestCase):
                 spawn.assert_not_called()
 
     def test_native_list_save_validates_revision_and_waits_for_jobs(self):
-        request = {'domains': 'example.com', 'exclusions': '', 'revision': 'a' * 64}
+        request = {'domains': 'example.com', 'exclusions': '', 'node': '', 'revision': 'a' * 64}
         for value in (True, 'forged', None, 2):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 api.validate('psportal_save', dict(request, revision=value))
@@ -65,6 +65,15 @@ class LuCITests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, '管理任务进行中'):
                 api.dispatch('psportal_save', request)
             save.assert_not_called()
+
+    def test_invalid_proxy_jobs_preserve_bitrate_during_cancellation(self):
+        for action in api.PROXY_ACTIONS:
+            with self.subTest(action=action):
+                self.job(action, state='queued', request={'revision': 'forged'})
+                with patch.object(api, 'cancelled', return_value=True), patch.object(api, 'stop_service') as stop, patch.object(api, 'record_failure'):
+                    api.worker('a' * 32)
+                stop.assert_not_called()
+                self.assertEqual(api.optional(api.JOBS / 'job.json')['state'], 'failed')
 
     def test_async_job_has_only_fixed_executable_arguments(self):
         with patch.object(api.subprocess, 'Popen', return_value=MagicMock(pid=4242)) as spawn:

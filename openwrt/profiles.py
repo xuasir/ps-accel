@@ -1,6 +1,6 @@
 """Fixed, same-length LaunchSpec requests shared by the CLI and LuCI."""
 
-APP_VERSION = '0.1.9'
+APP_VERSION = '0.1.10'
 
 PROFILE_INFO = {
     '35': {'request': b'35000', 'label': '35 Mbps', 'description': '轻量 · 优先留出无线余量'},

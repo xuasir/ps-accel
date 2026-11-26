@@ -21,7 +21,7 @@ import uuid
 import portal_openwrt as port
 from proxy_telemetry import (ConnectionTracker, PROBE_TAG, core_key, evidence_revision,
                              loopback_endpoint, outbound_signature, probe)
-from sony_domains import (AUTH_HOSTS, SIGNALING_HOSTS, CONNECTIVITY_HOSTS, FIRMWARE_HOST,
+from sony_domains import (FIRMWARE_HOST,
                          DYNAMIC_PROXY_RULES, domain_rules, domain_matcher, dynamic_rule_info,
                          matches_domain, proxy_rules, rule_excluded)
 
@@ -46,9 +46,7 @@ _G.gen_config = function(var)
 end
 ''' + END
 FIELDS = ('portal', 'ps5', 'node', 'domains', 'ports', 'exclusions')
-DEFAULTS = dict(portal='', ps5='', node='', ports='443',
-                domains='\n'.join(AUTH_HOSTS + SIGNALING_HOSTS + CONNECTIVITY_HOSTS),
-                exclusions=FIRMWARE_HOST)
+DEFAULTS = dict(portal='', ps5='', node='', ports='443', domains='', exclusions='')
 NATIVE_PROTOCOLS = {'shadowsocks', 'trojan', 'vless', 'vmess', 'hysteria2', 'tuic', 'anytls', 'socks', 'http'}
 MAC_PATTERN = r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}'
 LEASES = Path('/tmp/dhcp.leases')

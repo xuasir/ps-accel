@@ -357,7 +357,7 @@ class PolicyTests(unittest.TestCase):
                     pass
 
     def test_rpc_rejects_legacy_node_options_and_forged_list_revisions(self):
-        request = {'domains': self.request['domains'], 'exclusions': self.request['exclusions'], 'revision': 'a' * 64}
+        request = {'domains': self.request['domains'], 'exclusions': self.request['exclusions'], 'node': 'nodeA', 'revision': 'a' * 64}
         self.assertEqual(api.validate('psportal_apply', request), request)
         with self.assertRaises(ValueError):
             api.validate('psportal_apply', dict(request, path='/etc/passwd'))
@@ -367,7 +367,7 @@ class PolicyTests(unittest.TestCase):
     def test_luci_cancellation_uses_policy_rollback_and_keeps_bitrate_service(self):
         jobs = self.root / 'jobs'
         job_id = 'a' * 32
-        port.atomic(jobs / 'job.json', dict(id=job_id, action='psportal_apply', request={'domains': self.request['domains'], 'exclusions': self.request['exclusions'], 'revision': 'a' * 64}, state='queued'))
+        port.atomic(jobs / 'job.json', dict(id=job_id, action='psportal_apply', request={'domains': self.request['domains'], 'exclusions': self.request['exclusions'], 'node': 'nodeA', 'revision': 'a' * 64}, state='queued'))
         with patch.object(api, 'JOBS', jobs), patch.object(api, 'cancelled', return_value=True), \
              patch.object(api.rules, 'apply', side_effect=api.rules.RulesCancelled('名单应用已取消')), \
              patch.object(api, 'stop_service') as stop, patch.object(api, 'record_failure'):

@@ -72,12 +72,15 @@ function harness({ manualTimers = false, permission = true } = {}) {
   running: false, engine_alive: false, recovery_required: false, cleanup_pending: false,
   mode: 'active', counts: {}, foreign_relay: false,
   job: { id: 'initial', state: 'complete', busy: false, action: 'baseline' } };
- const policyData = { ok: true, available: true, mode: 'native_lists', enabled: true, running: true,
-  revision: 'a'.repeat(64), config: { domains: 'auth.api.playstation.com\n', exclusions: 'dwc.dl.playstation.net\n' },
-  environment: { cores: ['sing-box'], rules_path: '/etc/passwall/rules' },
-  switches: {proxy_list_enabled:true,direct_list_enabled:true}, counts:{domains:1,exclusions:1},
-  warnings:[],blockers:[],receipt:{},pending_apply:false };
- policyData.file_config = structuredClone(policyData.config);
+ const policyData = { ok:true,available:true,mode:'device_acl',enabled:true,running:true,
+  controlled:true,loaded:true,policy_mode:'proxy',devices_ready:true,can_apply:true,can_direct:true,can_release:true,
+  revision:'a'.repeat(64),config:{domains:'auth.api.playstation.com\n',exclusions:'dwc.dl.playstation.net\n',node:'xray_a'},
+  device_group:{portal:{ip:'10.0.0.101',mac:details.device_selectors.portal},ps5:{ip:'10.0.0.100',mac:details.device_selectors.ps5}},
+  environment:{cores:['xray'],selected_core:'xray',rules_path:'PassWall UCI · ps_accel_devices'},
+  nodes:[{id:'xray_a',label:'已有 Xray 出口',core:'xray',protocol:'vless',available:true},
+   {id:'sing_a',label:'已有 Sing-box 出口',core:'sing-box',protocol:'anytls',available:true}],
+  counts:{domains:1,exclusions:1},warnings:[],blockers:[],receipt:{},pending_apply:false };
+ policyData.file_config=structuredClone(policyData.config);
  const deviceData = { ok: true, configured: true, proxy_enabled: false,
   config: { bridge: details.config.bridge, portal_ip: details.config.portal_ip, ps5_ip: details.config.ps5_ip },
   binding: { config: { bridge: details.config.bridge, portal_ip: details.config.portal_ip, ps5_ip: details.config.ps5_ip },
@@ -99,11 +102,11 @@ function harness({ manualTimers = false, permission = true } = {}) {
   if (spec.method === 'domain_monitor') return Promise.resolve(structuredClone(domainData));
   if (spec.method === 'psportal_status') return Promise.resolve(structuredClone(policyData));
   if (spec.method === 'psportal_save') {
-   policyData.config = {domains: args[0], exclusions: args[1]};
+   policyData.config = {domains: args[0], exclusions: args[1], node: args[2]};
    policyData.file_config = structuredClone(policyData.config);
    policyData.revision = 'b'.repeat(64); policyData.pending_apply = true;
    return Promise.resolve({ok:true,config:policyData.config,revision:policyData.revision,pending_apply:true,
-    notice:'本机名单已保存，保存并应用后生效。'});
+    notice:'设备草稿已保存，应用设备规则后生效。'});
   }
   return Promise.resolve({ ok: true });
  } };
@@ -133,14 +136,14 @@ async function policyTab(h) {
 
 test('native list controls use only proxy and direct domains and follow the local core', async () => {
  const h = harness(); await h.init(); await policyTab(h);
- assert.deepEqual(Object.keys(h.app.policyInputs), ['domains', 'exclusions']);
- assert.deepEqual(Object.keys(h.app.policyButtons), ['save', 'apply', 'reload', 'cancel']);
+ assert.deepEqual(Object.keys(h.app.policyInputs), ['node', 'domains', 'exclusions']);
+ assert.deepEqual(Object.keys(h.app.policyButtons), ['save', 'apply', 'reload', 'direct', 'release', 'cancel']);
  assert.equal(h.app.policyButtons.apply.disabled, false);
- assert.match(nodeText(h.app.mainPanels.proxy), /PassWall 域名名单|保存并应用/);
+ assert.match(nodeText(h.app.mainPanels.proxy), /两设备专属域名规则|应用设备规则/);
  assert.doesNotMatch(nodeText(h.app.mainPanels.proxy), /选择代理节点|检测出口|TCP 端口|开机启用/);
- h.policyData.environment.cores = ['xray']; h.policyData.enabled = false; h.policyData.running = false;
+ h.policyData.environment.selected_core = 'sing-box'; h.policyData.enabled = false; h.policyData.running = false;
  await h.app.refreshPolicy(true);
- assert.match(h.app.policyEnvironment.textContent, /xray/);
+ assert.match(h.app.policyEnvironment.textContent, /sing-box/);
  assert.equal(h.app.policyButtons.apply.disabled, false);
 });
 
@@ -160,7 +163,7 @@ test('list save sends both native lists and their original revision', async () =
  h.app.policyInputs.domains.value += 'new.example.com\n'; h.app.policyInputs.domains.handlers.input();
  await h.app.policyAction('save'); await settle();
  const call = h.calls.find(call => call.method === 'psportal_save');
- assert.deepEqual(call.args, ['auth.api.playstation.com\nnew.example.com\n', 'dwc.dl.playstation.net\n', 'a'.repeat(64)]);
+ assert.deepEqual(call.args, ['auth.api.playstation.com\nnew.example.com\n', 'dwc.dl.playstation.net\n', 'xray_a', 'a'.repeat(64)]);
  assert.equal(h.app.policyRevision, 'b'.repeat(64));
  assert.deepEqual(h.app.policyTouched, {});
  assert.equal(h.calls.some(call => call.method === 'psportal_apply'), false);
@@ -171,10 +174,10 @@ test('save and apply submits a list transaction and reports its own completion',
  await h.app.policyAction('apply'); await settle();
  assert.equal(h.calls.filter(call => call.method === 'psportal_apply').length, 1);
  assert.equal(h.calls.some(call => call.method === 'psportal_preview'), false);
- assert.equal(h.calls.find(call => call.method === 'psportal_apply').args.length, 3);
+ assert.equal(h.calls.find(call => call.method === 'psportal_apply').args.length, 4);
  h.status.job = {id:'applied',action:'psportal_apply',state:'complete',busy:false,reloaded:false,pending_apply:true};
  await h.app.refresh(); await settle();
- assert.match(h.app.policyNotice.textContent, /下次启动/);
+ assert.match(h.app.policyNotice.textContent, /启动后/);
 });
 
 test('external list edits preserve the draft and require a deliberate reread', async () => {
@@ -194,7 +197,7 @@ test('external list edits preserve the draft and require a deliberate reread', a
 
 test('native list saving works before device and bitrate enrollment', async () => {
  const h = harness(); h.details.configured = h.details.devices_configured = false;
- h.details.device_selectors = {}; h.details.config.portal_ip = h.details.config.ps5_ip = '';
+ h.details.device_selectors = {}; h.details.config.portal_ip = h.details.config.ps5_ip = ''; h.policyData.devices_ready = false;
  await h.init(); await policyTab(h);
  assert.equal(h.app.policyButtons.save.disabled, false);
  h.app.selectTab('devices'); await h.app.refreshDevices(true);
@@ -239,10 +242,10 @@ test('moving native domains preserves comments and geosite entries in both lists
 
 test('native parent domains use suffix matching while a direct parent remains visible', async () => {
  const h = harness(); await h.init(); await policyTab(h);
- h.app.policyInputs.domains.value = 'example.com\n';
+ h.app.policyInputs.domains.value = 'domain:example.com\n';
  assert.match(nodeText(h.app.domainRuleActions('api.example.com')), /已加入代理/);
- assert.match(nodeText(h.app.domainRuleActions('example.com.attacker.net')), /PassWall 默认策略/);
- h.app.policyInputs.exclusions.value = 'example.com\n';
+ assert.match(nodeText(h.app.domainRuleActions('example.com.attacker.net')), /默认直连/);
+ h.app.policyInputs.exclusions.value = 'domain:example.com\n';
  const original = h.app.policyInputs.domains.value;
  h.app.addDomainToPolicy('api.example.com','domains');
  assert.equal(h.app.policyInputs.domains.value, original);
@@ -633,9 +636,9 @@ test('read-only domain copies use the HTTP clipboard fallback and clean up the t
 test('removing a covered native domain keeps the parent rule and adds a direct exception', async () => {
  const h = harness(); await h.init(); await policyTab(h);
  const host = 'region.auth.np.ac.playstation.net';
- h.app.policyInputs.domains.value = 'auth.np.ac.playstation.net\n'+host+'\n';
+ h.app.policyInputs.domains.value = 'domain:auth.np.ac.playstation.net\n'+host+'\n';
  h.app.domainRuleActions(host).children[1].children[1].click();
- assert.equal(h.app.policyInputs.domains.value, 'auth.np.ac.playstation.net\n');
+ assert.equal(h.app.policyInputs.domains.value, 'domain:auth.np.ac.playstation.net\n');
  assert.match(h.app.policyInputs.exclusions.value, /region\.auth\.np\.ac\.playstation\.net/);
  assert.match(h.app.domainActionText.textContent, /加入直连名单草稿/);
  h.app.domainRuleActions(host).children[1].children[0].click();
@@ -730,7 +733,7 @@ test('the main features show runtime, configuration and open bounded logs in ord
  }
  assert.equal(h.app.deviceLogDetails.open, true);
  assert.equal(h.app.fields.bridge.choicePicker.root.parentNode.parentNode.parentNode.tag, 'div');
- assert.deepEqual(Object.keys(h.app.policyInputs), ['domains', 'exclusions']);
+ assert.deepEqual(Object.keys(h.app.policyInputs), ['node', 'domains', 'exclusions']);
  assert.equal(h.app.buttons.baseline, undefined);
  assert.equal(h.app.buttons.trial, undefined);
  h.details.baseline_valid = false; await h.app.refreshDetails();
@@ -849,7 +852,7 @@ test('domain evidence edits a native draft and the apply action submits it direc
  assert.equal(h.calls.length, 0);
  assert.match(h.app.policyInputs.domains.value, /api\.sony\.example/);
  assert.equal(h.app.domainActionNotice.hidden, false);
- assert.match(h.app.domainActionText.textContent, /保存并应用/);
+ assert.match(h.app.domainActionText.textContent, /应用设备规则/);
  await h.app.policyAction('apply'); await settle();
  assert.match(h.calls.find(call => call.method === 'psportal_apply').args[0], /api\.sony\.example/);
 });
@@ -921,7 +924,7 @@ test('device replacement waits for the shared services to stop while inventory r
  assert.equal(h.app.buttons.device_save.disabled, true);
  assert.equal(h.app.fields.portal_ip.disabled, true);
  assert.equal(h.app.deviceRefreshButton.disabled, false);
- assert.match(h.app.deviceNotice.textContent, /旧版透明代理规则待迁移/);
+ assert.match(h.app.deviceNotice.textContent, /设备专属访问控制正在接管/);
  h.deviceData.proxy_enabled = false; await h.app.refreshDevices(true);
  assert.equal(h.app.buttons.device_save.disabled, false);
 });
@@ -937,7 +940,7 @@ test('proxy cancellation uses the shared cancellation API and displays its own r
   return Promise.resolve({ok:true,stopping:true});
  };
  await h.app.policyAction('cancel'); await settle();
- assert.match(h.app.policyNotice.textContent, /名单应用已取消/);
+ assert.match(h.app.policyNotice.textContent, /设备接管任务已取消/);
  assert.equal(h.calls.filter(call => call.method === 'stop').length, 1);
 });
 
@@ -965,5 +968,68 @@ test('restored feature results retain each failure after a task in another featu
  await h.app.refresh(); await settle();
  assert.match(h.app.messageNode.textContent, /relay address unavailable/);
  assert.match(h.app.deviceNotice.textContent, /device address unavailable/);
- assert.match(h.app.policyNotice.textContent, /名单已保存/);
+ assert.match(h.app.policyNotice.textContent, /两设备域名规则已应用/);
+});
+
+
+test('the two-device direct action retains an edited draft and advances its owned revision', async () => {
+ const h = harness(); await h.init(); await policyTab(h);
+ h.app.policyInputs.domains.value += 'edited.example.com\n'; h.app.policyInputs.domains.handlers.input();
+ await h.app.policyAction('direct'); await settle();
+ assert.deepEqual(h.calls.find(call => call.method === 'psportal_direct').args, ['a'.repeat(64)]);
+ h.policyData.policy_mode='direct'; h.policyData.revision='c'.repeat(64); h.policyData.loaded=true;
+ h.status.job={id:'direct-done',action:'psportal_direct',state:'complete',busy:false,policy_mode:'direct'};
+ await h.app.refresh(); await settle();
+ assert.match(h.app.policyInputs.domains.value, /edited.example.com/);
+ assert.equal(h.app.policyConflict, false);
+ assert.equal(h.app.policyRevision, 'c'.repeat(64));
+ assert.match(h.app.policyNotice.textContent, /全部直连/);
+});
+
+test('release uses its own revision-bound action and leaves the bitrate service running', async () => {
+ const h = harness(); await h.init(); await policyTab(h);
+ h.status.running=true; await h.app.refresh();
+ await h.app.policyAction('release'); await settle();
+ assert.deepEqual(h.calls.find(call => call.method === 'psportal_release').args, ['a'.repeat(64)]);
+ assert.equal(h.calls.some(call => call.method === 'stop'), false);
+ h.policyData.policy_mode='released'; h.policyData.loaded=false; h.policyData.can_release=false;
+ h.status.job={id:'released',action:'psportal_release',state:'complete',busy:false};
+ await h.app.refresh(); await settle();
+ assert.match(h.app.policyNotice.textContent, /恢复原 PassWall 策略/);
+ assert.equal(h.app.stateNode.textContent, '运行中');
+});
+
+test('node selection uses both native cores and keeps the current search during polling', async () => {
+ const h = harness(); await h.init(); await policyTab(h);
+ assert.deepEqual(h.app.policyNodePicker.getOptions().map(row=>row.value), ['xray_a','sing_a']);
+ h.app.policyNodePicker.trigger.click();
+ h.app.policyNodePicker.list.children.find(row => row.attributes['data-value'] === 'sing_a').click();
+ await h.app.refreshPolicy(true);
+ assert.equal(h.app.policyInputs.node.value, 'sing_a');
+ assert.match(h.app.policyEnvironment.textContent, /sing-box/);
+ assert.equal(h.app.policyButtons.apply.disabled, false);
+ await h.app.policyAction('apply'); await settle();
+ assert.equal(h.calls.find(call => call.method === 'psportal_apply').args[2], 'sing_a');
+});
+
+test('unavailable native exits stay disabled in the node picker', async () => {
+ const h = harness();
+ h.policyData.nodes.push({id:'stock_shunt',label:'已有分流组',core:'xray',protocol:'_shunt',
+  available:false,reason:'选择其中的实际出口'});
+ await h.init(); await policyTab(h);
+ h.app.policyNodePicker.trigger.click();
+ const option = h.app.policyNodePicker.list.children.find(row => row.attributes['data-value'] === 'stock_shunt');
+ assert.equal(option.disabled, true);
+ option.click();
+ assert.equal(h.app.policyInputs.node.value, 'xray_a');
+});
+
+test('empty device lists stay empty after the first policy read', async () => {
+ const h = harness();
+ h.policyData.config = {node:'xray_a',domains:'',exclusions:''};
+ h.policyData.config_source = 'empty';
+ await h.init(); await policyTab(h);
+ assert.equal(h.app.policyInputs.domains.value, '');
+ assert.equal(h.app.policyInputs.exclusions.value, '');
+ assert.match(h.app.policyDraftState.textContent, /初始为空/);
 });

@@ -1,12 +1,12 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=ps-accel
-PKG_VERSION:=0.1.9
+PKG_VERSION:=0.1.10
 PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=PS Accel
-APP_FILES:=portal_auto.py portal_auto_platform.py portal_active_probe.py portal_capture.py portal_egress_witness.py portal_windows_network.py protocol.py profiles.py telemetry.py observability.py stream_quality.py domain_monitor.py domain_tracker.py portal_observe.py portal_openwrt.py portal_luci.py portal_policy.py passwall_rules.py sony_domains.py proxy_telemetry.py
+APP_FILES:=portal_auto.py portal_auto_platform.py portal_active_probe.py portal_capture.py portal_egress_witness.py portal_windows_network.py protocol.py profiles.py telemetry.py observability.py stream_quality.py domain_monitor.py domain_tracker.py portal_observe.py portal_openwrt.py portal_luci.py portal_policy.py passwall_rules.py passwall_uci.py sony_domains.py proxy_telemetry.py
 
 include $(INCLUDE_DIR)/package.mk
 

@@ -117,7 +117,7 @@ class ConnectionTracker:
             self.revision = revision
         owners = {ip: role for role, ips in sources.items() for ip in ips}
         wanted = manifest.get('config', {})
-        native = manifest.get('mode') == 'native_lists'
+        native = manifest.get('mode') in ('native_lists', 'device_acl')
         included, excluded = ([], []) if native else (proxy_rules(wanted), domain_rules(wanted.get('exclusions', '')))
         successful, seen, errors = set(), set(), []
         for item in configs[:8]:
@@ -211,7 +211,7 @@ class ConnectionTracker:
         return {'epoch': epoch, 'state': 'observing' if successful else 'waiting',
                 'generation': self.generation,
                 'policy_scope': {key: wanted.get(key, '') for key in (
-                    ('mode', 'domains', 'exclusions', 'proxy_list_enabled', 'direct_list_enabled') if native else
+                    ('mode', 'domains', 'exclusions', 'scope_enabled', 'proxy_list_enabled', 'direct_list_enabled') if native else
                     ('domains', 'exclusions', 'ports'))},
                 'revision': revision,
                 'sampled_cores': len(successful), 'errors': errors,

@@ -8,7 +8,7 @@
     },
     "write": {
       "ubus": {
-        "ps-accel": ["device_save", "configure", "profile", "baseline", "trial", "start", "stop", "repair", "doctor", "logging", "incident", "domain_batch_start", "psportal_save", "psportal_apply"]
+        "ps-accel": ["device_save", "configure", "profile", "baseline", "trial", "start", "stop", "repair", "doctor", "logging", "incident", "domain_batch_start", "psportal_save", "psportal_apply", "psportal_direct", "psportal_release"]
       }
     }
   }

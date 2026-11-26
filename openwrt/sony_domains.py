@@ -76,7 +76,31 @@ def native_matches(host, rules):
     return bool(host) and any(host == rule or host.endswith('.' + rule) for rule in rules)
 
 
+def device_host_rules(text):
+    if not isinstance(text, str):
+        return []
+    result = []
+    for line in text.splitlines():
+        rule = line.strip().lower().removeprefix('full:')
+        if (native_host(rule.removeprefix('domain:')) or rule.startswith('geosite:')) and rule not in result:
+            result.append(rule)
+    return result
+
+
+def device_matches(host, rules):
+    host = host.lower().rstrip('.')
+    return bool(host) and any(native_matches(host, [rule[7:]]) if rule.startswith('domain:') else host == rule
+                              for rule in rules)
+
+
 def scope_proxy(host, config, respect_switches=True):
+    if config.get('mode') == 'device_acl':
+        if not config.get('scope_enabled'):
+            return False
+        enabled = config.get('proxy_list_enabled', False) or not respect_switches
+        direct = config.get('direct_list_enabled', True) or not respect_switches
+        return bool(enabled and device_matches(host, device_host_rules(config.get('domains', ''))) and
+                    not (direct and device_matches(host, device_host_rules(config.get('exclusions', '')))))
     if config.get('mode') == 'native_lists':
         enabled = config.get('proxy_list_enabled', True) or not respect_switches
         direct = config.get('direct_list_enabled', True) or not respect_switches

@@ -4,7 +4,7 @@
 
 当前基准设备：**FastRhino R66S，rockchip/armv8，OpenWrt 25.12-SNAPSHOT，内核 6.12.115**。原有提码率方案的有效性由本机实测确认，本仓库负责重做中文控制台、配置流程、稳定性和部署。
 
-当前版本 **0.1.9**：提供轻量串流质量采集与只读降档建议，展示客户端报告丢失、坏帧／关键帧请求、中继接收队列丢包和转发处理耗时。持续异常时建议试用下一低档，反馈过期后撤回建议，中继自身异常优先提示检查负载。页面提供设备配置、码率增强、透明代理与域名监控四个一级入口；域名监控按连接批次保存解析、失败证据及核心流量统计，支持 PassWall 纯域名复制、代理流量排序与代理清单联动。透明代理已收敛为本机 PassWall 的代理、直连域名名单维护，沿用当前核心和节点，兼容 Xray 与 Sing-box。域名级流量读取本机已有接口，页面明确显示数据来源与可用状态。换档沿用选择码率、保存并自动重启的流程。
+当前版本 **0.1.10**：提供轻量串流质量采集与只读降档建议，展示客户端报告丢失、坏帧／关键帧请求、中继接收队列丢包和转发处理耗时。持续异常时建议试用下一低档，反馈过期后撤回建议，中继自身异常优先提示检查负载。页面提供设备配置、码率增强、透明代理与域名监控四个一级入口；域名监控按连接批次保存解析、失败证据及核心流量统计，支持 PassWall 纯域名复制、代理流量排序与代理清单联动。透明代理使用本机 PassWall 的两设备专属访问控制与独立分流规则组，引用已有 Xray / Sing-box 出口，默认直连，提供全部直连与解除接管。域名级流量读取本机已有接口，页面明确显示数据来源与可用状态。换档沿用选择码率、保存并自动重启的流程。
 
 - [OpenWrt 安装与使用](openwrt/README.zh-CN.md)
 - [仓库分析与增强设计](docs/openwrt-analysis.zh-CN.md)
@@ -13,7 +13,7 @@
 - [0.1.5 原始对齐核对](docs/openwrt-alignment-0.1.5.zh-CN.md)
 - [界面与功能结构](docs/openwrt-ui-redesign.zh-CN.md)
 - [早期 R66S 透明代理实现记录](docs/psportal-r66s-design.md)
-- 中文交互预览：运行 `python3 openwrt/build.py` 后打开 `openwrt/release-assets/ps-accel-console-0.1.9.html`
+- 中文交互预览：运行 `python3 openwrt/build.py` 后打开 `openwrt/release-assets/ps-accel-console-0.1.10.html`
 
 `openwrt/` 包含独立的 PS Accel 服务、原生 LuCI 页面、协议引擎、测试、IPK/脚本包构建器和 OpenWrt 原生包 Makefile。`PS-Portal-Relay/` 是工作区中的独立登录与信令代理仓库，提供透明代理实现参考，并保留独立 Git 历史。
 
@@ -24,7 +24,7 @@
 | 推送目标 | 发布类型 | GitHub Release tag |
 | --- | --- | --- |
 | `release/test` 分支 | 测试版，标记为 Pre-release | `test-<构建编号>-<提交短 SHA>` |
-| `v<应用版本>` tag，例如 `v0.1.9` | 正式版，标记为 Latest | 使用推送的版本 tag |
+| `v<应用版本>` tag，例如 `v0.1.10` | 正式版，标记为 Latest | 使用推送的版本 tag |
 
 发布流程复用完整检查和构建结果，通过 SHA256 校验后上传到 [GitHub Releases](https://github.com/xuasir/ps-accel/releases)。测试分支的每次推送都会触发发布，正式版由版本 tag 触发。
 
@@ -37,8 +37,8 @@ git push origin release/test
 正式版 tag 与 `openwrt/profiles.py` 的 `APP_VERSION`、`openwrt/build.py` 的安装包版本保持一致。当前版本发布命令：
 
 ```sh
-git tag v0.1.9
-git push origin v0.1.9
+git tag v0.1.10
+git push origin v0.1.10
 ```
 
 升级版本时同步更新 `openwrt/profiles.py`、`openwrt/build.py` 和 `openwrt/Makefile`，完成检查后推送对应版本 tag。

@@ -44,7 +44,9 @@ METHODS = {'status': {}, 'details': {}, 'devices': {}, 'device_save': {key: '' f
            'baseline': {}, 'trial': {}, 'start': {'autostart': 0}, 'stop': {}, 'repair': {}, 'doctor': {}}
 METHODS.update({'psportal_status': {},
                 'psportal_save': dict({key: '' for key in rules.FIELDS}, revision=''),
-                'psportal_apply': dict({key: '' for key in rules.FIELDS}, revision='')})
+                'psportal_apply': dict({key: '' for key in rules.FIELDS}, revision=''),
+                'psportal_direct': {'revision': ''}, 'psportal_release': {'revision': ''}})
+PROXY_ACTIONS = {'psportal_apply', 'psportal_direct', 'psportal_release'}
 
 
 def optional(path, default=None):
@@ -291,18 +293,20 @@ def devices():
     binding = port.device_binding(values)
     return {'ok': True, 'config': {key: values.get(key, '') for key in port.DEVICE_FIELDS},
             'configured': bool(binding), 'binding': binding, 'devices': policy.inventory(),
-            'proxy_enabled': policy.policy_enabled(policy.read(policy.folder() / 'manifest.json'))}
+            'proxy_enabled': rules.devices_controlled() or policy.policy_enabled(policy.read(policy.folder() / 'manifest.json'))}
 
 
 def save_devices(request):
     """Confirm LAN identities without creating a relay namespace or changing proxy rules."""
     request = port.validate_devices(request)
-    with port.exclusive(), policy.lock():
+    with port.exclusive(), rules.lock():
         if (port.ENGINE_LOCK.exists() or (port.RUNTIME / 'recovery-required').exists()
                 or port.HANDLE.exists() or (port.SYSNET / port.HOST).exists()):
             raise RuntimeError('请先停止码率增强并完成网络恢复，再保存设备配置')
         if policy.policy_enabled(policy.read(policy.folder() / 'manifest.json')):
             raise RuntimeError('请先停用透明代理，再保存设备配置')
+        if rules.devices_controlled():
+            raise RuntimeError('请先在透明代理中解除设备接管，再保存设备配置')
         if not (port.SYSNET / request['bridge'] / 'bridge').is_dir():
             raise ValueError('所选 LAN 网桥待就绪，请检查设备所在网络')
         addresses = json.loads(port.command('ip', '-j', 'addr', 'show', 'dev', request['bridge'], timeout=3).stdout)
@@ -635,6 +639,7 @@ def proxy_diagnostics():
     return {'ok': True, 'generated_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
             'proxy': redact_domain_data({key: data.get(key) for key in (
                 'mode', 'available', 'enabled', 'running', 'config', 'file_config', 'environment', 'switches',
+                'device_group', 'policy_mode', 'controlled', 'loaded', 'passwall_enabled', 'acl_id', 'node_id',
                 'blockers', 'warnings', 'receipt', 'pending_apply', 'telemetry')}),
             'domain_diagnostics': redact_domain_data(report),
             'privacy': '诊断包含代理配置、域名访问与失败证据；设备地址与 MAC 已遮盖。'}
@@ -702,8 +707,9 @@ def validate(method, request):
         raise ValueError('Invalid autostart setting')
     if method in ('psportal_save', 'psportal_apply'):
         rules.normalize(request)
+    if method in ('psportal_save', 'psportal_apply', 'psportal_direct', 'psportal_release'):
         if not isinstance(request['revision'], str) or not re.fullmatch('[0-9a-f]{64}', request['revision']):
-            raise ValueError('请重新读取本机 PassWall 名单后保存')
+            raise ValueError('请重新读取设备专属规则后保存')
     return request
 
 
@@ -955,7 +961,8 @@ def worker(job_id):
                 raise RuntimeError('Unknown job')
             job.update(pid=os.getpid(), identity=process_identity(os.getpid()), state='running')
             record_job(job)
-        action, request = job['action'], validate(job['action'], job['request'])
+        action = job['action']
+        request = validate(action, job['request'])
         if action == 'device_save':
             message('正在确认 Portal / PS5 的内网地址与设备身份。')
             save_devices(request)
@@ -981,11 +988,13 @@ def worker(job_id):
             start_managed_service(job_id)
         elif action == 'stop':
             stop_service(job_id, job.get('orphan'))
-        elif action == 'psportal_apply':
-            message('正在保存本机 PassWall 的代理与直连域名名单。')
-            result = rules.apply(request, cancel=lambda: cancelled(job_id))
+        elif action in PROXY_ACTIONS:
+            message('正在应用 Portal / PS5 的设备专属访问控制。')
+            operation = {'psportal_apply': rules.apply, 'psportal_direct': rules.direct, 'psportal_release': rules.release}[action]
+            result = operation(request, cancel=lambda: cancelled(job_id))
             message(result['notice'])
-            update_job(job_id, reloaded=result['reloaded'], pending_apply=result['pending_apply'], commit_complete=True)
+            update_job(job_id, reloaded=result['reloaded'], pending_apply=result['pending_apply'],
+                       policy_mode=result['policy_mode'], revision=result['revision'], commit_complete=True)
     except Exception as exc:
         error = None if isinstance(exc, rules.RulesCancelled) else exc
         message(str(exc), error=error is not None)
@@ -994,10 +1003,10 @@ def worker(job_id):
     # rollback keeps its restored service; a failed cleanup ends with a retryable job.
     cancel_requested = cancelled(job_id)
     saved = optional(JOBS / 'job.json')
-    if action == 'psportal_apply' and saved.get('commit_complete'):
+    if action in PROXY_ACTIONS and saved.get('commit_complete'):
         cancel_requested = False
     owns_job = not saved.get('id') or saved['id'] == job_id
-    needs_cleanup = owns_job and action != 'psportal_apply' and (cancel_requested or (error is not None and saved.get('cleanup_required')
+    needs_cleanup = owns_job and action not in PROXY_ACTIONS and (cancel_requested or (error is not None and saved.get('cleanup_required')
                                                      and not saved.get('rolled_back')))
     if needs_cleanup and not saved.get('cleanup_complete') and not saved.get('cleanup_attempted'):
         try:
@@ -1018,7 +1027,7 @@ def worker(job_id):
             values['cleanup_error'] = str(cleanup_error)
     else:
         values = dict(state='cancelled' if cancel_requested else 'complete', finished=time.time(), cleanup_required=False)
-        message(('名单应用已取消，原名单已恢复。' if action == 'psportal_apply' else '已停止，网络恢复完成。') if cancel_requested else '操作完成。')
+        message(('设备接管任务已取消，原策略已恢复。' if action in PROXY_ACTIONS else '已停止，网络恢复完成。') if cancel_requested else '操作完成。')
     best_effort_update(job_id, **values)
     if values['state'] == 'failed':
         record_failure(port.RUNTIME, port.PERSIST, 'management', values['error'], job_id)
