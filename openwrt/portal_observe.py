@@ -11,7 +11,7 @@ import time
 import portal_openwrt as port
 from domain_tracker import DomainTracker
 from observability import (OBSERVATION_LIMIT, correlate, merge_events, read_bounded,
-                           read_domain_events, read_incidents, save_incident, utc)
+                           read_domain_events, read_incidents, save_incident, utc, atomic_json)
 from telemetry import Telemetry
 
 SNAPLEN = 4096
@@ -55,7 +55,12 @@ def capture_filter(devices):
                        for info in devices.values())
     # TCP payload capture is restricted to the first visible ClientHello record.
     # Encrypted application/video payloads fail the kernel filter.
-    traffic = ('udp port 53 or tcp port 53 or icmp or icmp6 or '
+    # Only the paired client's control headers and 15-byte congestion feedback
+    # extend a connection batch. Media packets stay outside the capture filter.
+    control = ('(udp and src host ' + devices['portal']['ip'] + ' and dst host ' + devices['ps5']['ip'] +
+               ' and ((udp[8] = 0 and udp[21] = 0 and (udp[22] = 0 or udp[22] = 1)) or '
+               '(udp[4:2] = 23 and udp[8] = 5 and udp[9:2] = 0)))')
+    traffic = (control + ' or udp port 53 or tcp port 53 or icmp or icmp6 or '
                '(ip and tcp and (tcp[13] & 0x06 != 0 or '
                '(dst port 443 and tcp[((tcp[12] & 0xf0) >> 2)] = 22))) or '
                '(ip6 and (ip6[6] = 6) and (ip6[53] & 0x06 != 0 or '
@@ -88,7 +93,10 @@ class ObserverTelemetry(Telemetry):
 
     def write_report(self, name, payload):
         history = payload.get('_history', [])
-        public = {key: value for key, value in payload.items() if key != '_history'}
+        batches = payload.get('_batches')
+        public = {key: value for key, value in payload.items() if key not in ('_history', '_batches')}
+        if isinstance(batches, dict):
+            atomic_json(port.RUNTIME / 'domain-batches.json', batches)
         super().write_report(name, public)
         if time.monotonic() < self.next_incident_scan:
             return
@@ -112,6 +120,11 @@ class ObserverTelemetry(Telemetry):
                     'connections': proxy_snapshot('connections.json').get('connections', [])[:16],
                     'probes': proxy_snapshot('probes.json').get('targets', [])[:4]}))
 
+    def write_inventory(self, payload):
+        if isinstance(payload.get('_batches'), dict):
+            atomic_json(port.PERSIST / 'domain-batches.json', payload['_batches'])
+        super().write_inventory({key: value for key, value in payload.items() if key != '_batches'})
+
 
 def run():
     os.umask(0o077)
@@ -122,10 +135,11 @@ def run():
         except BlockingIOError:
             raise RuntimeError('设备域名观察服务已运行') from None
         recorder = ObserverTelemetry()
-        sock, tracker, binding, memory_inventory = None, None, None, None
+        sock, tracker, binding, memory_inventory, memory_batches = None, None, None, None, None
         last_domains = None
         running = True
         next_config = next_report = next_inventory = next_new_inventory = 0
+        next_traffic_inventory = 0
         next_tick, rate_start, rate_count, rate_drops, capture_drops = 0, time.monotonic(), 0, 0, 0
         state, error = 'waiting', ''
 
@@ -150,6 +164,7 @@ def run():
                             if tracker is not None:
                                 tracker.tick(closing=True)
                                 memory_inventory = tracker.inventory()
+                                memory_batches = memory_inventory.get('_batches')
                                 recorder.inventory(memory_inventory)
                             if sock is not None:
                                 sock.close()
@@ -162,7 +177,13 @@ def run():
                                     except (OSError, ValueError):
                                         pass
                                 sock = open_capture(*current)
-                                tracker = DomainTracker(current[1], recorder.event, preferences, inventory)
+                                batches = memory_batches
+                                if batches is None:
+                                    try:
+                                        batches = read_bounded(port.PERSIST / 'domain-batches.json')
+                                    except (OSError, ValueError):
+                                        batches = None
+                                tracker = DomainTracker(current[1], recorder.event, preferences, inventory, batches=batches)
                                 binding = current
                         if recorder.preferences.initialized:
                             state, error = ('observing' if enabled else 'disabled'), ''
@@ -176,6 +197,11 @@ def run():
                 if tracker is not None:
                     tracker.preferences = preferences
                     if now >= next_tick:
+                        try:
+                            tracker.start_batch(read_bounded(port.RUNTIME / 'domain-batch-request.json', 4096))
+                        except (OSError, ValueError, TypeError, AttributeError, KeyError):
+                            pass
+                        tracker.observe_traffic(proxy_snapshot('connections.json'))
                         tracker.tick()
                         next_tick = now + 1
                 if now >= next_report:
@@ -193,13 +219,19 @@ def run():
                                   rate_drops=rate_drops, capture_drops=capture_drops, snaplen=SNAPLEN)
                     if tracker is not None:
                         report['_history'] = list(tracker.recent)
+                        report['_batches'] = tracker.monitor.snapshot()
                     recorder.snapshot(report)
-                    next_report = now + preferences.snapshot_interval
+                    next_report = now + min(2, preferences.snapshot_interval)
                 if tracker is not None and tracker.dirty and (
-                        now >= next_inventory or (tracker.new_names and now >= next_new_inventory)):
+                        tracker.monitor.changed or now >= next_inventory or (tracker.new_names and now >= next_new_inventory) or
+                        tracker.traffic_dirty and now >= next_traffic_inventory):
                     recorder.inventory(tracker.inventory())
                     tracker.dirty, tracker.new_names = False, False
+                    tracker.monitor.changed = False
+                    tracker.monitor.new_domains = False
+                    tracker.traffic_dirty = False
                     next_inventory, next_new_inventory = now + 300, now + 60
+                    next_traffic_inventory = now + 60
                 if sock is None:
                     time.sleep(.5)
                     continue

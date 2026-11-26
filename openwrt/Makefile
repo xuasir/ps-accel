@@ -6,7 +6,7 @@ PKG_RELEASE:=1
 PKG_LICENSE:=MIT
 PKG_LICENSE_FILES:=LICENSE
 PKG_MAINTAINER:=PS Accel
-APP_FILES:=portal_auto.py portal_auto_platform.py portal_active_probe.py portal_capture.py portal_egress_witness.py portal_windows_network.py protocol.py profiles.py telemetry.py observability.py stream_quality.py domain_tracker.py portal_observe.py portal_openwrt.py portal_luci.py portal_policy.py sony_domains.py proxy_telemetry.py psportal_adapter.lua
+APP_FILES:=portal_auto.py portal_auto_platform.py portal_active_probe.py portal_capture.py portal_egress_witness.py portal_windows_network.py protocol.py profiles.py telemetry.py observability.py stream_quality.py domain_monitor.py domain_tracker.py portal_observe.py portal_openwrt.py portal_luci.py portal_policy.py passwall_rules.py sony_domains.py proxy_telemetry.py
 
 include $(INCLUDE_DIR)/package.mk
 
@@ -38,7 +38,7 @@ endef
 
 define Package/ps-accel/install
 	$(INSTALL_DIR) $(1)/usr/lib/ps-accel $(1)/etc/ps-accel
-	$(INSTALL_DATA) $(PKG_BUILD_DIR)/*.py $(PKG_BUILD_DIR)/psportal_adapter.lua $(PKG_BUILD_DIR)/LICENSE $(PKG_BUILD_DIR)/requirements.txt $(PKG_BUILD_DIR)/UPSTREAM* $(1)/usr/lib/ps-accel/
+	$(INSTALL_DATA) $(PKG_BUILD_DIR)/*.py $(PKG_BUILD_DIR)/LICENSE $(PKG_BUILD_DIR)/requirements.txt $(PKG_BUILD_DIR)/UPSTREAM* $(1)/usr/lib/ps-accel/
 	chmod 700 $(1)/usr/lib/ps-accel $(1)/etc/ps-accel
 	chmod 600 $(1)/usr/lib/ps-accel/*
 	$(INSTALL_DIR) $(1)/usr/sbin $(1)/etc/init.d $(1)/etc/config $(1)/www
@@ -78,7 +78,9 @@ uci commit ps_accel
 /etc/init.d/ps-accel disable
 /etc/init.d/ps-accel-observe enable
 /etc/init.d/ps-accel-observe start
-if [ -f /etc/ps-accel/psportal/manifest.json ]; then /usr/sbin/ps-accel-policy resume; fi
+/usr/sbin/ps-accel-policy migrate || exit 1
+/etc/init.d/ps-accel-policy enable
+/etc/init.d/ps-accel-policy start
 rm -rf /usr/lib/ps-accel/__pycache__
 rm -f /tmp/luci-indexcache*
 if /etc/init.d/rpcd running >/dev/null 2>&1; then /etc/init.d/rpcd reload; fi

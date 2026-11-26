@@ -1,6 +1,7 @@
 """Bounded, authenticated loopback Sing-box evidence and fixed-target probes."""
 from collections import OrderedDict
 import base64
+import datetime
 import hashlib
 import http.client
 import ipaddress
@@ -11,9 +12,10 @@ import ssl
 import subprocess
 import sys
 import time
+import uuid
 
 from sony_domains import (FIRMWARE_HOST, DYNAMIC_PROXY_RULES, domain_info, domain_rules,
-                         matches_domain, proxy_rules)
+                         matches_domain, proxy_rules, scope_proxy)
 
 PROBE_TAG = 'ps-accel-psportal-probe'
 MAX_CONNECTIONS = 128
@@ -57,7 +59,14 @@ def loopback_endpoint(value):
 
 def api_connections(config, timeout=1):
     api = config.get('experimental', {}).get('clash_api', {})
-    host, port = loopback_endpoint(api.get('external_controller', ''))
+    endpoint = api.get('external_controller', '')
+    if isinstance(endpoint, str):
+        address, separator, number = endpoint.rpartition(':')
+        if address in ('0.0.0.0', 'localhost'):
+            endpoint = '127.0.0.1:' + number
+        elif address in ('[::]', '::'):
+            endpoint = '[::1]:' + number
+    host, port = loopback_endpoint(endpoint)
     secret = api.get('secret', '')
     if not isinstance(secret, str) or len(secret) > 256 or any(ord(x) < 32 for x in secret):
         raise ValueError('管理接口凭据格式需要检查')
@@ -84,10 +93,20 @@ def finite_number(value, default=0):
     return value if type(value) in (int, float) and math.isfinite(value) and value >= 0 else default
 
 
+def connection_start(value, epoch):
+    try:
+        stamp = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+        started = stamp.timestamp() if stamp.tzinfo is not None else None
+        return started if started is not None and 0 <= started <= epoch + 10 else None
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return None
+
+
 class ConnectionTracker:
     def __init__(self):
         self.connections = OrderedDict()
         self.revision = ''
+        self.generation = uuid.uuid4().hex
         self.health = {'capacity_drops': 0, 'malformed': 0}
 
     def sample(self, configs, sources, manifest, epoch=None):
@@ -98,10 +117,11 @@ class ConnectionTracker:
             self.revision = revision
         owners = {ip: role for role, ips in sources.items() for ip in ips}
         wanted = manifest.get('config', {})
-        included, excluded = proxy_rules(wanted), domain_rules(wanted.get('exclusions', ''))
+        native = manifest.get('mode') == 'native_lists'
+        included, excluded = ([], []) if native else (proxy_rules(wanted), domain_rules(wanted.get('exclusions', '')))
         successful, seen, errors = set(), set(), []
         for item in configs[:8]:
-            config, key = item['config'], core_key(item['config'])
+            config, key = item['config'], item.get('key') or core_key(item['config'])
             try:
                 rows = api_connections(config)
             except (OSError, ValueError, RuntimeError, http.client.HTTPException):
@@ -109,13 +129,16 @@ class ConnectionTracker:
                 continue
             successful.add(key)
             direct_tags = {x.get('tag') for x in config.get('outbounds', []) if x.get('type') == 'direct'}
+            proxy_tags = {x.get('tag') for x in config.get('outbounds', [])
+                          if x.get('type') not in (None, 'direct', 'block', 'dns', 'selector', 'urltest')}
             for row in rows[:4096]:
                 if not isinstance(row, dict) or not isinstance(row.get('metadata'), dict):
                     self.health['malformed'] += 1
                     continue
                 metadata = row['metadata']
                 source = str(metadata.get('sourceIP', ''))
-                if source not in owners or str(metadata.get('network', '')).lower() != 'tcp':
+                network = str(metadata.get('network', '')).lower()
+                if source not in owners or network not in ('tcp', 'udp'):
                     continue
                 host = str(metadata.get('host') or '').lower().rstrip('.')[:253]
                 ident = row.get('id')
@@ -129,8 +152,13 @@ class ConnectionTracker:
                 tagged = 'ps-accel-psportal' in chain
                 expected = manifest.get('expected_outbounds', {}).get(key)
                 selected = tagged and (not expected or outbound_signature(config) == expected)
-                direct = bool(direct_tags.intersection(chain)) and not selected
-                upload, download = finite_number(row.get('upload')), finite_number(row.get('download'))
+                via_proxy = bool(tagged or proxy_tags.intersection(chain))
+                direct = bool(direct_tags.intersection(chain)) and not via_proxy
+                counters = [finite_number(row.get(key), None) for key in ('upload', 'download')]
+                if any(value is None or value > 2**63 - 1 for value in counters):
+                    self.health['malformed'] += 1
+                    continue
+                upload, download = map(int, counters)
                 info = domain_info(host)
                 phase = 'CONNECTED' if info['category'] == 'signaling' and download else \
                     'AUTH' if info['category'] == 'auth' else 'SIGNALING' if info['category'] == 'signaling' else 'CONNECTED'
@@ -151,10 +179,13 @@ class ConnectionTracker:
                          'address': str(metadata.get('destinationIP', ''))[:45],
                          'port': str(metadata.get('destinationPort', ''))[:5],
                          'first_epoch': previous.get('first_epoch', epoch), 'last_epoch': epoch,
+                         'started_epoch': connection_start(row.get('start'), epoch) or previous.get('started_epoch'),
+                         'network': network,
                          'phase': phase, 'phase_inferred': True, 'active': True,
                          'bytes_up': upload, 'bytes_down': download, 'outbound_chain': chain,
-                         'route': 'selected' if selected else 'previous' if tagged else 'direct' if direct else 'original' if chain else 'unknown',
-                         'expected_proxy': matches_domain(host, included)
+                         'route': 'proxy' if native and via_proxy else 'selected' if selected else 'previous' if tagged else 'other_proxy' if via_proxy else 'direct' if direct else 'original' if chain else 'unknown',
+                         'via_proxy': via_proxy,
+                         'expected_proxy': scope_proxy(host, wanted) if native else network == 'tcp' and matches_domain(host, included)
                              and not matches_domain(host, excluded)
                              and str(metadata.get('destinationPort', '')) in wanted.get('ports', '').split(','),
                          'failure': '', 'trace': trace[-8:], 'missing_samples': 0, **info}
@@ -175,8 +206,13 @@ class ConnectionTracker:
                     if value['bytes_up'] and not value['bytes_down']:
                         value['failure'] = 'upstream_response_missing'
         rows = [dict(value) for value in reversed(self.connections.values())]
-        confirmed = [x for x in rows if x['last_epoch'] == epoch and x['core'] in successful and x['route'] == 'selected']
+        confirmed = [x for x in rows if x['last_epoch'] == epoch and x['core'] in successful and
+                     x['route'] == ('proxy' if native else 'selected')]
         return {'epoch': epoch, 'state': 'observing' if successful else 'waiting',
+                'generation': self.generation,
+                'policy_scope': {key: wanted.get(key, '') for key in (
+                    ('mode', 'domains', 'exclusions', 'proxy_list_enabled', 'direct_list_enabled') if native else
+                    ('domains', 'exclusions', 'ports'))},
                 'revision': revision,
                 'sampled_cores': len(successful), 'errors': errors,
                 'connections': rows, 'health': dict(self.health),

@@ -1,4 +1,8 @@
-"""Device-scoped PSN rules layered into PassWall's existing Sing-box route chain."""
+"""Legacy policy migration and shared device inventory.
+
+Native domain-list maintenance is implemented in passwall_rules.py. This module
+retains the former format so upgrades can detach its owned generator hook.
+"""
 from contextlib import contextmanager
 import fcntl
 import hashlib
@@ -824,6 +828,7 @@ def resume():
 def watch():
     tracker = ConnectionTracker()
     next_sources = 0
+    observing = False
     stopping = False
     def stop(*_):
         nonlocal stopping
@@ -839,6 +844,11 @@ def watch():
             if policy_enabled(manifest):
                 sources, _ = resolve(manifest['config'], inventory())
                 port.atomic(runtime() / 'connections.json', tracker.sample(live_configs(), sources, manifest))
+                observing = True
+            elif observing:
+                port.atomic(runtime() / 'connections.json', {'epoch': time.time(), 'state': 'disabled',
+                            'sampled_cores': 0, 'connections': [], 'generation': tracker.generation})
+                observing = False
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
             pass
         for _ in range(2):

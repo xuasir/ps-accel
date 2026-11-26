@@ -26,8 +26,12 @@ class Element {
  addEventListener(name, handler) { this.handlers[name] = handler; }
  get options() { return this.children.filter(child => child.tag === 'option'); }
  focus() { this.focused = true; }
+ select() { this.selected = true; }
  click() { if (!this.disabled) return this.handlers.click?.({ currentTarget: this, preventDefault() {} }); }
- remove() { this.removed = true; }
+ remove() {
+  this.removed = true;
+  if (this.parentNode) this.parentNode.children = this.parentNode.children.filter(child => child !== this);
+ }
 }
 
 function E(tag, attrs, children) {
@@ -49,7 +53,7 @@ function E(tag, attrs, children) {
 }
 
 function harness({ manualTimers = false, permission = true } = {}) {
- const calls = [], notifications = [], handlers = {}, timers = new Map();
+ const calls = [], notifications = [], handlers = {}, timers = new Map(), clipboardWrites = [];
  let timerId = 0;
  const details = { ok: true, details_revision: 'v1', details_warnings: [],
   config: { bridge: 'br-lan', address: '10.0.0.250/24', ps5_ip: '10.0.0.100', portal_ip: '10.0.0.101', profile: '65' },
@@ -61,18 +65,19 @@ function harness({ manualTimers = false, permission = true } = {}) {
   { device: 'portal', domain: 'api.sony.example', first_seen: '2026-11-23T10:00:00Z',
    last_seen: '2026-11-23T10:01:00Z', counts: { dns_ok: 1 }, addresses: [], last_problem: '', new_since_tag: true }
  ], observer: { state: 'observing', fresh: true, health: {}, observability: {} }, incidents: [], selected: null };
+ domainData.batch = {id:'d'.repeat(32),time:'2026-11-23T10:00:00Z',state:'collecting',domains:domainData.domains,events:[],event_count:1};
+ domainData.batches = [{id:domainData.batch.id,time:domainData.batch.time,state:'collecting',domain_count:1,failed_count:0}];
+ domainData.inventory_count = domainData.domains.length;
  const status = { ok: true, details_revision: 'v1', state_known: true, status_warnings: [],
   running: false, engine_alive: false, recovery_required: false, cleanup_pending: false,
   mode: 'active', counts: {}, foreign_relay: false,
   job: { id: 'initial', state: 'complete', busy: false, action: 'baseline' } };
- const policyData = { ok: true, enabled: false, autostart: true,
-  config: { portal: '02:00:00:00:00:01', ps5: '02:00:00:00:00:02', node: 'nodeA',
-   domains: 'auth.api.playstation.com', ports: '443', exclusions: 'dwc.dl.playstation.net' },
-  environment: { passwall: '26.11.11-r376', singbox: '1.14.4', compatible: true, active_cores: 1, attached_cores: 0 },
-  devices: [{ mac: '02:00:00:00:00:01', label: 'Portal', addresses: ['10.0.0.101'] }],
-  nodes: [{ id: 'nodeA', label: '已有订阅节点', protocol: 'trojan' }], sources: {}, blockers: [],
-  dynamic_rules: ['*.auth.np.ac.playstation.net', '*.np.communication.playstation.net', 'gsconnect.*',
-   '*.gsconnect.playstation.net', '*signaling*', '*.remoteplay.playstation.net'].map(domain => ({domain,builtin:true})) };
+ const policyData = { ok: true, available: true, mode: 'native_lists', enabled: true, running: true,
+  revision: 'a'.repeat(64), config: { domains: 'auth.api.playstation.com\n', exclusions: 'dwc.dl.playstation.net\n' },
+  environment: { cores: ['sing-box'], rules_path: '/etc/passwall/rules' },
+  switches: {proxy_list_enabled:true,direct_list_enabled:true}, counts:{domains:1,exclusions:1},
+  warnings:[],blockers:[],receipt:{},pending_apply:false };
+ policyData.file_config = structuredClone(policyData.config);
  const deviceData = { ok: true, configured: true, proxy_enabled: false,
   config: { bridge: details.config.bridge, portal_ip: details.config.portal_ip, ps5_ip: details.config.ps5_ip },
   binding: { config: { bridge: details.config.bridge, portal_ip: details.config.portal_ip, ps5_ip: details.config.ps5_ip },
@@ -80,6 +85,7 @@ function harness({ manualTimers = false, permission = true } = {}) {
   devices: [{ mac: details.device_selectors.portal, label: 'Portal', addresses: [details.config.portal_ip], source: 'dhcp' },
    { mac: details.device_selectors.ps5, label: 'PS5', addresses: [details.config.ps5_ip], source: 'dhcp' }] };
  const window = {
+  navigator: {clipboard: {writeText: text => { clipboardWrites.push(text); return Promise.resolve(); }}},
   setTimeout: manualTimers ? fn => { timers.set(++timerId, fn); return timerId; } : setTimeout,
   clearTimeout: manualTimers ? id => timers.delete(id) : clearTimeout };
  const rpc = { declare: spec => (...args) => {
@@ -90,10 +96,15 @@ function harness({ manualTimers = false, permission = true } = {}) {
   if (spec.method === 'logs') return Promise.resolve({ ok: true, kind: args[0], text: args[0]+' output' });
   if (spec.method === 'devices') return Promise.resolve(structuredClone(deviceData));
   if (spec.method === 'domains') return Promise.resolve(structuredClone(domainData));
+  if (spec.method === 'domain_monitor') return Promise.resolve(structuredClone(domainData));
   if (spec.method === 'psportal_status') return Promise.resolve(structuredClone(policyData));
-  if (spec.method === 'psportal_preview') return Promise.resolve({ ok: true, token: 'a'.repeat(64),
-   can_apply: true, restart_required: true, blockers: [], rules: [{ domain: args[3], ports: args[4] }],
-   validation: { protection_rules: 2 }, notice: '首次接入需要重启 PassWall' });
+  if (spec.method === 'psportal_save') {
+   policyData.config = {domains: args[0], exclusions: args[1]};
+   policyData.file_config = structuredClone(policyData.config);
+   policyData.revision = 'b'.repeat(64); policyData.pending_apply = true;
+   return Promise.resolve({ok:true,config:policyData.config,revision:policyData.revision,pending_apply:true,
+    notice:'本机名单已保存，保存并应用后生效。'});
+  }
   return Promise.resolve({ ok: true });
  } };
  const poll = { add: (callback, seconds) => { poll.callback = callback; poll.seconds = seconds; } };
@@ -109,6 +120,7 @@ function harness({ manualTimers = false, permission = true } = {}) {
   { extend: object => object }, rpc, poll, ui, E, window, document,
   { hasViewPermission: () => permission });
  return { app, calls, handlers, status, details, domainData, policyData, deviceData, notifications, timers, poll,
+  clipboardWrites, window, document,
   init: async () => { app.render(await app.load()); await settle(); },
   expire: () => { for (const [id, fn] of [...timers]) { timers.delete(id); fn(); } } };
 }
@@ -119,198 +131,123 @@ async function policyTab(h) {
  await settle();
 }
 
-test('policy device choices, node choices and preview rows render as DOM nodes', async () => {
+test('native list controls use only proxy and direct domains and follow the local core', async () => {
  const h = harness(); await h.init(); await policyTab(h);
- h.app.selectTab('devices'); await h.app.refreshDevices(true);
- assert.deepEqual(h.app.fields.portal_ip.choicePicker.getOptions().map(node => node.value), ['10.0.0.101', '10.0.0.100']);
- await policyTab(h);
- assert.equal(h.app.policyInputs.portal.value, h.details.device_selectors.portal);
- assert.deepEqual(h.app.policyNodePicker.getOptions().map(node => node.value), ['nodeA']);
- await h.app.policyAction('preview');
- const row = h.app.policyPreviewBody.children[0];
- assert.equal(row.tag, 'tr');
- assert.deepEqual(row.children.map(node => node.tag), ['td', 'td', 'td']);
- assert.equal(row.children[0].textContent, 'auth.api.playstation.com');
+ assert.deepEqual(Object.keys(h.app.policyInputs), ['domains', 'exclusions']);
+ assert.deepEqual(Object.keys(h.app.policyButtons), ['save', 'apply', 'reload', 'cancel']);
+ assert.equal(h.app.policyButtons.apply.disabled, false);
+ assert.match(nodeText(h.app.mainPanels.proxy), /PassWall 域名名单|保存并应用/);
+ assert.doesNotMatch(nodeText(h.app.mainPanels.proxy), /选择代理节点|检测出口|TCP 端口|开机启用/);
+ h.policyData.environment.cores = ['xray']; h.policyData.enabled = false; h.policyData.running = false;
+ await h.app.refreshPolicy(true);
+ assert.match(h.app.policyEnvironment.textContent, /xray/);
+ assert.equal(h.app.policyButtons.apply.disabled, false);
 });
 
-test('precise routing tab loads policy only when visible and throttles status reads', async () => {
+test('native list reads load on demand and polling retains the current form', async () => {
  const h = harness(); await h.init();
  assert.equal(h.calls.some(call => call.method === 'psportal_status'), false);
- await policyTab(h);
- assert.equal(h.app.mainPanels.proxy.hidden, false);
- assert.equal(h.app.mainPanels.bitrate.hidden, true);
- assert.equal(h.app.mainTabs.proxy.attributes['aria-selected'], 'true');
- assert.equal(h.app.policyInputs.node.value, 'nodeA');
- h.calls.length = 0;
+ await policyTab(h); h.calls.length = 0;
  await h.app.refresh(); await settle();
  assert.deepEqual(h.calls.map(call => call.method), ['status']);
- h.app.selectTab('bitrate'); await h.app.refresh(); await settle();
- assert.equal(h.calls.some(call => call.method === 'psportal_status'), false);
-});
-
-test('first attachment needs an explicit shared restart check after preview', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- await h.app.policyAction('preview');
- assert.equal(h.app.policyConfirmation.hidden, false);
- assert.equal(h.app.policyButtons.apply.disabled, true);
- assert.equal(h.app.policyConfirm.checked, false);
- assert.match(h.app.policyPreviewNotice.textContent, /2 条原有直连/);
- h.app.policyConfirm.checked = true; h.app.policyConfirm.handlers.change();
- assert.equal(h.app.policyButtons.apply.disabled, false);
- await h.app.policyAction('apply'); await settle();
- const call = h.calls.find(call => call.method === 'psportal_apply');
- assert.equal(call.args.at(-1), 1);
- assert.equal(call.args.at(-2), 'a'.repeat(64));
- assert.equal(h.app.policyPlan, null);
-});
-
-test('editing a scoped host invalidates the preview and restart consent', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- await h.app.policyAction('preview');
- h.app.policyConfirm.checked = true; h.app.policyConfirm.handlers.change();
- h.app.policyInputs.domains.value = 'np.ac.playstation.net';
- h.app.policyInputs.domains.handlers.input();
- assert.equal(h.app.policyPlan, null);
- assert.equal(h.app.policyPreview.hidden, true);
- assert.equal(h.app.policyConfirm.checked, false);
- assert.equal(h.app.policyConfirmation.hidden, true);
- assert.equal(h.app.policyButtons.apply.disabled, true);
+ h.app.policyInputs.domains.value += 'new.example.com\n'; h.app.policyInputs.domains.handlers.input();
  await h.app.refreshPolicy(true);
- assert.equal(h.app.policyInputs.domains.value, 'np.ac.playstation.net');
+ assert.match(h.app.policyInputs.domains.value, /new.example.com/);
 });
 
-test('same-node hot update sends no shared restart consent', async () => {
+test('list save sends both native lists and their original revision', async () => {
  const h = harness(); await h.init(); await policyTab(h);
- h.policyData.enabled = true; h.policyData.active_config = structuredClone(h.policyData.config);
- await h.app.refreshPolicy(true);
- h.handlers.psportal_preview = () => Promise.resolve({ ok: true, token: 'b'.repeat(64), can_apply: true,
-  restart_required: false, blockers: [], rules: [], validation: { protection_rules: 1 } });
- await h.app.policyAction('preview');
- assert.equal(h.app.policyConfirmation.hidden, true);
- assert.equal(h.app.policyButtons.apply.disabled, false);
- assert.equal(h.app.policyButtons.apply.textContent, '热更新配置');
- await h.app.policyAction('apply'); await settle();
- assert.equal(h.calls.find(call => call.method === 'psportal_apply').args.at(-1), 0);
-});
-
-test('proxy drafts use shared device identities while device edits stay in their own form', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- h.app.fields.portal_ip.value = '10.0.0.111'; h.app.fields.portal_ip.handlers.input();
- h.app.policyInputs.domains.value = 'new.sony.example'; h.app.policyInputs.domains.handlers.input();
- h.calls.length = 0;
+ h.app.policyInputs.domains.value += 'new.example.com\n'; h.app.policyInputs.domains.handlers.input();
  await h.app.policyAction('save'); await settle();
  const call = h.calls.find(call => call.method === 'psportal_save');
- assert.equal(call.args[0], h.details.device_selectors.portal);
- assert.equal(call.args[3], 'new.sony.example');
- assert.equal(h.calls.some(call => ['device_save', 'configure', 'psportal_apply'].includes(call.method)), false);
- assert.equal(h.app.fields.portal_ip.value, '10.0.0.111');
+ assert.deepEqual(call.args, ['auth.api.playstation.com\nnew.example.com\n', 'dwc.dl.playstation.net\n', 'a'.repeat(64)]);
+ assert.equal(h.app.policyRevision, 'b'.repeat(64));
+ assert.deepEqual(h.app.policyTouched, {});
+ assert.equal(h.calls.some(call => call.method === 'psportal_apply'), false);
 });
 
-test('read-only users can preview a saved policy and retain RPC write boundaries', async () => {
- const h = harness({ permission: false }); await h.init(); await policyTab(h);
- assert.equal(h.app.policyInputs.domains.disabled, true);
- assert.equal(h.app.policyButtons.save.disabled, true);
- assert.equal(h.app.policyButtons.preview.disabled, false);
- await h.app.policyAction('preview');
- assert.equal(h.app.policyButtons.apply.disabled, true);
- assert.equal(h.app.policyConfirm.disabled, true);
- h.calls.length = 0;
- await h.app.policyAction('save'); await h.app.policyAction('apply'); await h.app.policyAction('disable');
- assert.equal(h.calls.length, 0);
-});
-
-test('policy writers wait for existing management jobs and pending form submissions', async () => {
+test('save and apply submits a list transaction and reports its own completion', async () => {
  const h = harness(); await h.init(); await policyTab(h);
- h.status.job.busy = true;
- await h.app.refresh();
- assert.equal(h.app.policyButtons.save.disabled, true);
- h.calls.length = 0;
- await h.app.policyAction('save');
- assert.equal(h.calls.length, 0);
- h.status.job.busy = false;
- await h.app.refresh();
- h.app.pending = true; h.app.updatePolicyControls();
- assert.equal(h.app.policyButtons.save.disabled, true);
-});
-
-test('environment failure discards a usable preview and keeps detection retryable', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- await h.app.policyAction('preview');
- h.app.policyConfirm.checked = true;
- h.handlers.psportal_status = () => Promise.reject(new Error('router unavailable'));
- await h.app.refreshPolicy(true);
- assert.equal(h.app.policyPlan, null);
- assert.equal(h.app.policyButtons.apply.disabled, true);
- assert.match(h.app.policyBlockers.textContent, /router unavailable/);
- assert.equal(h.app.policyButtons.preview.disabled, false);
- delete h.handlers.psportal_status;
- await h.app.refreshPolicy(true);
- assert.equal(h.app.policyEnvironmentError, false);
-});
-
-test('policy state blockers invalidate a previously approved preview', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- await h.app.policyAction('preview');
- h.policyData.blockers = ['PassWall 节点已变化'];
- await h.app.refreshPolicy(true);
- assert.equal(h.app.policyPlan, null);
- assert.equal(h.app.policyButtons.apply.disabled, true);
-});
-
-test('backend rejects expired previews with a fresh-preview path', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- await h.app.policyAction('preview');
- h.app.policyConfirm.checked = true;
- h.handlers.psportal_apply = () => Promise.resolve({ ok: false, error: '状态已变化，请重新生成预览' });
  await h.app.policyAction('apply'); await settle();
- assert.match(h.app.policyNotice.textContent, /重新生成预览/);
- assert.equal(h.app.policyPlan, null);
- assert.equal(h.app.policyPending, false);
-});
-
-test('completed policy jobs report their own result in the policy tab', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- h.app.addDomainToPolicy('api.sony.example', 'domains');
- await h.app.policyAction('preview');
- h.app.policyConfirm.checked = true;
- h.policyData.config.domains = h.app.policyInputs.domains.value;
- h.policyData.enabled = true; h.policyData.environment.attached_cores = 1;
- h.status.job = { id: 'policy-job', action: 'psportal_apply', state: 'complete', busy: false };
+ assert.equal(h.calls.filter(call => call.method === 'psportal_apply').length, 1);
+ assert.equal(h.calls.some(call => call.method === 'psportal_preview'), false);
+ assert.equal(h.calls.find(call => call.method === 'psportal_apply').args.length, 3);
+ h.status.job = {id:'applied',action:'psportal_apply',state:'complete',busy:false,reloaded:false,pending_apply:true};
  await h.app.refresh(); await settle();
- assert.match(h.app.policyNotice.textContent, /透明代理已启用/);
- assert.equal(h.app.policyConfigNotice.textContent, h.app.policyNotice.textContent);
- assert.equal(h.app.domainActionNotice.hidden, true);
- assert.equal(h.app.policyConfirmation.hidden, true);
- assert.equal(h.app.policyConfirm.checked, false);
- assert.match(h.app.policyState.textContent, /载入/);
- assert.equal(h.app.policyButtons.disable.disabled, false);
+ assert.match(h.app.policyNotice.textContent, /下次启动/);
 });
 
-test('a completed apply shows the canonical MAC that follows the selected IP', async () => {
+test('external list edits preserve the draft and require a deliberate reread', async () => {
  const h = harness(); await h.init(); await policyTab(h);
- h.app.policyInputs.portal.value = '10.0.0.101';
- h.policyData.config.portal = '02:00:00:00:00:01';
- h.status.job = { id: 'canonical-job', action: 'psportal_apply', state: 'complete', busy: false };
- await h.app.refresh(); await settle();
- assert.equal(h.app.policyInputs.portal.value, '02:00:00:00:00:01');
-});
-
-test('a proxy task finishing on the device page refreshes its main status and device editing state', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- h.policyData.enabled = true; h.policyData.environment.attached_cores = 1;
+ h.app.policyInputs.domains.value = 'edited.example.com\n'; h.app.policyInputs.domains.handlers.input();
+ h.policyData.config.domains = 'external.example.com\n'; h.policyData.revision = 'c'.repeat(64);
  await h.app.refreshPolicy(true);
- h.deviceData.proxy_enabled = true;
- h.app.selectTab('devices'); await h.app.refreshDevices(true); await settle();
- assert.equal(h.app.buttons.device_save.disabled, true);
- h.policyData.enabled = false; h.policyData.environment.attached_cores = 0;
- h.status.job = {id:'disabled-away',action:'psportal_disable',state:'complete',busy:false};
- h.calls.length = 0;
- await h.app.refresh(); await settle();
- assert.equal(h.app.activeTab, 'devices');
- assert.equal(h.calls.some(call => call.method === 'psportal_status'), true);
- assert.equal(h.app.proxyNavNode.textContent, '已停用');
- assert.equal(h.app.fields.portal_ip.disabled, false);
+ assert.equal(h.app.policyInputs.domains.value, 'edited.example.com\n');
+ assert.equal(h.app.policyRevision, 'a'.repeat(64));
+ assert.equal(h.app.policyButtons.save.disabled, true);
+ assert.match(h.app.policyConfigNotice.textContent, /外部修改/);
+ await h.app.reloadPolicyLists();
+ assert.equal(h.app.policyInputs.domains.value, 'external.example.com\n');
+ assert.equal(h.app.policyRevision, 'c'.repeat(64));
+ assert.equal(h.app.policyButtons.save.disabled, false);
+});
+
+test('native list saving works before device and bitrate enrollment', async () => {
+ const h = harness(); h.details.configured = h.details.devices_configured = false;
+ h.details.device_selectors = {}; h.details.config.portal_ip = h.details.config.ps5_ip = '';
+ await h.init(); await policyTab(h);
+ assert.equal(h.app.policyButtons.save.disabled, false);
+ h.app.selectTab('devices'); await h.app.refreshDevices(true);
  assert.equal(h.app.buttons.device_save.disabled, false);
+});
+
+test('read-only users can reread lists and keep their write boundary', async () => {
+ const h = harness({permission:false}); await h.init(); await policyTab(h);
+ assert.equal(h.app.policyButtons.save.disabled, true);
+ assert.equal(h.app.policyButtons.apply.disabled, true);
+ assert.equal(h.app.policyButtons.reload.disabled, false);
+ await h.app.policyAction('apply'); await h.app.reloadPolicyLists();
+ assert.equal(h.calls.some(call => call.method === 'psportal_apply'), false);
+});
+
+test('native list writers wait for management jobs and recover from a failed read', async () => {
+ const h = harness(); await h.init(); await policyTab(h);
+ h.status.job = {id:'trial',action:'trial',busy:true,state:'running'}; await h.app.refresh();
+ assert.equal(h.app.policyButtons.apply.disabled, true);
+ await h.app.policyAction('apply');
+ assert.equal(h.calls.some(call => call.method === 'psportal_apply'), false);
+ h.status.job.busy = false; await h.app.refresh();
+ h.handlers.psportal_status = () => Promise.reject(new Error('read failed'));
+ await h.app.refreshPolicy(true);
+ assert.equal(h.app.policyButtons.save.disabled, true);
+ assert.equal(h.app.policyButtons.reload.disabled, false);
+ delete h.handlers.psportal_status; await h.app.reloadPolicyLists();
+ assert.equal(h.app.policyButtons.save.disabled, false);
+});
+
+test('moving native domains preserves comments and geosite entries in both lists', async () => {
+ const h = harness(); await h.init(); await policyTab(h);
+ h.app.policyInputs.domains.value = '# keep proxy\ngeosite:google\nother.example.com\n';
+ h.app.policyInputs.exclusions.value = '# keep direct\ngeosite:cn\napi.example.com\n';
+ h.app.addDomainToPolicy('api.example.com', 'domains');
+ assert.equal(h.app.policyInputs.domains.value, '# keep proxy\ngeosite:google\nother.example.com\napi.example.com\n');
+ assert.equal(h.app.policyInputs.exclusions.value, '# keep direct\ngeosite:cn\n');
+ h.app.removeDomainFromPolicy('api.example.com');
+ assert.equal(h.app.policyInputs.domains.value, '# keep proxy\ngeosite:google\nother.example.com\n');
+ assert.equal(h.app.policyInputs.exclusions.value, '# keep direct\ngeosite:cn\napi.example.com\n');
+});
+
+test('native parent domains use suffix matching while a direct parent remains visible', async () => {
+ const h = harness(); await h.init(); await policyTab(h);
+ h.app.policyInputs.domains.value = 'example.com\n';
+ assert.match(nodeText(h.app.domainRuleActions('api.example.com')), /已加入代理/);
+ assert.match(nodeText(h.app.domainRuleActions('example.com.attacker.net')), /PassWall 默认策略/);
+ h.app.policyInputs.exclusions.value = 'example.com\n';
+ const original = h.app.policyInputs.domains.value;
+ h.app.addDomainToPolicy('api.example.com','domains');
+ assert.equal(h.app.policyInputs.domains.value, original);
+ assert.match(h.app.domainActionText.textContent, /直连父域/);
+ assert.match(nodeText(h.app.domainRuleActions('api.example.com')), /直连名单/);
 });
 
 test('hidden log panels generate only dynamic status polls', async () => {
@@ -526,7 +463,7 @@ test('read-only users see quality states while existing profile controls retain 
  assert.equal(h.app.qualityNode.textContent, '等待启动');
 });
 
-test('domain views load on demand and compact polling reuses the ten-second sample', async () => {
+test('domain views load on demand and polling reuses the current sample', async () => {
  const h = harness(); await h.init(); h.calls.length = 0;
  await h.app.refresh(); await settle();
  assert.deepEqual(h.calls.map(call => call.method), ['status']);
@@ -534,7 +471,8 @@ test('domain views load on demand and compact polling reuses the ten-second samp
  await h.app.refreshDomains(); await settle();
  assert.match(elementText(h.app.domainList), /api\.sony\.example/);
  assert.match(elementText(h.app.domainList), /本轮新增/);
- assert.equal(h.app.proxyLogNode.hidden, true);
+ assert.equal(h.app.mainPanels.monitor.hidden, false);
+ assert.equal(h.app.mainPanels.proxy.hidden, true);
  h.calls.length = 0;
  await h.app.refresh(); await settle();
  assert.deepEqual(h.calls.map(call => call.method), ['status']);
@@ -545,7 +483,7 @@ test('domain views load on demand and compact polling reuses the ten-second samp
 
 test('a blocked domain response leaves dynamic status and recovery controls available', async () => {
  const h = harness({ manualTimers: true }); await h.init();
- h.handlers.domains = () => new Promise(() => {});
+ h.handlers.domain_monitor = () => new Promise(() => {});
  h.app.selectStage('proxy', 'logs'); h.app.selectLogTab('domains');
  const request = h.app.refreshDomains(); await settle();
  h.status.modified = 91; await h.app.refresh();
@@ -626,7 +564,7 @@ test('marking a device failure during a trial selects its DNS evidence immediate
 test('an older domain request cannot replace the newer failure selection', async () => {
  const h = harness(); await h.init();
  let finish;
- h.handlers.domains = selected => selected ? Promise.resolve({ ...h.domainData, selected: {
+ h.handlers.domain_monitor = (_batch, selected) => selected ? Promise.resolve({ ...h.domainData, selected: {
   id: selected, note: '新失败', time: '2026-11-23T10:01:00Z', evidence: { candidates: [], events: [] }
  } }) : new Promise(resolve => { finish = resolve; });
  h.app.selectStage('proxy', 'logs'); h.app.selectLogTab('domains'); const old = h.app.refreshDomains(); await settle();
@@ -654,15 +592,132 @@ test('read-only sessions keep log policy and failure marking disabled', async ()
  assert.equal(h.app.logMode.disabled, true);
 });
 
+test('batch rule copies cover every domain and retain recovered DNS failures across filters', async () => {
+ const h = harness(); await h.init();
+ const rows = Array.from({length:130}, (_, index) => ({device:'portal', domain:'host'+String(index).padStart(3,'0')+'.example',
+  counts:{dns_ok:1}, addresses:[], last_problem:''}));
+ rows[129].counts.dns_error = 2;
+ rows.push({...rows[129],device:'ps5'});
+ rows.push({device:'portal',domain:'tcp-only.example',counts:{dns_ok:1,tcp_reset:1},addresses:[]});
+ h.domainData.domains = h.domainData.batch.domains = rows;
+ h.app.selectTab('monitor'); await h.app.refreshDomains(); await settle();
+ h.app.domainSearch.value = 'host000'; h.app.renderDomains(h.domainData);
+ await h.app.copyAllDomains.click();
+ assert.equal(h.clipboardWrites[0].trim().split('\n').length, 131);
+ assert.match(h.clipboardWrites[0], /host129\.example\n/);
+ assert.equal(h.clipboardWrites[0].includes('full:'), false);
+ h.app.domainFailedButton.click();
+ await h.app.copyFailedDomains.click();
+ assert.equal(h.clipboardWrites[1], 'host129.example\n');
+ assert.match(h.app.domainCopyNotice.textContent, /共 1 行/);
+ assert.equal(h.app.domainOnlyProblems.checked, true);
+});
+
+test('read-only domain copies use the HTTP clipboard fallback and clean up the temporary control', async () => {
+ const h = harness({permission:false}); await h.init();
+ h.app.selectTab('monitor'); await h.app.refreshDomains(); await settle();
+ h.window.navigator.clipboard.writeText = () => Promise.reject(new Error('HTTP'));
+ h.document.execCommand = command => {
+  assert.equal(command, 'copy');
+  const input = h.document.body.children.at(-1);
+  assert.equal(input.selected, true);
+  h.clipboardWrites.push(input.value); return true;
+ };
+ await h.app.copyAllDomains.click();
+ assert.equal(h.clipboardWrites[0], 'api.sony.example\n');
+ assert.equal(h.document.body.children.length, 0);
+ assert.equal(h.app.batchStartButton.disabled, true);
+ assert.equal(h.app.domainActionButtons.every(button => button.disabled), true);
+});
+
+test('removing a covered native domain keeps the parent rule and adds a direct exception', async () => {
+ const h = harness(); await h.init(); await policyTab(h);
+ const host = 'region.auth.np.ac.playstation.net';
+ h.app.policyInputs.domains.value = 'auth.np.ac.playstation.net\n'+host+'\n';
+ h.app.domainRuleActions(host).children[1].children[1].click();
+ assert.equal(h.app.policyInputs.domains.value, 'auth.np.ac.playstation.net\n');
+ assert.match(h.app.policyInputs.exclusions.value, /region\.auth\.np\.ac\.playstation\.net/);
+ assert.match(h.app.domainActionText.textContent, /加入直连名单草稿/);
+ h.app.domainRuleActions(host).children[1].children[0].click();
+ assert.doesNotMatch(h.app.policyInputs.exclusions.value, /region\.auth/);
+ assert.match(h.app.policyInputs.domains.value, /region\.auth/);
+});
+
+test('a changed batch selection blocks stale copies and ignores an older response', async () => {
+ const h = harness(); await h.init();
+ let finish;
+ const id = 'c'.repeat(32), row = {device:'ps5',domain:'new-batch.example',counts:{dns_ok:1},addresses:[]};
+ h.handlers.domain_monitor = batch => batch === id ? Promise.resolve({...h.domainData, domains:[row],
+  batch:{id,time:'2026-11-23T11:00:00Z',state:'archived',domains:[row],events:[]}}) : new Promise(resolve => {finish=resolve;});
+ h.app.selectTab('monitor'); await settle();
+ const older = h.app.domainRequest;
+ h.app.selectBatch(id);
+ assert.equal(h.app.copyAllDomains.disabled, true);
+ await h.app.copyDomainRules(false);
+ assert.equal(h.clipboardWrites.length, 0);
+ finish(h.domainData); await older; await settle();
+ assert.equal(h.app.domainData.batch.id, id);
+ await h.app.copyAllDomains.click();
+ assert.equal(h.clipboardWrites[0], 'new-batch.example\n');
+});
+
+test('manual connection batches start independently during a management job', async () => {
+ const h = harness(); await h.init(); h.app.selectTab('monitor'); await h.app.refreshDomains(); await settle();
+ h.status.job = {id:'trial',action:'trial',busy:true,state:'running'}; await h.app.refresh();
+ const id = 'e'.repeat(32);
+ h.handlers.domain_batch_start = () => Promise.resolve({ok:true,id,time:'2026-11-23T11:00:00Z'});
+ h.handlers.domain_monitor = () => Promise.resolve({...h.domainData, domains:[],
+  batch:{id,time:'2026-11-23T11:00:00Z',state:'collecting',domains:[],events:[]}});
+ h.calls.length = 0;
+ await h.app.batchStartButton.click();
+ assert.equal(h.app.batchId, id);
+ assert.equal(h.app.latest.job.busy, true);
+ assert.equal(h.app.copyAllDomains.disabled, true);
+ assert.deepEqual(h.calls.map(call => call.method), ['domain_batch_start','domain_monitor']);
+});
+
+test('batch traffic sorts by proxy bytes and keeps historical proxy flows visible after removal', async () => {
+ const h = harness(); await h.init();
+ const mib = 1024*1024;
+ function row(domain, down, proxyDown, hasProxy) {
+  return {device:'portal',domain,counts:{dns_ok:1},addresses:[],traffic:{sampled:true,fresh:false,
+   upload_bytes:1024,download_bytes:down,proxy_upload_bytes:hasProxy?1024:0,proxy_download_bytes:proxyDown,
+   has_proxy:hasProxy,proxy_rules_seen:hasProxy,proxy_rate:10*mib,proxy_active_connections:0}};
+ }
+ const rows = [row('direct.example',500*mib,0,false), row('small.example',2*mib,2*mib,true),
+  row('large.example',256*mib,256*mib,true)];
+ h.domainData.domains = h.domainData.batch.domains = rows;
+ h.domainData.batch.traffic = {sampled:true,fresh:false,upload_bytes:3072,download_bytes:886*mib,
+  proxy_upload_bytes:2048,proxy_download_bytes:386*mib};
+ h.domainData.batch.unattributed_traffic = {proxy_download_bytes:128*mib};
+ h.app.selectTab('monitor'); await h.app.refreshDomains(); await settle();
+ let tableRows = h.app.domainList.children[0].children[1].children;
+ assert.match(elementText(tableRows[0]), /large\.example/);
+ assert.match(elementText(tableRows[0].children[3]), /256\.0 MiB|代理大流量/);
+ assert.match(elementText(tableRows[1].children[3]), /本批次曾走代理/);
+ assert.doesNotMatch(elementText(tableRows[1].children[3]), /\/s/);
+ assert.match(h.app.domainTrafficUnassigned.textContent, /128\.0 MiB/);
+ assert.equal(h.app.domainTrafficUnassigned.dataset.error, 'true');
+ h.app.domainOnlyProxy.checked = true; h.app.renderDomains(h.domainData);
+ assert.equal(h.app.domainList.children[0].children[1].children.length, 2);
+ h.app.domainOnlyLargeProxy.checked = true; h.app.renderDomains(h.domainData);
+ tableRows = h.app.domainList.children[0].children[1].children;
+ assert.equal(tableRows.length, 1); assert.match(elementText(tableRows[0]), /large\.example/);
+ h.app.domainOnlyProxy.checked = h.app.domainOnlyLargeProxy.checked = false;
+ h.app.domainTrafficSort.choicePicker.setValue('total'); h.app.renderDomains(h.domainData);
+ assert.match(elementText(h.app.domainList.children[0].children[1].children[0]), /direct\.example/);
+});
+
 test('the main features show runtime, configuration and open bounded logs in order', async () => {
  const h = harness(); await h.init();
- assert.deepEqual(Object.keys(h.app.mainTabs), ['devices', 'bitrate', 'proxy']);
+ assert.deepEqual(Object.keys(h.app.mainTabs), ['devices', 'bitrate', 'proxy', 'monitor']);
  assert.deepEqual(Object.keys(h.app.stageTabs.bitrate), []);
  assert.deepEqual(Object.keys(h.app.stageTabs.proxy), []);
  assert.equal(h.app.logTabs.domains, undefined);
- assert.equal(h.app.proxyLogTabs.domains.tag, 'a');
- assert.equal(h.app.proxyLogTabs.domains.parentNode.tag, 'li');
- assert.equal(h.app.proxyLogTabs.domains.parentNode.attributes['class'], 'cbi-tab');
+ assert.equal(h.app.proxyLogTabs.domains, undefined);
+ assert.deepEqual(Object.keys(h.app.proxyLogTabs), ['proxy']);
+ assert.match(elementText(h.app.mainPanels.monitor), /连接批次|复制全部域名规则|复制失败域名规则/);
+ assert.doesNotMatch(elementText(h.app.mainPanels.proxy), /域名采集设置|连接失败回溯/);
  assert.doesNotMatch(elementText(h.app.mainPanels.devices), /中继独立地址/);
  assert.doesNotMatch(elementText(h.app.mainPanels.devices), /局域网设备|主路由/);
  assert.match(elementText(h.app.stagePanels.bitrate.config), /中继独立地址/);
@@ -675,7 +730,7 @@ test('the main features show runtime, configuration and open bounded logs in ord
  }
  assert.equal(h.app.deviceLogDetails.open, true);
  assert.equal(h.app.fields.bridge.choicePicker.root.parentNode.parentNode.parentNode.tag, 'div');
- assert.equal(h.app.policyRules.open, true);
+ assert.deepEqual(Object.keys(h.app.policyInputs), ['domains', 'exclusions']);
  assert.equal(h.app.buttons.baseline, undefined);
  assert.equal(h.app.buttons.trial, undefined);
  h.details.baseline_valid = false; await h.app.refreshDetails();
@@ -688,7 +743,7 @@ test('the main features show runtime, configuration and open bounded logs in ord
  assert.equal(h.app.stagePanels.proxy.logs.open, true);
 });
 
-test('first-time setup starts at shared devices while proxy logs work before bitrate enrollment', async () => {
+test('first-time setup starts at shared devices while domain monitoring works before bitrate enrollment', async () => {
  const h = harness();
  h.details.configured = false; h.details.devices_configured = false;
  h.details.device_selectors = {}; h.details.config.portal_ip = ''; h.details.config.ps5_ip = ''; h.details.config.address = '';
@@ -699,7 +754,7 @@ test('first-time setup starts at shared devices while proxy logs work before bit
  h.details.config.portal_ip = '10.0.0.101'; h.details.config.ps5_ip = '10.0.0.100';
  h.details.device_selectors = {portal:'02:00:00:00:00:01', ps5:'02:00:00:00:00:02'};
  await h.app.refreshDetails();
- h.app.selectStage('proxy', 'logs'); await h.app.refreshDomains(); await settle();
+ h.app.selectTab('monitor'); await h.app.refreshDomains(); await settle();
  assert.match(elementText(h.app.domainList), /api\.sony\.example/);
  assert.equal(h.app.buttons.start.disabled, true);
  assert.equal(h.app.policyButtons.save.disabled, false);
@@ -766,56 +821,6 @@ test('device choices open with one click and polling preserves the open list', a
  assert.equal(picker.menu.hidden, true);
 });
 
-test('node choices show local availability and preserve a search across polling', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- h.policyData.nodes.push({id:'nodeB', label:'节点 B', protocol:'vless', available:false, reason:'此节点配置了链式代理'});
- await h.app.refreshPolicy(true);
- const picker = h.app.policyNodePicker;
- picker.trigger.click(); picker.search.value = '节点 B'; picker.search.handlers.input();
- assert.equal(picker.list.children[0].disabled, true);
- assert.match(elementText(picker.list), /链式代理/);
- await h.app.refreshPolicy(true);
- assert.equal(picker.menu.hidden, false); assert.equal(picker.search.value, '节点 B');
- picker.close();
- h.policyData.node_error = 'PassWall 节点读取失败'; h.policyData.nodes = [];
- await h.app.refreshPolicy(true);
- assert.match(h.app.policyNodeState.textContent, /节点读取失败/);
-});
-
-test('the proxy boot switch saves separately and read-only users keep its boundary', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- h.handlers.psportal_autostart = value => {
-  h.policyData.autostart = !!value;
-  return Promise.resolve({ok:true, autostart:!!value, enabled:false});
- };
- h.calls.length = 0; h.app.policyAutostart.checked = false;
- await h.app.policyAutostart.handlers.change(); await settle();
- assert.deepEqual(h.calls.find(call => call.method === 'psportal_autostart').args, [0]);
- assert.equal(h.app.policyAutostart.checked, false);
- assert.equal(h.calls.some(call => ['psportal_apply','psportal_disable','psportal_save'].includes(call.method)), false);
- const readonly = harness({permission:false}); await readonly.init(); await policyTab(readonly);
- assert.equal(readonly.app.policyAutostart.disabled, true);
- await readonly.app.policyAutostart.handlers.change();
- assert.equal(readonly.calls.some(call => call.method === 'psportal_autostart'), false);
-});
-
-test('the simple enable button checks and applies while keeping restart confirmation visible', async () => {
- const h = harness(); await h.init(); await policyTab(h); h.calls.length = 0;
- await h.app.policyButtons.enable.click(); await settle();
- assert.equal(h.calls.filter(call => call.method === 'psportal_preview').length, 1);
- assert.equal(h.calls.some(call => call.method === 'psportal_apply'), false);
- assert.equal(h.app.policyConfirmation.hidden, false);
- h.app.policyConfirm.checked = true; h.app.policyConfirm.handlers.change();
- await h.app.policyButtons.enable.click(); await settle();
- assert.equal(h.calls.filter(call => call.method === 'psportal_apply').length, 1);
- assert.equal(h.app.policyConfirmation.hidden, true);
- const hot = harness(); await hot.init(); await policyTab(hot);
- hot.handlers.psportal_preview = () => Promise.resolve({ok:true, token:'a'.repeat(64), can_apply:true,
-  restart_required:false, rules:[], blockers:[]});
- await hot.app.policyButtons.enable.click(); await settle();
- assert.equal(hot.calls.filter(call => call.method === 'psportal_apply').length, 1);
-});
-
 test('device save errors remain visible in the device page after polling', async () => {
  const h = harness(); await h.init();
  h.handlers.device_save = () => Promise.resolve({ok:false, error:'设备地址与 MAC 待确认'});
@@ -838,35 +843,15 @@ test('bitrate enrollment uses saved device addresses and preserves an unfinished
  assert.equal(h.app.activeStages.bitrate, 'runtime');
 });
 
-test('a shared identity update invalidates proxy previews and clears restart consent', async () => {
- const h = harness(); await h.init(); await policyTab(h); await h.app.policyAction('preview');
- h.app.policyConfirm.checked = true;
- h.details.device_selectors.portal = '02:00:00:00:00:11';
- h.details.config.portal_ip = '10.0.0.111';
- await h.app.refreshDetails();
- assert.equal(h.app.policyPlan, null);
- assert.equal(h.app.policyConfirm.checked, false);
- assert.equal(h.app.policyInputs.portal.value, '02:00:00:00:00:11');
- assert.match(elementText(h.app.mainPanels.bitrate), /10\.0\.0\.111/);
- assert.match(elementText(h.app.mainPanels.proxy), /10\.0\.0\.111/);
-});
-
-test('domain evidence enters the proxy draft before explicit preview and application', async () => {
- const h = harness(); await h.init(); await policyTab(h); await h.app.policyAction('preview');
- h.app.policyConfirm.checked = true;
- h.calls.length = 0;
+test('domain evidence edits a native draft and the apply action submits it directly', async () => {
+ const h = harness(); await h.init(); await policyTab(h); h.calls.length = 0;
  h.app.addDomainToPolicy('api.sony.example', 'domains');
  assert.equal(h.calls.length, 0);
  assert.match(h.app.policyInputs.domains.value, /api\.sony\.example/);
- assert.equal(h.app.policyPlan, null);
- assert.equal(h.app.policyConfirm.checked, false);
  assert.equal(h.app.domainActionNotice.hidden, false);
- assert.match(h.app.domainActionText.textContent, /检查配置并生成预览/);
- assert.match(h.app.policyConfigNotice.textContent, /代理草稿已调整/);
- await h.app.policyAction('preview');
- h.app.policyConfirm.checked = true;
+ assert.match(h.app.domainActionText.textContent, /保存并应用/);
  await h.app.policyAction('apply'); await settle();
- assert.match(h.calls.find(call => call.method === 'psportal_apply').args[3], /api\.sony\.example/);
+ assert.match(h.calls.find(call => call.method === 'psportal_apply').args[0], /api\.sony\.example/);
 });
 
 test('moving a domain between proxy and exclusion lists keeps one draft interpretation', async () => {
@@ -881,12 +866,22 @@ test('moving a domain between proxy and exclusion lists keeps one draft interpre
  assert.match(h.app.policyInputs.exclusions.value, /dwc\.dl\.playstation\.net/);
 });
 
+test('removing the firmware host restores its direct download exclusion', async () => {
+ const h = harness(); await h.init(); await policyTab(h);
+ const host = 'dwc.dl.playstation.net';
+ h.app.addDomainToPolicy(host, 'domains');
+ assert.doesNotMatch(h.app.policyInputs.exclusions.value, /dwc\.dl/);
+ h.app.removeDomainFromPolicy(host);
+ assert.doesNotMatch(h.app.policyInputs.domains.value, /dwc\.dl/);
+ assert.equal(h.app.policyInputs.exclusions.value.split('\n').filter(rule => rule === host).length, 1);
+});
+
 test('domain additions retain list limits, read-only permissions and active job boundaries', async () => {
  const h = harness(); await h.init(); await policyTab(h);
- h.app.policyInputs.domains.value = Array.from({length:32}, (_, i) => 'host'+i+'.example').join('\n');
+ h.app.policyInputs.domains.value = Array.from({length:4096}, (_, i) => 'host'+i+'.example').join('\n');
  h.app.addDomainToPolicy('new.example', 'domains');
- assert.match(h.app.domainActionText.textContent, /最多 32/);
- assert.equal(h.app.policyInputs.domains.value.split('\n').length, 32);
+ assert.match(h.app.domainActionText.textContent, /最多 4096/);
+ assert.equal(h.app.policyInputs.domains.value.split('\n').length, 4096);
  const saved = h.app.policyInputs.domains.value;
  h.status.job = {id:'proxy',action:'psportal_apply',busy:true,state:'running'}; await h.app.refresh();
  h.app.addDomainToPolicy('new.example', 'exclusions');
@@ -926,7 +921,7 @@ test('device replacement waits for the shared services to stop while inventory r
  assert.equal(h.app.buttons.device_save.disabled, true);
  assert.equal(h.app.fields.portal_ip.disabled, true);
  assert.equal(h.app.deviceRefreshButton.disabled, false);
- assert.match(h.app.deviceNotice.textContent, /停用后/);
+ assert.match(h.app.deviceNotice.textContent, /旧版透明代理规则待迁移/);
  h.deviceData.proxy_enabled = false; await h.app.refreshDevices(true);
  assert.equal(h.app.buttons.device_save.disabled, false);
 });
@@ -942,7 +937,7 @@ test('proxy cancellation uses the shared cancellation API and displays its own r
   return Promise.resolve({ok:true,stopping:true});
  };
  await h.app.policyAction('cancel'); await settle();
- assert.match(h.app.policyNotice.textContent, /任务已取消/);
+ assert.match(h.app.policyNotice.textContent, /名单应用已取消/);
  assert.equal(h.calls.filter(call => call.method === 'stop').length, 1);
 });
 
@@ -950,7 +945,7 @@ test('main navigation preserves keyboard focus and logs expand in place', async 
  const h = harness(); await h.init();
  let prevented = 0;
  h.app.mainTabs.devices.handlers.keydown({key:'End',preventDefault(){prevented++;}});
- assert.equal(h.app.activeTab, 'proxy'); assert.equal(h.app.mainTabs.proxy.focused, true);
+ assert.equal(h.app.activeTab, 'monitor'); assert.equal(h.app.mainTabs.monitor.focused, true);
  h.app.selectStage('proxy', 'logs', true);
  assert.equal(h.app.activeStages.proxy, 'logs');
  assert.equal(h.app.mainTabs.proxy.focused, true);
@@ -970,110 +965,5 @@ test('restored feature results retain each failure after a task in another featu
  await h.app.refresh(); await settle();
  assert.match(h.app.messageNode.textContent, /relay address unavailable/);
  assert.match(h.app.deviceNotice.textContent, /device address unavailable/);
- assert.match(h.app.policyNotice.textContent, /透明代理已启用/);
-});
-
-test('a proxy preview shows resolved device addresses alongside the host and port scope', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- h.handlers.psportal_preview = () => Promise.resolve({ok:true,can_apply:true,token:'a'.repeat(64),
-  restart_required:false,rules:[],sources:{portal:['10.0.0.111'],ps5:['10.0.0.100']}});
- await h.app.policyAction('preview');
- assert.match(h.app.policyPreviewSources.textContent, /10\.0\.0\.111/);
- assert.match(h.app.policyPreviewSources.textContent, /10\.0\.0\.100/);
-});
-
-test('built-in dynamic coverage skips candidate additions while connectivity completes the draft', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- h.app.selectStage('proxy', 'config');
- h.domainData.candidates = [
-  {domain:'region.np.communication.playstation.net',suggestion:'proxy'},
-  {domain:'www.google.com',suggestion:'proxy'},
-  {domain:'excluded.auth.np.ac.playstation.net',suggestion:'proxy'},
-  {domain:'example.com',suggestion:'review'} ];
- h.app.policyInputs.exclusions.value = 'excluded.auth.np.ac.playstation.net';
- h.app.policyPlan = {token:'old',can_apply:true}; h.app.policyConfirm.checked = true;
- await h.app.addSuggestedDomains();
- assert.doesNotMatch(h.app.policyInputs.domains.value, /region\.np\.communication\.playstation\.net/);
- assert.match(h.app.policyInputs.domains.value, /www\.google\.com/);
- assert.doesNotMatch(h.app.policyInputs.domains.value, /excluded|example\.com/);
- assert.equal(h.app.policyPlan, null);
- assert.equal(h.app.policyConfirm.checked, false);
- assert.equal(h.policyData.active_config?.domains, undefined);
- assert.equal(h.calls.filter(call => call.method === 'psportal_apply').length, 0);
-});
-
-test('candidate capacity and read-only boundaries leave the draft unchanged', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- h.domainData.candidates = Array.from({length:33}, (_, i) => ({domain:'d'+i+'.example.com',suggestion:'proxy'}));
- const before = h.app.policyInputs.domains.value;
- await h.app.addSuggestedDomains();
- assert.equal(h.app.policyInputs.domains.value, before);
- assert.match(h.app.policyCandidateSummary.textContent, /超过 32/);
- const readonly = harness({permission:false}); await readonly.init(); await policyTab(readonly);
- assert.equal(readonly.app.policyButtons.candidates.disabled, true);
- assert.equal(readonly.app.policyButtons.probe.disabled, true);
- const count = readonly.calls.length; await readonly.app.addSuggestedDomains();
- assert.equal(readonly.calls.length, count);
-});
-
-test('unseen dynamic hosts and wildcard exclusions render the same draft interpretation', async () => {
- const h = harness(); await h.init(); await policyTab(h);
- assert.match(h.app.policyDynamicRules.textContent, /\*\.auth\.np\.ac\.playstation\.net/);
- const host = 'unseen.auth.np.ac.playstation.net';
- let actions = h.app.domainRuleActions(host);
- assert.match(elementText(actions), /动态匹配/);
- assert.equal(actions.children[1].children[0].disabled, true);
- h.app.policyInputs.exclusions.value = '*.auth.np.ac.playstation.net';
- actions = h.app.domainRuleActions(host);
- assert.match(elementText(actions), /排除清单/);
- assert.equal(actions.children[1].children[1].disabled, true);
- const original = h.app.policyInputs.domains.value;
- h.app.addDomainToPolicy(host, 'domains');
- assert.equal(h.app.policyInputs.domains.value, original);
- assert.match(h.app.domainActionText.textContent, /泛匹配排除规则/);
- h.domainData.candidates = [{domain:host,suggestion:'proxy'}, {domain:'www.google.com',suggestion:'proxy'}];
- h.app.policyInputs.domains.value = '*.google.com';
- await h.app.addSuggestedDomains();
- assert.equal(h.app.policyInputs.domains.value, '*.google.com');
- assert.match(h.app.policyCandidateSummary.textContent, /均已覆盖/);
- h.handlers.psportal_preview = () => Promise.resolve({ok:true,can_apply:true,token:'a'.repeat(64),restart_required:false,
-  rules:[{domain:'*.auth.np.ac.playstation.net',builtin:true,excluded:true,ports:'443'}]});
- await h.app.policyAction('preview');
- assert.match(h.app.policyPreviewBody.children[0].children[0].textContent, /内置动态/);
- assert.match(h.app.policyPreviewBody.children[0].children[2].textContent, /排除清单/);
-});
-
-test('actual core routes and fixed-target probe stages render with separate evidence', async () => {
- const h = harness(); await h.init();
- h.policyData.telemetry = {fresh:true,sampled_cores:1,matched_connections:1,connections:[
-  {device:'portal',domain:'region.np.communication.playstation.net',phase:'CONNECTED',route:'selected',bytes_up:2048,bytes_down:4096},
-  {device:'ps5',domain:'dwc.dl.playstation.net',phase:'CONNECTED',route:'direct',bytes_down:8192} ]};
- h.policyData.probes = {epoch:1800000000,healthy:false,targets:[
-  {domain:'auth.api.playstation.com',category_label:'认证',path:'proxy',dns:{ok:true},tcp:true,tls:false,failure:'certificate_validation'} ]};
- await policyTab(h);
- assert.match(h.app.policyCoreSummary.textContent, /处理 1 条设备连接/);
- assert.match(nodeText(h.app.policyConnections), /所选节点/);
- assert.match(nodeText(h.app.policyConnections), /原有直连/);
- assert.match(nodeText(h.app.policyProbeResults), /证书校验失败/);
- h.policyData.probes.current_config = false;
- await h.app.refreshPolicy(true);
- assert.match(h.app.policyProbeState.textContent, /此前配置检测/);
- assert.match(nodeText(h.app.policyProbeResults), /此前配置出口/);
-});
-
-test('a completed connectivity probe preserves an edited proxy draft', async () => {
- const h = harness(); await h.init(); h.policyData.enabled = true; await policyTab(h);
- h.app.policyInputs.domains.value = 'edited.auth.np.ac.playstation.net';
- h.app.policyInputs.domains.handlers.input();
- h.status.job = {id:'probe-complete',action:'psportal_probe',state:'complete',busy:false};
- await h.app.policyAction('probe'); await settle();
- assert.ok(h.calls.some(call => call.method === 'psportal_probe'));
- assert.equal(h.app.policyInputs.domains.value, 'edited.auth.np.ac.playstation.net');
- assert.equal(h.app.policyTouched.domains, true);
- assert.match(h.app.policyNotice.textContent, /连接检测完成/);
- h.app.update({...h.app.latest,job:{id:'probe-cancelled',action:'psportal_probe',state:'cancelled',busy:false}});
- assert.match(h.app.policyNotice.textContent, /连接检测已取消/);
- h.app.update({...h.app.latest,job:{id:'probe-failed',action:'psportal_probe',state:'failed',busy:false,error:'检测入口待检查'}});
- assert.equal(h.app.policyNotice.textContent, '检测入口待检查');
- assert.equal(h.app.policyNotice.attributes['data-error'], 'true');
+ assert.match(h.app.policyNotice.textContent, /名单已保存/);
 });

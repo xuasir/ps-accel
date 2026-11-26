@@ -54,6 +54,37 @@ def matches_domain(host, rules):
                               for rule in rules)
 
 
+def native_host(name):
+    if (not isinstance(name, str) or len(name) > 253 or '.' not in name or
+            any(not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?', part)
+                for part in name.split('.'))):
+        return False
+    try:
+        ipaddress.ip_address(name)
+    except ValueError:
+        return True
+    return False
+
+
+def native_host_rules(text):
+    return list(dict.fromkeys(line.strip().lower() for line in text.splitlines()
+                              if native_host(line.strip().lower()))) if isinstance(text, str) else []
+
+
+def native_matches(host, rules):
+    host = host.lower().rstrip('.')
+    return bool(host) and any(host == rule or host.endswith('.' + rule) for rule in rules)
+
+
+def scope_proxy(host, config, respect_switches=True):
+    if config.get('mode') == 'native_lists':
+        enabled = config.get('proxy_list_enabled', True) or not respect_switches
+        direct = config.get('direct_list_enabled', True) or not respect_switches
+        return bool(enabled and native_matches(host, native_host_rules(config.get('domains', ''))) and
+                    not (direct and native_matches(host, native_host_rules(config.get('exclusions', '')))))
+    return matches_domain(host, proxy_rules(config)) and not matches_domain(host, domain_rules(config.get('exclusions', '')))
+
+
 def proxy_rules(config):
     return list(dict.fromkeys(domain_rules(config.get('domains', '')) + list(DYNAMIC_PROXY_RULES)))
 

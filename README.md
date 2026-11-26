@@ -4,7 +4,7 @@
 
 当前基准设备：**FastRhino R66S，rockchip/armv8，OpenWrt 25.12-SNAPSHOT，内核 6.12.115**。原有提码率方案的有效性由本机实测确认，本仓库负责重做中文控制台、配置流程、稳定性和部署。
 
-当前版本 **0.1.9**：新增轻量串流质量采集与只读降档建议，展示客户端报告丢失、坏帧／关键帧请求、中继接收队列丢包和转发处理耗时。持续异常时建议试用下一低档，反馈过期后撤回建议，中继自身异常优先提示检查负载。页面保留设备配置、码率增强与透明代理三个入口，换档沿用选择码率、保存并自动重启的流程。
+当前版本 **0.1.9**：提供轻量串流质量采集与只读降档建议，展示客户端报告丢失、坏帧／关键帧请求、中继接收队列丢包和转发处理耗时。持续异常时建议试用下一低档，反馈过期后撤回建议，中继自身异常优先提示检查负载。页面提供设备配置、码率增强、透明代理与域名监控四个一级入口；域名监控按连接批次保存解析、失败证据及核心流量统计，支持 PassWall 纯域名复制、代理流量排序与代理清单联动。透明代理已收敛为本机 PassWall 的代理、直连域名名单维护，沿用当前核心和节点，兼容 Xray 与 Sing-box。域名级流量读取本机已有接口，页面明确显示数据来源与可用状态。换档沿用选择码率、保存并自动重启的流程。
 
 - [OpenWrt 安装与使用](openwrt/README.zh-CN.md)
 - [仓库分析与增强设计](docs/openwrt-analysis.zh-CN.md)
@@ -12,7 +12,7 @@
 - [0.1.6 对齐补齐与验证记录](docs/verification-0.1.6.zh-CN.md)
 - [0.1.5 原始对齐核对](docs/openwrt-alignment-0.1.5.zh-CN.md)
 - [界面与功能结构](docs/openwrt-ui-redesign.zh-CN.md)
-- [R66S 透明代理实现](docs/psportal-r66s-design.md)
+- [早期 R66S 透明代理实现记录](docs/psportal-r66s-design.md)
 - 中文交互预览：运行 `python3 openwrt/build.py` 后打开 `openwrt/release-assets/ps-accel-console-0.1.9.html`
 
 `openwrt/` 包含独立的 PS Accel 服务、原生 LuCI 页面、协议引擎、测试、IPK/脚本包构建器和 OpenWrt 原生包 Makefile。`PS-Portal-Relay/` 是工作区中的独立登录与信令代理仓库，提供透明代理实现参考，并保留独立 Git 历史。

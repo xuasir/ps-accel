@@ -46,7 +46,7 @@ var state = {
  log:'[演示] LAN 网桥 br-lan 就绪\n[演示] Portal 与 PS5 的设备身份已确认\n[演示] 码率配置已保存，目标 65 Mbps\n[演示] 启动增强后重新连接 Portal，检查画面与按键',
  events:'2026-11-23 14:20:18 INFO 已修改新连接请求，目标码率=65 Mbps\n2026-11-23 14:22:06 INFO 已完成设备网络恢复'
 };
-var runningSince = 0, instance, jobSequence = 0, probeDemo = {}, qualityDemo = 'stable';
+var runningSince = 0, instance, jobSequence = 0, qualityDemo = 'stable';
 function demoQuality() {
  var loss=qualityDemo==='loss', waiting=qualityDemo==='waiting', stale=qualityDemo==='stale';
  var unsupported=qualityDemo==='unsupported', relay=qualityDemo==='relay';
@@ -67,79 +67,34 @@ function demoQuality() {
    profile:state.running && loss && index?profiles[index-1]:null,
    sustained_seconds:loss?6:0,loss_percent:loss?4:null}};
 }
-var dynamicDemoRules = ['*.auth.np.ac.playstation.net', '*.np.communication.playstation.net', 'gsconnect.*',
- '*.gsconnect.playstation.net', '*signaling*', '*.remoteplay.playstation.net'].map(function(domain) {
- return {domain:domain,builtin:true};
-});
 function demoNames(text) {
  return text.split('\n').map(function(name){return name.trim().toLowerCase().replace(/^full:/,'');})
-  .filter(function(name,index,names){return name && name[0]!=='#' && names.indexOf(name)===index;});
-}
-function demoMatches(host,rules) {
- return rules.some(function(rule){return new RegExp('^'+rule.split('*').map(function(part) {
-  return part.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
- }).join('.*')+'$').test(host);});
-}
-function demoExcluded(rule,exclusions) {
- return exclusions.some(function(exclusion){return rule===exclusion ||
-  exclusion.startsWith('*.') && rule.endsWith(exclusion.slice(1)) ||
-  !rule.includes('*') && demoMatches(rule,[exclusion]);});
+  .filter(function(name,index,names){return name && name[0]!=='#' && !name.startsWith('geosite:') && names.indexOf(name)===index;});
 }
 var policyDemo = {
- enabled:false,autostart:true,hooked:false,applied:null,receipt:{},token:'',
- config:{portal:'10.0.0.101',ps5:'10.0.0.100',node:'preview-selected',ports:'443',
-  domains:'auth.api.sonyentertainmentnetwork.com\nauth.api.playstation.com\nnp.ac.playstation.net\nremoteplay.dl.playstation.net',
-  exclusions:'dwc.dl.playstation.net'},
- nodes:[{id:'preview-selected',label:'[演示] 订阅节点 A',protocol:'trojan'},
-  {id:'preview-other',label:'[演示] 订阅节点 B',protocol:'vless'}],
+ enabled:true,running:true,revision:'d'.repeat(64),sequence:13,receipt:{},
+ config:{domains:'# 本机现有代理名单\nauth.api.playstation.com\nregion.np.communication.playstation.net\nremoteplay.dl.playstation.net\ngeosite:google\n',
+  exclusions:'# 固件下载直连\ndwc.dl.playstation.net\n'},
  devices:[{mac:'02:00:00:00:00:02',label:'Portal',addresses:['10.0.0.101'],source:'dhcp'},
   {mac:'02:00:00:00:00:03',label:'PS5',addresses:['10.0.0.100'],source:'dhcp'}]
 };
-function policyValues(args) {
- var result={};['portal','ps5','node','domains','ports','exclusions'].forEach(function(key,i){result[key]=args[i];});
- return result;
-}
-function policySources(config) {
- var result={};['portal','ps5'].forEach(function(role){
-  var device=policyDemo.devices.find(function(item){return item.mac===config[role] || item.addresses.includes(config[role]);});
-  result[role]=device?device.addresses.slice():[];
- });return result;
-}
+function policyValues(args) { return {domains:args[0],exclusions:args[1]}; }
 function policyStatus() {
- return {ok:true,enabled:policyDemo.enabled,autostart:policyDemo.autostart,config:policyDemo.config,nodes:policyDemo.nodes,
-  devices:policyDemo.devices,active_config:policyDemo.applied || {},sources:policyDemo.applied?policySources(policyDemo.applied):{},
-  blockers:[],receipt:policyDemo.receipt,dynamic_rules:dynamicDemoRules,
-  environment:{passwall:'26.11.11-r376',singbox:'1.14.4',compatible:true,passwall_enabled:true,
-   hooked:policyDemo.hooked,active_cores:1,attached_cores:policyDemo.hooked?1:0},
-  entry_scope:{blockers:[],notices:['[演示] 配置与命中结果由模拟数据提供。'],traffic_verified:false},
-  probes:Object.assign({},probeDemo,{current_config:policyDemo.enabled && probeDemo.revision===JSON.stringify(policyDemo.applied)}),
-  telemetry:policyDemo.enabled?{fresh:true,sampled_cores:1,matched_connections:1,connections:[
-   {device:'portal',domain:policyDemo.applied.domains.split('\n')[0],phase:'AUTH',route:'selected',bytes_up:2048,bytes_down:8192},
-   {device:'ps5',domain:'dwc.dl.playstation.net',phase:'CONNECTED',route:'direct',bytes_up:1024,bytes_down:32768}]}:{}};
+ return {ok:true,available:true,mode:'native_lists',enabled:policyDemo.enabled,running:policyDemo.running,
+  revision:policyDemo.revision,config:policyDemo.config,file_config:policyDemo.config,
+  counts:{domains:demoNames(policyDemo.config.domains).length,exclusions:demoNames(policyDemo.config.exclusions).length},
+  switches:{proxy_list_enabled:true,direct_list_enabled:true,client_proxy:true,acl_enabled:false},
+  blockers:[],warnings:[],receipt:policyDemo.receipt,pending_apply:!!policyDemo.receipt.pending_apply,
+  environment:{cores:['sing-box'],rules_path:'/etc/passwall/rules'},
+  telemetry:{fresh:true,state:'observing',sampled_cores:1,limit:'[演示] 域名流量按连接批次累计，数据来自本机已有连接接口。'}};
 }
-function policyPlan(config) {
- var names=demoNames(config.domains), exclusions=demoNames(config.exclusions);
- var targets=Array.from(new Set(names.concat(dynamicDemoRules.map(function(rule){return rule.domain;}))));
- var sources=policySources(config), blockers=[];
- ['portal','ps5'].forEach(function(role){if(!sources[role].length)blockers.push('[演示] 请使用列表中的设备 MAC 或 IP。');});
- if(config.portal===config.ps5)blockers.push('[演示] 请为 Portal 与 PS5 选择不同设备。');
- if(!policyDemo.nodes.some(function(node){return node.id===config.node;}))blockers.push('[演示] 请选择代理出口。');
- if(!names.length || names.concat(exclusions).some(function(name){return (
-  name.length>253 || !/^[a-z0-9]+(?:[.-][a-z0-9-]+)*\.[a-z0-9-]+$/i.test(name.replace(/^\*\./,'')));}))
-  blockers.push('[演示] 每行填写完整主机名或 *.example.com。');
- if(names.length>32 || exclusions.length>32)blockers.push('[演示] 每份列表最多 32 条域名规则。');
- if(!/^\d{1,5}(,\s*\d{1,5})*$/.test(config.ports) || config.ports.split(',').some(function(port){return +port<1 || +port>65535;}))
-  blockers.push('[演示] 请填写有效 TCP 端口。');
- if(targets.every(function(name){return demoExcluded(name,exclusions);}))blockers.push('[演示] 目标域名规则均在排除列表中。');
- var restart=!policyDemo.hooked || !policyDemo.applied || policyDemo.applied.node!==config.node;
- policyDemo.token='preview-policy-'+JSON.stringify(config);
- return {ok:true,can_apply:!blockers.length,config:config,sources:sources,token:policyDemo.token,
-  blockers:blockers,restart_required:restart,validation:{checked_cores:1,protection_rules:3},
-  entry_scope:policyStatus().entry_scope,
-  rules:targets.map(function(name){return {domain:name,network:'tcp',ports:config.ports,
-   builtin:dynamicDemoRules.some(function(rule){return rule.domain===name;}),excluded:demoExcluded(name,exclusions)};}),
-  direct_rules:demoMatches('dwc.dl.playstation.net',exclusions)?[{domain:'dwc.dl.playstation.net',network:'tcp',ports:'80,443'}]:[],
-  notice:restart?'[演示] 首次接入或换节点涉及共享 PassWall 重启':'[演示] 本次热更新规则，核心进程保持运行'};
+function demoSaveLists(config,apply) {
+ policyDemo.config=config;policyDemo.revision=(++policyDemo.sequence).toString(16).padStart(64,'0');
+ var reloaded=apply && policyDemo.enabled && policyDemo.running;
+ policyDemo.receipt={state:reloaded?'applied':'saved',time:Date.now()/1000,pending_apply:!reloaded};
+ if(reloaded)policyDemo.receipt.applied_at=Date.now()/1000;
+ return {ok:true,config:config,revision:policyDemo.revision,reloaded:reloaded,pending_apply:!reloaded,
+  notice:reloaded?'[演示] 名单已保存并调用 PassWall 重新加载。':'[演示] 本机名单已保存，点击保存并应用加载修改。'};
 }
 var domainRows = [
  {device:'portal',domain:'region.np.communication.playstation.net',category:'signaling',category_label:'信令',suggestion:'proxy',
@@ -154,7 +109,10 @@ var domainRows = [
   counts:{dns_query:8,dns_ok:8,tcp_ok:4,tls_sni:4},last_problem:'',addresses:[{address:'1.1.1.1',ttl:60}]},
  {device:'ps5',domain:'auth.sony.example',first_epoch:Date.parse('2026-11-21T10:01:00+08:00')/1000,
   first_seen:'2026-11-21T10:01:00+08:00',last_seen:'2026-11-23T14:21:58+08:00',
-  counts:{dns_query:4,dns_ok:4,tcp_ok:2},last_problem:'',addresses:[{address:'8.8.8.8',ttl:120}]}
+  counts:{dns_query:4,dns_ok:4,tcp_ok:2},last_problem:'',addresses:[{address:'8.8.8.8',ttl:120}]},
+ {device:'portal',domain:'dwc.dl.playstation.net',category_label:'固件下载',counts:{dns_query:1,dns_ok:1,tcp_ok:1},
+  first_seen:new Date().toISOString(),last_seen:new Date().toISOString(),first_epoch:Date.now()/1000,
+  last_problem:'',addresses:[{address:'8.8.4.4',ttl:120}]}
 ];
 var domainEvidence = {evidence_complete:true,coverage_limited:false,event_count:3,
  candidates:[{device:'portal',domain:'upgrade-api.sony.example',errors:2,evidence:['dns_error','dns_timeout']},
@@ -165,13 +123,64 @@ var domainEvidence = {evidence_complete:true,coverage_limited:false,event_count:
 var incidents=[{id:'a'.repeat(32),source:'manual',note:'[演示] Portal 升级后首次连接失败',tag:state.logging.tag,
  time:'2026-11-23T14:22:06+08:00',captured_at:'2026-11-23T14:22:21+08:00',evidence:domainEvidence}];
 function domainResult(id) {
- return {ok:true,logging:state.logging,dynamic_rules:dynamicDemoRules,domains:domainRows.map(function(row) {
+ return {ok:true,logging:state.logging,dynamic_rules:[],domains:domainRows.map(function(row) {
   return Object.assign({},row,{new_since_tag:!!state.logging.tag && row.first_epoch>=state.logging.tag_since});
  }),candidates:domainRows.filter(function(row){return row.suggestion==='proxy';}).concat([
   {domain:'google.com',suggestion:'proxy'},{domain:'www.google.com',suggestion:'proxy'}]),
  observer:{state:state.logging.domains?'observing':'disabled',fresh:true,bridge:'br-lan',health:{suppressed_events:26},
   observability:{write_errors:state.observability.write_errors,last_error:state.observability.last_error}},
  incidents:incidents,selected:incidents.find(function(item){return item.id===id;}) || null};
+}
+var batchEpoch = Date.now()/1000 - 90;
+function demoBatchRow(row, epoch) {
+ var counts = Object.assign({},row.counts), failures = (counts.dns_error || 0) + (counts.dns_timeout || 0);
+ var direct=row.domain==='dwc.dl.playstation.net', large=row.domain==='stream.sony.example';
+ var up=direct?65536:16384, down=direct?480*1024*1024:large?256*1024*1024:128*1024;
+ var traffic={sampled:!failures,source:'passwall_core',upload_bytes:failures?0:up,download_bytes:failures?0:down,
+  proxy_upload_bytes:direct||failures?0:up,proxy_download_bytes:direct||failures?0:down,
+  direct_upload_bytes:direct?up:0,direct_download_bytes:direct?down:0,
+  has_proxy:!direct&&!failures,proxy_rules_seen:!direct&&!failures,last_route:failures?'unknown':direct?'direct':'proxy',
+  upload_rate:4096,download_rate:large?4*1024*1024:direct?8*1024*1024:32768,
+  proxy_rate:large?4*1024*1024:direct?0:32768,proxy_active_connections:direct||failures?0:1,last_sample_epoch:epoch+30};
+ return Object.assign({},row,{first_epoch:epoch,first_seen:new Date(epoch*1000).toISOString(),
+  last_epoch:epoch+30,last_seen:new Date((epoch+30)*1000).toISOString(),counts:counts,qtypes:[1,28],
+  dns_failed:!!failures,dns_failures:failures,last_rcode:counts.dns_error?3:undefined,traffic:traffic});
+}
+var domainBatches = [{id:'b'.repeat(32),epoch:batchEpoch,time:new Date(batchEpoch*1000).toISOString(),
+ last_epoch:batchEpoch+60,last_seen:new Date((batchEpoch+60)*1000).toISOString(),state:'collecting',source:'activity',
+ domains:domainRows.map(function(row){return demoBatchRow(row,batchEpoch);}),
+ events:domainEvidence.events.map(function(event,index){return Object.assign({},event,{qtype:1,
+  time:new Date((batchEpoch+30+index)*1000).toISOString()});}),event_count:3},
+ {id:'c'.repeat(32),epoch:batchEpoch-3600,time:new Date((batchEpoch-3600)*1000).toISOString(),
+ last_epoch:batchEpoch-3540,last_seen:new Date((batchEpoch-3540)*1000).toISOString(),
+ ended_at:new Date((batchEpoch-3540)*1000).toISOString(),state:'archived',source:'activity',
+ domains:[demoBatchRow(domainRows[4],batchEpoch-3600)],events:[],event_count:1}];
+function monitorResult(batchId,incidentId) {
+ var result=domainResult(incidentId), selected=domainBatches.find(function(batch){return batch.id===batchId;});
+ if (!batchId) selected=domainBatches[0];
+ domainBatches.forEach(function(batch){
+  var fresh=batch.state==='collecting' && state.logging.domains && policyDemo.enabled;
+  batch.traffic={sampled:batch.domains.some(function(row){return row.traffic && row.traffic.sampled;}),fresh:fresh,
+   source:'passwall_core',upload_bytes:0,download_bytes:0,proxy_upload_bytes:0,proxy_download_bytes:0,proxy_rate:0};
+  batch.unattributed_traffic={};
+  batch.domains.forEach(function(row){
+   row.traffic.fresh=fresh;
+   row.traffic.proxy_active_connections=fresh&&row.traffic.has_proxy?1:0;
+   if(fresh)row.traffic.last_sample_epoch=Date.now()/1000;
+   ['upload_bytes','download_bytes','proxy_upload_bytes','proxy_download_bytes'].forEach(function(key){batch.traffic[key]+=row.traffic[key] || 0;});
+   if(fresh)batch.traffic.proxy_rate+=row.traffic.proxy_rate || 0;
+  });
+ });
+ result.batch=batchId==='inventory'?null:selected || null;
+ result.inventory_count=domainRows.length;
+ result.observer.traffic={state:policyDemo.enabled?'observing':'waiting',source:'passwall_core',sample_interval:2,
+  limit:'[演示] 按批次累计本机已有连接接口的字节增量。设备直达流量与短连接影响覆盖。'};
+ result.batches=domainBatches.map(function(batch){return Object.assign({},batch,{
+  domain_count:new Set(batch.domains.map(function(row){return row.domain;})).size,
+  failed_count:new Set(batch.domains.filter(function(row){return row.dns_failed;}).map(function(row){return row.domain;})).size,
+  domains:undefined,events:undefined});});
+ if(batchId!=='inventory') result.domains=selected?selected.domains:[];
+ return result;
 }
 function detailsRevision() {
  return JSON.stringify([state.config,state.device_selectors,state.devices_configured,state.baseline_valid,state.autostart,state.logging]);
@@ -191,7 +200,7 @@ window.rpc = { declare:function(spec) { return function() {
  return new Promise(function(resolve) {
   window.setTimeout(function() {
    if(spec.method==='devices'){
-    resolve({ok:true,configured:state.devices_configured,proxy_enabled:policyDemo.enabled,devices:policyDemo.devices,
+    resolve({ok:true,configured:state.devices_configured,proxy_enabled:false,devices:policyDemo.devices,
      config:{bridge:state.config.bridge,portal_ip:state.config.portal_ip,ps5_ip:state.config.ps5_ip},
      binding:{config:{bridge:state.config.bridge,portal_ip:state.config.portal_ip,ps5_ip:state.config.ps5_ip},
       portal_mac:state.device_selectors.portal,ps5_mac:state.device_selectors.ps5}});return;
@@ -199,7 +208,7 @@ window.rpc = { declare:function(spec) { return function() {
    if(spec.method==='device_save'){
     var portal=policyDemo.devices.find(function(item){return item.addresses.includes(args[1]);});
     var ps5=policyDemo.devices.find(function(item){return item.addresses.includes(args[2]);});
-    if(state.running || policyDemo.enabled){resolve({ok:false,error:'[演示] 停止增强并停用代理后保存设备配置。'});return;}
+    if(state.running){resolve({ok:false,error:'[演示] 停止增强并完成网络恢复后保存设备配置。'});return;}
     if(!portal || !ps5 || portal.mac===ps5.mac){resolve({ok:false,error:'[演示] 请选择列表中两台独立设备的地址。'});return;}
     var changed=state.config.bridge!==args[0] || state.config.portal_ip!==args[1] || state.config.ps5_ip!==args[2] ||
      state.device_selectors.portal!==portal.mac || state.device_selectors.ps5!==ps5.mac;
@@ -210,51 +219,24 @@ window.rpc = { declare:function(spec) { return function() {
     resolve({ok:true});return;
    }
    if(spec.method==='psportal_status'){resolve(JSON.parse(JSON.stringify(policyStatus())));return;}
-   if(spec.method==='psportal_autostart'){
-    policyDemo.autostart=args[0]===1;
-    resolve({ok:true,autostart:policyDemo.autostart,enabled:policyDemo.enabled});return;
-   }
-   if(spec.method==='psportal_probe'){
-    var probeJob=job('psportal_probe',{state:'running',busy:true});
-    var probeConfig=JSON.stringify(policyDemo.applied);
-    window.setTimeout(function(){
-     if(state.job.id!==probeJob || !state.job.busy)return;
-     probeDemo={epoch:Date.now()/1000,healthy:true,revision:probeConfig,targets:[
-      ['auth.api.playstation.com','认证','proxy',443],['remoteplay.dl.playstation.net','信令','proxy',443],
-      ['www.google.com','连通探测','proxy',443],['dwc.dl.playstation.net','固件下载','direct',80]
-     ].map(function(target){return {domain:target[0],category_label:target[1],path:target[2],dns:{ok:true},tcp:true,tls:target[3]===443?true:null,failure:''};})};
-     if(state.job.id===probeJob){state.job.busy=false;state.job.state='complete';}
-    },1200);
-    resolve({ok:true,job:probeJob});return;
-   }
-   if(spec.method==='psportal_preview'){resolve(policyPlan(policyValues(args)));return;}
-   if(spec.method==='psportal_save'){
-    policyDemo.config=policyValues(args);policyDemo.token='';resolve({ok:true,saved:true});return;
-   }
-   if(spec.method==='psportal_apply' || spec.method==='psportal_disable'){
-    var applying=spec.method==='psportal_apply', config=applying?policyValues(args):policyDemo.config;
-    var restart=applying && (!policyDemo.hooked || !policyDemo.applied || policyDemo.applied.node!==config.node);
-    if(applying && (args[6]!==policyDemo.token || !policyDemo.token)){
-     resolve({ok:false,error:'[演示] 请重新生成预览。'});return;
-    }
-    if(restart && args[7]!==1){resolve({ok:false,error:'[演示] 请确认预览中的共享重启。'});return;}
-    var policyJob=job(spec.method,{state:'running',busy:true});policyDemo.token='';
-    state.log='[演示] '+(applying?'正在校验并应用代理规则。':'正在停用代理规则。');
+   if(spec.method==='psportal_save' || spec.method==='psportal_apply'){
+    if(args[2]!==policyDemo.revision){resolve({ok:false,error:'[演示] 本机名单已变化，请重新读取后保存。'});return;}
+    var config=policyValues(args);
+    var invalid=['domains','exclusions'].some(function(key){return config[key].split('\n').some(function(line){
+     var name=line.trim();return name && name[0]!=='#' && !name.startsWith('geosite:') &&
+      !/^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z0-9-]+$/i.test(name.replace(/^full:/,''));
+    });});
+    if(invalid){resolve({ok:false,error:'[演示] 每行填写完整域名，保留现有注释与 geosite: 标签。'});return;}
+    if(spec.method==='psportal_save'){resolve(demoSaveLists(config,false));return;}
+    var policyJob=job('psportal_apply',{state:'running',busy:true});
+    state.log='[演示] 正在保存代理与直连域名名单。';
     window.setTimeout(function(){
      if(state.job.id!==policyJob || !state.job.busy)return;
-     policyDemo.enabled=applying;
-     if(applying){
-      ['portal','ps5'].forEach(function(role){
-       var device=policyDemo.devices.find(function(item){return item.mac===config[role] || item.addresses.includes(config[role]);});
-       if(device)config[role]=device.mac;
-      });
-      policyDemo.config=config;policyDemo.applied=Object.assign({},config);policyDemo.hooked=true;
-     }
-     policyDemo.receipt={state:applying?'applied':'disabled',time:Date.now()/1000,restarted:restart};
-     state.job.busy=false;state.job.state='complete';
-    state.log+='\n[演示] '+(applying?'透明代理已应用；固件下载使用设备直连，其他连接沿用原策略。':'规则集已清空，新连接恢复原策略。');
-    },1500);
-    resolve({ok:true,job:policyJob});return;
+     var result=demoSaveLists(config,true);
+     state.job.busy=false;state.job.state='complete';state.job.reloaded=result.reloaded;state.job.pending_apply=result.pending_apply;
+     state.log+='\n'+result.notice;
+    },1200);
+    resolve({ok:true,id:policyJob});return;
    }
    if (spec.method === 'status') {
     if (state.running) {
@@ -280,6 +262,22 @@ window.rpc = { declare:function(spec) { return function() {
     resolve({ok:true,kind:args[0],text:args[0]===state.log_kind?state.log:state.featureLogs[args[0]] || state[args[0]] || ''});return;
    }
    if (spec.method === 'domains') {resolve(JSON.parse(JSON.stringify(domainResult(args[0]))));return;}
+   if (spec.method === 'domain_monitor') {resolve(JSON.parse(JSON.stringify(monitorResult(args[0],args[1]))));return;}
+   if (spec.method === 'domain_batch_start') {
+    if(!state.logging.domains){resolve({ok:false,error:'[演示] 开启域名采集后新建批次。'});return;}
+    var now=Date.now()/1000, id=(Date.now().toString(16)+String(++jobSequence)).padStart(32,'0');
+    if(domainBatches[0]){domainBatches[0].state='archived';domainBatches[0].ended_at=new Date().toISOString();}
+    var batch={id:id,epoch:now,time:new Date().toISOString(),last_epoch:now,last_seen:new Date().toISOString(),
+     state:'collecting',source:'manual',domains:[],events:[],event_count:0};
+    domainBatches.unshift(batch);domainBatches=domainBatches.slice(0,32);
+    window.setTimeout(function(){
+     batch.domains=domainRows.map(function(row){return demoBatchRow(row,now);});
+     batch.events=domainEvidence.events.map(function(event){return Object.assign({},event,{time:new Date().toISOString(),qtype:1});});
+     batch.event_count=batch.events.length;
+     if(instance && instance.activeTab==='monitor') instance.refreshDomains(true);
+    },1200);
+    resolve({ok:true,id:id,time:batch.time});return;
+   }
    if (spec.method === 'logging') {
     var tag=args[2],changed=tag!==state.logging.tag;
     state.logging={mode:args[0],domains:!!args[1],tag:tag,tag_since:changed?Date.now()/1000:state.logging.tag_since};
@@ -321,8 +319,7 @@ window.rpc = { declare:function(spec) { return function() {
     var cancelledAction=state.job.busy?state.job.action:null;
     if(cancelledAction && cancelledAction.indexOf('psportal_')===0){
      job(cancelledAction,{state:'cancelled'});
-     if(cancelledAction==='psportal_probe')probeDemo={epoch:Date.now()/1000,cancelled:true,targets:[]};
-     state.log='[演示] 代理任务已取消，码率服务继续运行。';
+     state.log='[演示] 名单应用已取消，原名单已保留。';
     }else{
      state.running=false;state.control_mbps=0;job(cancelledAction || 'stop',cancelledAction?{state:'cancelled'}:{});
      state.recovery_required=false;state.cleanup_pending=false;

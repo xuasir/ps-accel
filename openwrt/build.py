@@ -12,9 +12,9 @@ OUT = ROOT / 'release-assets'
 VERSION = '0.1.9-1'
 ENGINE = ['portal_auto.py', 'portal_auto_platform.py', 'portal_active_probe.py',
           'portal_capture.py', 'portal_egress_witness.py', 'portal_windows_network.py',
-          'protocol.py', 'profiles.py', 'telemetry.py', 'observability.py', 'stream_quality.py', 'domain_tracker.py',
-          'portal_observe.py', 'portal_policy.py', 'sony_domains.py', 'proxy_telemetry.py',
-          'psportal_adapter.lua', 'LICENSE', 'requirements.txt', 'UPSTREAM.md']
+          'protocol.py', 'profiles.py', 'telemetry.py', 'observability.py', 'stream_quality.py', 'domain_monitor.py', 'domain_tracker.py',
+          'portal_observe.py', 'portal_policy.py', 'passwall_rules.py', 'sony_domains.py', 'proxy_telemetry.py',
+          'LICENSE', 'requirements.txt', 'UPSTREAM.md']
 
 
 def archive(files):
@@ -119,7 +119,9 @@ uci commit ps_accel
 /etc/init.d/ps-accel disable
 /etc/init.d/ps-accel-observe enable
 /etc/init.d/ps-accel-observe start
-if [ -f /etc/ps-accel/psportal/manifest.json ]; then /usr/sbin/ps-accel-policy resume; fi
+/usr/sbin/ps-accel-policy migrate || exit 1
+/etc/init.d/ps-accel-policy enable
+/etc/init.d/ps-accel-policy start
 rm -f /tmp/luci-indexcache*
 if /etc/init.d/rpcd running >/dev/null 2>&1; then /etc/init.d/rpcd reload; fi
 echo 'Installed disabled. Open LuCI: Services -> PS Accel.'

@@ -201,7 +201,7 @@ class SharedDeviceTests(unittest.TestCase):
                 'nodes': [{'password': 'unrelated-node-data'}]}
         report = {'ok': True, 'domains': [{'device': 'portal', 'domain': 'auth.sony.example',
                   'addresses': [{'address': '1.1.1.1'}]}], 'incidents': [], 'observer': {'state': 'observing'}}
-        with patch.object(policy, 'status', return_value=data), patch.object(api, 'domains', return_value=report):
+        with patch.object(api.rules, 'status', return_value=data), patch.object(api, 'domains', return_value=report):
             result = api.dispatch('proxy_diagnostics', {})
         self.assertTrue(result['proxy']['enabled'])
         serialized = json.dumps(result)

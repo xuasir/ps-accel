@@ -185,6 +185,9 @@ class Telemetry:
     def write_recovery(self, payload):
         self.write_report('recovery', payload)
 
+    def write_inventory(self, payload):
+        atomic_json(Path(self.persist) / 'domains.json', payload)
+
     def write_events(self, messages):
         self.runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
         path = self.runtime / self.event_name
@@ -266,7 +269,7 @@ class Telemetry:
                     self.failed(exc)
             if inventory is not None:
                 try:
-                    atomic_json(Path(self.persist) / 'domains.json', inventory)
+                    self.write_inventory(inventory)
                 except Exception as exc:
                     self.failed(exc)
             if recovery is not None:

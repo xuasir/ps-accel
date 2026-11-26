@@ -18,23 +18,21 @@ var callDiagnostics = rpc.declare({ object: 'ps-accel', method: 'diagnostics', e
 var callProxyDiagnostics = rpc.declare({ object: 'ps-accel', method: 'proxy_diagnostics', expect: {} });
 var callLogging = rpc.declare({ object: 'ps-accel', method: 'logging', params: [ 'mode', 'domains', 'tag' ], expect: {} });
 var callDomains = rpc.declare({ object: 'ps-accel', method: 'domains', params: [ 'incident' ], expect: {} });
+var callDomainMonitor = rpc.declare({ object: 'ps-accel', method: 'domain_monitor', params: [ 'batch', 'incident' ], expect: {} });
+var callDomainBatchStart = rpc.declare({ object: 'ps-accel', method: 'domain_batch_start', expect: {} });
 var callIncident = rpc.declare({ object: 'ps-accel', method: 'incident', params: [ 'note' ], expect: {} });
-var policyFields = [ 'portal', 'ps5', 'node', 'domains', 'ports', 'exclusions' ];
+var policyFields = [ 'domains', 'exclusions' ];
+var maxPolicyRules = 4096;
 var callPolicyStatus = rpc.declare({ object: 'ps-accel', method: 'psportal_status', expect: {} });
-var callPolicyPreview = rpc.declare({ object: 'ps-accel', method: 'psportal_preview', params: policyFields, expect: {} });
-var callPolicySave = rpc.declare({ object: 'ps-accel', method: 'psportal_save', params: policyFields, expect: {} });
-var callPolicyApply = rpc.declare({ object: 'ps-accel', method: 'psportal_apply',
- params: policyFields.concat([ 'token', 'confirm_restart' ]), expect: {} });
-var callPolicyDisable = rpc.declare({ object: 'ps-accel', method: 'psportal_disable', expect: {} });
-var callPolicyProbe = rpc.declare({ object: 'ps-accel', method: 'psportal_probe', expect: {} });
-var callPolicyAutostart = rpc.declare({ object: 'ps-accel', method: 'psportal_autostart', params: [ 'autostart' ], expect: {} });
+var callPolicySave = rpc.declare({ object: 'ps-accel', method: 'psportal_save', params: policyFields.concat(['revision']), expect: {} });
+var callPolicyApply = rpc.declare({ object: 'ps-accel', method: 'psportal_apply', params: policyFields.concat(['revision']), expect: {} });
 var calls = {};
 [ 'baseline', 'trial', 'stop', 'repair', 'doctor' ].forEach(function(name) {
  calls[name] = rpc.declare({ object: 'ps-accel', method: name, expect: {} });
 });
 var actionNames = { device_save: '确认设备', configure: '检查码率配置', profile: '应用码率', baseline: '连接测试',
  trial: '试运行', start: '启动码率增强', stop: '停止任务', repair: '网络恢复', doctor: '环境检查',
- psportal_apply: '启用透明代理', psportal_disable: '停用透明代理', psportal_probe: '检测出口连通性' };
+ psportal_apply: '应用 PassWall 名单' };
 var profilePhases = { stopping: '正在恢复旧连接', saving: '正在保存新码率',
  starting: '正在启动新档位', rollback: '正在恢复原档位',
  waiting_exit: '正在等待进程退出', repairing: '正在恢复与清理网络' };
@@ -51,8 +49,8 @@ function jobFeature(action) {
  return action && action.indexOf('psportal_') === 0 ? 'proxy' : action === 'device_save' ? 'devices' : 'bitrate';
 }
 function policyHosts(text) {
- return (text || '').split('\n').map(function(name) { return name.trim().toLowerCase().replace(/^full:/, ''); })
-  .filter(function(name, index, names) { return name && name.charAt(0) !== '#' && names.indexOf(name) === index; });
+ return (text || '').split('\n').map(function(name) { return name.trim().toLowerCase().replace(/^full:/, '').replace(/\.$/, ''); })
+  .filter(function(name, index, names) { return validHost(name) && names.indexOf(name) === index; });
 }
 function validHost(name) {
  return name.length <= 253 && name.indexOf('.') > 0 && !/^\d+(\.\d+){3}$/.test(name) &&
@@ -60,10 +58,59 @@ function validHost(name) {
 }
 function policyMatches(host, rules) {
  host = host.toLowerCase().replace(/\.$/, '');
- return !!host && rules.some(function(rule) {
-  var pattern = rule.split('*').map(function(part) { return part.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }).join('.*');
-  return new RegExp('^' + pattern + '$').test(host);
+ return !!host && rules.some(function(rule) { return host === rule || host.endsWith('.' + rule); });
+}
+function policyListEdit(text, domain, remove) {
+ var lines = (text || '').split('\n').filter(function(line) {
+  return line.trim().toLowerCase().replace(/^full:/, '').replace(/\.$/, '') !== domain;
  });
+ while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+ if (!remove) lines.push(domain);
+ return lines.join('\n') + (lines.length ? '\n' : '');
+}
+function policyRuleCount(text) {
+ return (text || '').split('\n').filter(function(line) { return line.trim() && line.trim().charAt(0) !== '#'; }).length;
+}
+function dnsFailed(row) {
+ var counts = row.counts || {};
+ return !!row.dns_failed || !!(counts.dns_error || counts.dns_timeout);
+}
+function domainNames(rows, failed) {
+ return rows.filter(function(row) { return !failed || dnsFailed(row); }).map(function(row) { return row.domain; })
+  .filter(function(name, index, all) { return validHost(name) && all.indexOf(name) === index; }).sort();
+}
+var largeProxyBytes = 100 * 1024 * 1024;
+function formatBytes(value) {
+ value = typeof value === 'number' && isFinite(value) && value >= 0 ? value : 0;
+ var units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'], index = 0;
+ while (value >= 1024 && index < units.length - 1) { value /= 1024; index++; }
+ return (index ? value.toFixed(value < 10 ? 2 : 1) : Math.round(value)) + ' ' + units[index];
+}
+function rowBytes(row, proxy) {
+ var traffic = row.traffic || {};
+ return Number(traffic[proxy ? 'proxy_upload_bytes' : 'upload_bytes'] || 0) +
+  Number(traffic[proxy ? 'proxy_download_bytes' : 'download_bytes'] || 0);
+}
+function proxyRelated(row) {
+ var traffic = row.traffic || {};
+ return !!(traffic.has_proxy || traffic.proxy_rules_seen || rowBytes(row, true));
+}
+function copyText(text) {
+ function fallback() {
+  var input = E('textarea', { readonly: '', style: 'position:fixed;left:-9999px;top:0' });
+  var focused = document.activeElement;
+  input.value = text; document.body.appendChild(input);
+  try {
+   input.select();
+   if (!document.execCommand || !document.execCommand('copy')) throw new Error('浏览器剪贴板权限待确认');
+  } finally {
+   input.remove();
+   if (focused && focused.focus) focused.focus();
+  }
+ }
+ var clipboard = window.navigator && window.navigator.clipboard;
+ return clipboard && clipboard.writeText ? Promise.resolve().then(function() { return clipboard.writeText(text); })
+  .catch(fallback) : Promise.resolve().then(fallback);
 }
 
 function rpcRequest(request) {
@@ -143,7 +190,11 @@ var styles = `
 .ps-accel .pa-domain-new{display:inline-block;margin-left:6px;font-size:.85em;font-weight:normal}
 .ps-accel .pa-domain-action-notice{margin:12px 0}.ps-accel .pa-domain-candidate{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;margin:12px 0}
 .ps-accel .pa-domain-empty{padding:12px 0}.ps-accel .pa-incident{margin-top:16px}.ps-accel .pa-foot{margin-top:20px;padding:12px 0;font-size:.85em}
+.ps-accel .pa-domain-monitor{max-width:1200px}.ps-accel .pa-traffic-summary{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:14px 0}
+.ps-accel .pa-traffic-summary b,.ps-accel .pa-traffic-summary span{display:block}.ps-accel .pa-traffic-summary span{margin-top:5px;font-size:1.2em;font-weight:600}.ps-accel .pa-traffic-value{white-space:nowrap;font-weight:600}
+.ps-accel .pa-domain-heavy{color:var(--error-color-high,var(--err,inherit))}.ps-accel .pa-domain-tools>.pa-choice{min-width:210px}.ps-accel .pa-domain-list .pa-domain-total,.ps-accel .pa-domain-list .pa-domain-proxy{min-width:120px}
 @media(max-width:900px){.ps-accel .pa-grid{grid-template-columns:1fr}.ps-accel .pa-domain-list .table{min-width:0}}
+@media(max-width:700px){.ps-accel .pa-traffic-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.ps-accel .pa-domain-tools>.pa-choice{width:100%}.ps-accel .pa-domain-list .table,.ps-accel .pa-domain-list tbody{display:block;min-width:0}.ps-accel .pa-domain-list thead{display:none}.ps-accel .pa-domain-list tbody>.tr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-areas:'name name' 'total proxy' 'dns dns' 'rules time';border-bottom:1px solid var(--border-color-medium,#ccc);padding:8px 0}.ps-accel .pa-domain-list .td{min-width:0;padding:8px}.ps-accel .pa-domain-list .td:nth-child(1){grid-area:name}.ps-accel .pa-domain-list .td:nth-child(2){grid-area:dns}.ps-accel .pa-domain-list .td:nth-child(3){grid-area:total}.ps-accel .pa-domain-list .td:nth-child(4){grid-area:proxy}.ps-accel .pa-domain-list .td:nth-child(5){grid-area:rules}.ps-accel .pa-domain-list .td:nth-child(6){grid-area:time}.ps-accel .pa-domain-total:before,.ps-accel .pa-domain-proxy:before{content:attr(data-title);display:block;font-size:.85em;margin-bottom:6px}}
 @media(max-width:600px){.ps-accel .pa-form,.ps-accel .pa-device-form{grid-template-columns:1fr}.ps-accel .pa-main-tabs>li{flex:1 1 auto}.ps-accel .pa-main-tab{width:100%}.ps-accel .pa-nav-state{white-space:normal}.ps-accel .pa-stats td:first-child{width:30%}.ps-accel .pa-flow{grid-template-columns:minmax(0,1fr) 12px minmax(0,1fr) 12px minmax(0,1fr);gap:3px}.ps-accel .pa-domain-list thead{display:none}.ps-accel .pa-domain-list tr{display:block;padding:10px 0;border-bottom:1px solid var(--border-color-medium,var(--line,currentColor))}.ps-accel .pa-domain-list td{display:block;width:100%;border:0;text-align:left;box-sizing:border-box}.ps-accel .pa-domain-list td:first-child{width:100%}.ps-accel .pa-log-tools{gap:8px}}
 `;
 
@@ -322,14 +373,13 @@ return view.extend({
   if (this.activeTab === 'bitrate' && this.stagePanels.bitrate.logs.open)
    return { kind: this.logTab, node: this.logNode };
   if (this.activeTab === 'proxy' && this.stagePanels.proxy.logs.open)
-   return { kind: this.proxyLogTab, node: this.proxyLogNode };
+   return { kind: 'proxy', node: this.proxyLogNode };
   return null;
  },
 
  refreshLogs: function(force) {
   var context = this.activeLog();
   if (!context) return Promise.resolve();
-  if (context.kind === 'domains') return this.refreshDomains(force);
   var self = this, kind = context.kind;
   if (this.logRequests[kind]) return this.logRequests[kind];
   if (!force && Date.now() < (this.nextLogRead[kind] || 0)) return Promise.resolve();
@@ -342,7 +392,7 @@ return view.extend({
    var empty = { devices: '保存设备配置后，地址确认结果显示在这里。',
     bitrate: '配置检查、连接测试、启停与恢复结果显示在这里。',
     events: '码率增强启动后，握手修改与运行事件显示在这里。',
-    proxy: '透明代理的启用、更新、停用与回滚结果显示在这里。' };
+    proxy: '本机 PassWall 名单保存、应用与恢复结果显示在这里。' };
    active.node.textContent = data.text || empty[kind];
    if (bottom) active.node.scrollTop = active.node.scrollHeight;
   }).catch(function(error) {
@@ -353,41 +403,41 @@ return view.extend({
  },
 
  refreshDomains: function(force, anyStage) {
-  if (!anyStage && (this.activeTab !== 'proxy' || !this.stagePanels.proxy.logs.open || this.proxyLogTab !== 'domains'))
-   return Promise.resolve();
+  if (anyStage) return rpcRequest(function() { return callDomains(''); });
+  if (this.activeTab !== 'monitor') return Promise.resolve();
   if (this.domainRequest) return this.domainRequest;
   if (!force && Date.now() < (this.nextDomainRead || 0)) return Promise.resolve();
-  var self = this, selected = this.incidentId || '';
-  this.nextDomainRead = Date.now() + ((this.latest.logging || {}).mode === 'verbose' ? 2000 : 10000);
-  this.domainRequest = rpcRequest(function() { return callDomains(selected); }).then(function(data) {
-   if ((self.incidentId || '') !== selected) return;
+  var self = this, selected = this.incidentId || '', batch = this.batchId || '';
+  function current() { return (self.incidentId || '') === selected && (self.batchId || '') === batch; }
+  this.nextDomainRead = Date.now() + 2000;
+  this.domainRequest = rpcRequest(function() { return callDomainMonitor(batch, selected); }).then(function(data) {
+   if (!current()) return;
+   self.domainSelectionPending = false;
    self.domainData = data;
    self.renderDomains(data);
+   if (data.batch && data.batch.state === 'pending') self.nextDomainRead = Date.now() + 1000;
    return data;
   }).catch(function(error) {
-   if ((self.incidentId || '') === selected) self.domainState.textContent = '域名记录读取失败：' + error.message;
+   if (current()) self.domainState.textContent = '域名记录读取失败：' + error.message;
   }).finally(function() {
    self.domainRequest = null;
-   if ((self.incidentId || '') !== selected) self.refreshDomains(true);
+   if (!current()) self.refreshDomains(true);
   });
   return this.domainRequest;
  },
 
  selectLogTab: function(name, focus) {
-  var proxy = name === 'domains' || name === 'proxy', tabs = proxy ? this.proxyLogTabs : this.logTabs;
+  if (name === 'domains') { this.selectTab('monitor', focus); return this.refreshDomains(); }
+  var proxy = name === 'proxy', tabs = proxy ? this.proxyLogTabs : this.logTabs;
   if (!tabs[name]) return;
   if (proxy) this.proxyLogTab = name;
   else this.logTab = name;
   Object.keys(tabs).forEach(function(key) {
    setTabState(tabs[key], key === name);
   });
-  if (proxy) {
-   this.proxyLogNode.hidden = name === 'domains';
-   this.domainPanel.hidden = name !== 'domains';
-  }
   if (!proxy) this.logNode.setAttribute('aria-labelledby', tabs[name].id || tabs[name].attributes && tabs[name].attributes.id);
   if (focus) tabs[name].focus();
-  if (name !== 'domains') (proxy ? this.proxyLogNode : this.logNode).textContent = this.logContent[name] || '正在读取日志…';
+  (proxy ? this.proxyLogNode : this.logNode).textContent = this.logContent[name] || '正在读取日志…';
   return this.refreshLogs(true);
  },
 
@@ -438,91 +488,107 @@ return view.extend({
  },
 
  invalidatePolicy: function() {
-  this.policyPlan = null;
-  if (this.policyConfirm) this.policyConfirm.checked = false;
-  if (this.policyConfirmation) this.policyConfirmation.hidden = true;
-  if (this.policyPreview) this.policyPreview.hidden = true;
   this.updatePolicyControls();
  },
 
- dynamicDomainRules: function() {
-  return ((this.policyData || {}).dynamic_rules || (this.domainData || {}).dynamic_rules || [])
-   .map(function(rule) { return rule.domain; });
- },
-
  addDomainToPolicy: function(domain, target) {
-  domain = domain.trim().toLowerCase().replace(/^full:/, '');
+  domain = domain.trim().toLowerCase().replace(/^full:/, '').replace(/\.$/, '');
   var busy = this.readonly || this.policyPending || this.pending || !!(this.latest.job || {}).busy;
-  if (busy || ['domains', 'exclusions'].indexOf(target) < 0) return;
+  if (busy || !(this.policyData || {}).available || this.policyRequest || !validHost(domain) ||
+      policyFields.indexOf(target) < 0) return;
   var hosts = policyHosts(this.policyInputs[target].value);
-  if (target === 'domains' && policyMatches(domain, policyHosts(this.policyInputs.exclusions.value).filter(function(rule) {
-   return rule !== domain;
-  }))) {
-   this.domainActionText.textContent = domain + ' 命中泛匹配排除规则，请在代理配置中调整该规则后加入。';
+  var parents = policyHosts(this.policyInputs.exclusions.value).filter(function(rule) { return rule !== domain; });
+  if (target === 'domains' && policyMatches(domain, parents)) {
+   this.domainActionText.textContent = domain + ' 命中直连父域规则，请在名单中调整该规则后加入代理。';
    this.domainActionNotice.hidden = false; this.domainActionNotice.setAttribute('data-error', 'true'); return;
   }
-  if (!validHost(domain) || (hosts.indexOf(domain) < 0 && hosts.length >= 32)) {
-   this.domainActionText.textContent = validHost(domain) ? '每份清单最多 32 个域名，请先整理代理配置。' :
-    '请从日志选择有效的完整主机名。';
+  if (hosts.indexOf(domain) < 0 && policyRuleCount(this.policyInputs[target].value) >= maxPolicyRules) {
+   this.domainActionText.textContent = '每份名单最多 4096 条规则，请先整理名单。';
    this.domainActionNotice.hidden = false; this.domainActionNotice.setAttribute('data-error', 'true'); return;
   }
-  if (hosts.indexOf(domain) < 0) hosts.push(domain);
   var other = target === 'domains' ? 'exclusions' : 'domains';
-  this.policyInputs[target].value = hosts.join('\n');
-  this.policyInputs[other].value = policyHosts(this.policyInputs[other].value).filter(function(name) {
-   return name !== domain;
-  }).join('\n');
+  this.policyInputs[target].value = policyListEdit(this.policyInputs[target].value, domain, false);
+  this.policyInputs[other].value = policyListEdit(this.policyInputs[other].value, domain, true);
   this.policyTouched[target] = this.policyTouched[other] = true;
-  this.invalidatePolicy();
-  this.policyConfigNotice.textContent = this.policyDraftState.textContent =
-   '代理草稿已调整，保存并生成新预览后应用。';
+  this.policyConfigNotice.textContent = this.policyDraftState.textContent = '名单草稿已调整，保存并应用后生效。';
   this.policyConfigNotice.setAttribute('data-error', 'false');
-  this.domainActionText.textContent = domain + ' 已加入' + (target === 'domains' ? '代理清单' : '排除清单') +
-   '。检查配置并生成预览后应用。';
+  this.domainActionText.textContent = domain + (target === 'domains' ? ' 已加入代理名单草稿。' : ' 已移出代理并加入直连名单草稿。') +
+   '保存并应用后由 PassWall 加载。';
   this.domainActionNotice.hidden = false; this.domainActionNotice.setAttribute('data-error', 'false');
+  this.updatePolicyControls();
   if (this.domainData) this.renderDomains(this.domainData);
  },
 
+ removeDomainFromPolicy: function(domain) {
+  this.addDomainToPolicy(domain, 'exclusions');
+ },
+
+ selectBatch: function(id) {
+  this.batchId = id;
+  this.domainSelectionPending = true;
+  this.domainCopyNotice.textContent = '';
+  this.domainRulePreview.hidden = true;
+  this.batchTitle.textContent = '正在读取连接批次…'; this.batchSummary.textContent = '';
+  this.domainList.replaceChildren(E('p', { 'class': 'pa-caption' }, '正在读取所选连接批次…'));
+  this.updateDomainControls();
+  return this.refreshDomains(true);
+ },
+
+ startDomainBatch: function() {
+  if (this.batchStartButton.disabled || this.batchPending) return Promise.resolve();
+  var self = this;
+  this.batchPending = true; this.updateDomainControls();
+  return rpcRequest(callDomainBatchStart).then(function(data) {
+   self.incidentId = '';
+   self.batchNotice.textContent = '已新建 ' + localTime(data.time) + ' 的监控批次，请发起本次连接。';
+   return self.selectBatch(data.id);
+  }).catch(function(error) {
+   self.batchNotice.textContent = '新建批次失败：' + error.message;
+  }).finally(function() { self.batchPending = false; self.updateDomainControls(); });
+ },
+
+ updateDomainControls: function() {
+  if (!this.copyAllDomains) return;
+  var data = this.domainData || {}, rows = data.domains || [], observer = data.observer || {};
+  var pending = this.domainSelectionPending || this.copyPending;
+  this.copyAllDomains.disabled = !!pending || !domainNames(rows, false).length;
+  this.copyFailedDomains.disabled = !!pending || !domainNames(rows, true).length;
+  this.batchStartButton.disabled = this.readonly || !!this.batchPending || !!this.domainSelectionPending || !observer.fresh || observer.state !== 'observing' ||
+   !!(data.batch && data.batch.state === 'pending');
+ },
+
+ copyDomainRules: function(failed) {
+  if (this.domainSelectionPending || this.copyPending) return Promise.resolve();
+  var names = domainNames((this.domainData || {}).domains || [], failed), self = this;
+  if (!names.length) return Promise.resolve();
+  var text = names.join('\n') + '\n';
+  this.copyPending = true; this.updateDomainControls();
+  this.domainRuleText.value = text;
+  return copyText(text).then(function() {
+   self.domainCopyNotice.textContent = '已复制' + (failed ? '失败' : '全部') + '域名，共 ' + names.length + ' 行，可粘贴到 PassWall 规则列表。';
+   self.domainRulePreview.hidden = true;
+  }).catch(function() {
+   self.domainCopyNotice.textContent = '浏览器剪贴板权限待确认，选中下方规则后按 Ctrl+C 或 ⌘C 复制。';
+   self.domainRulePreview.hidden = false; self.domainRuleText.focus(); self.domainRuleText.select();
+  }).finally(function() { self.copyPending = false; self.updateDomainControls(); });
+ },
+
  domainRuleActions: function(domain) {
-  var self = this, names = policyHosts(this.policyInputs.domains.value), exclusions = policyHosts(this.policyInputs.exclusions.value);
-  var excluded = policyMatches(domain, exclusions), dynamic = policyMatches(domain, this.dynamicDomainRules());
-  var included = policyMatches(domain, names) || dynamic;
-  return E('div', {}, [ E('div', { 'class': 'pa-domain-rule' }, '草稿 · ' +
-   (excluded ? '排除清单 / 原有策略' : dynamic ? '动态匹配 / 所选节点' : included ? '代理清单 / 所选节点' : '沿用原有策略')),
-   E('div', { 'class': 'pa-domain-row-actions' }, [['domains', '加入代理'], ['exclusions', '加入排除']].map(function(item) {
-    var chosen = item[0] === 'domains' ? included && !excluded : excluded;
-    var disabled = self.readonly || self.policyPending || self.pending || !!(self.latest.job || {}).busy || chosen || !validHost(domain);
+  var self = this, names = policyHosts(this.policyInputs.domains.value), direct = policyHosts(this.policyInputs.exclusions.value);
+  var excluded = policyMatches(domain, direct), included = policyMatches(domain, names);
+  return E('div', {}, [ E('div', { 'class': 'pa-domain-rule' }, (Object.keys(this.policyTouched).length ? '草稿 · ' : '本机名单 · ') +
+   (excluded ? '直连名单' : included ? '代理名单' : 'PassWall 默认策略')),
+   E('div', { 'class': 'pa-domain-row-actions' }, [['domains', '加入代理'], ['remove', '移出代理']].map(function(item) {
+    var chosen = item[0] === 'domains' ? included && !excluded : excluded && names.indexOf(domain) < 0;
+    var disabled = self.readonly || self.policyPending || self.pending || !!(self.latest.job || {}).busy ||
+     !(self.policyData || {}).available || !!self.policyRequest || chosen || !validHost(domain);
     var button = E('button', { type: 'button', 'class': buttonClass(), click: function() {
-     self.addDomainToPolicy(domain, item[0]);
-    } }, chosen ? (item[0] === 'domains' ? '已覆盖代理' : '已加入排除') : item[1]);
+     if (item[0] === 'remove') self.removeDomainFromPolicy(domain);
+     else self.addDomainToPolicy(domain, item[0]);
+    } }, chosen ? (item[0] === 'domains' ? '已加入代理' : '已转为直连') : item[1]);
     button.disabled = !!disabled; button.dataset.chosen = String(chosen); button.dataset.domain = domain;
     self.domainActionButtons.push(button); return button;
    })) ]);
- },
-
- addSuggestedDomains: function() {
-  var self = this;
-  if (this.readonly || this.policyPending || this.pending || !!(this.latest.job || {}).busy) return Promise.resolve();
-  return this.refreshDomains(true, true).then(function(data) {
-   if (!data) { self.policyCandidateSummary.textContent = '域名候选读取待确认，请重新读取。'; return; }
-   if (self.readonly || self.policyPending || self.pending || !!(self.latest.job || {}).busy) return;
-   var hosts = policyHosts(self.policyInputs.domains.value), excluded = policyHosts(self.policyInputs.exclusions.value);
-   var covered = hosts.concat(self.dynamicDomainRules());
-   var additions = ((self.domainData || {}).candidates || []).filter(function(row) { return row.suggestion === 'proxy'; }).map(function(row) { return row.domain; }).filter(function(host, index, all) {
-    return validHost(host) && !policyMatches(host, excluded) && !policyMatches(host, covered) && all.indexOf(host) === index;
-   });
-   if (hosts.length + additions.length > 32) {
-    self.policyCandidateSummary.textContent = '必要候选共 ' + additions.length + ' 项，合并后超过 32 项；从日志逐项整理。'; return;
-   }
-   if (additions.length) {
-    self.policyInputs.domains.value = hosts.concat(additions).join('\n');
-    self.policyTouched.domains = true; self.invalidatePolicy();
-    self.policyConfigNotice.textContent = self.policyDraftState.textContent = '必要域名已加入草稿，保存并生成新预览后应用。';
-   }
-   self.policyCandidateSummary.textContent = additions.length ? '已加入 ' + additions.length + ' 个完整主机名：' + additions.join('、') :
-    '当前认证、信令与连通探测候选均已覆盖；排除清单继续生效。';
-   if (self.domainData) self.renderDomains(self.domainData);
-  });
  },
 
  saveLogging: function(feature) {
@@ -547,7 +613,7 @@ return view.extend({
   this.incidentPending = true; this.update(this.latest);
   return rpcRequest(function() { return callIncident(self.incidentNote.value.trim() || 'Portal 连接失败'); }).then(function(data) {
    self.incidentId = data.id;
-   self.selectStage('proxy', 'logs'); self.selectLogTab('domains');
+   self.selectTab('monitor');
    self.incidentNotice.textContent = '已标记 ' + localTime(data.time) + '，正在收集后 15 秒的观测证据。';
    return self.refreshDomains(true);
   }).catch(function(error) {
@@ -556,11 +622,12 @@ return view.extend({
  },
 
  renderDomains: function(data) {
-  var self = this, observer = data.observer || {}, rows = data.domains || [];
+  if (this.domainSelectionPending) return;
+  var self = this, observer = data.observer || {}, rows = data.domains || [], batch = data.batch;
   this.domainActionButtons = [];
   var names = { observing: observer.fresh ? '正在观察设备域名' : '观察状态待确认',
    disabled: '域名记录已关闭', waiting: '等待设备配对与网桥就绪', stopped: '观察服务已停止' };
-  this.domainState.textContent = (names[observer.state] || '等待观察服务') + ' · 已记录 ' + rows.length + ' 个设备域名' +
+  this.domainState.textContent = (names[observer.state] || '等待观察服务') + ' · 保留 ' + (data.batches || []).length + ' 个连接批次' +
    (data.logging && data.logging.tag ? ' · 标记：' + data.logging.tag : '') +
    (observer.error ? '。' + observer.error : '');
   var health = observer.health || {}, io = observer.observability || {};
@@ -568,9 +635,49 @@ return view.extend({
    ' · 限速舍弃 ' + Number(observer.rate_drops || 0) + ' · 缓存舍弃 ' + Number(health.capacity_drops || 0) +
    ' · 解析舍弃 ' + Number(health.malformed || 0) + ' · 报文截断 ' + Number(health.snaplen_limited || 0) +
    ' · 合并重复 ' + Number(health.suppressed_events || 0) + ' · 写入错误 ' + Number(io.write_errors || 0) +
-   (observer.snapshot_truncated ? ' · 部分历史上下文已精简' : '') +
+   (observer.snapshot_truncated || batch && batch.truncated ? ' · 部分历史上下文已精简' : '') +
    (io.last_error ? '。' + io.last_error : '。');
-  var incidentChoices = [{value:'', label:'当前域名清单'}].concat((data.incidents || []).map(function(item) {
+  var allNames = domainNames(rows, false), failedNames = domainNames(rows, true);
+  this.batchTitle.textContent = this.batchId === 'inventory' ? '历史累计清单' : batch ? localTime(batch.time) : '等待首个连接批次';
+  this.batchSummary.textContent = batch ?
+   ({collecting:'本批次正在采集', archived:'本批次已归档', pending:'本批次正在准备采集'}[batch.state] || '本批次记录') +
+    ' · ' + allNames.length + ' 个域名 · ' + failedNames.length + ' 个失败解析域名' +
+    (batch.ended_at ? ' · 结束 ' + localTime(batch.ended_at) : '') +
+    (batch.truncated ? '。记录容量已达上限，明细优先保留异常。' : '') :
+   this.batchId === 'inventory' ? '展示已保存的累计域名与解析证据。' : '由 Portal 或 PS5 发起连接，域名活动会自动创建批次。';
+  var totals = batch && batch.traffic || {}, unknown = batch && batch.unattributed_traffic || {};
+  var totalProxy = Number(totals.proxy_upload_bytes || 0) + Number(totals.proxy_download_bytes || 0);
+  this.batchTrafficSummary.replaceChildren.apply(this.batchTrafficSummary, [
+   ['核心上传', totals.upload_bytes], ['核心下载', totals.download_bytes], ['代理累计', totalProxy],
+   ['代理采样速率', totals.fresh ? totals.proxy_rate : null]
+  ].map(function(item, index) {
+   return E('div', {}, [E('b', {}, item[0]), E('span', {},
+    totals.sampled ? item[1] !== null ? formatBytes(item[1]) + (index === 3 ? '/s' : '') : '—' : '等待样本')]);
+  }));
+  this.domainTrafficNotice.textContent = (observer.traffic || {}).limit || '流量按本批次累计，来源为本机已有连接统计接口。设备直达流量与短连接影响覆盖。';
+  this.domainTrafficNotice.textContent +=
+   (batch && batch.state === 'collecting' && (observer.traffic || {}).state === 'waiting' ? ' 当前等待核心流量样本。' : '') +
+   (totals.sampled && !totals.fresh ? ' 当前显示已保存的采样累计。' : '') +
+   (totals.coverage_limited ? ' 部分连接以首个采样值为起点；短连接或采样中断会影响覆盖。' : '');
+  var unknownProxy = Number(unknown.proxy_upload_bytes || 0) + Number(unknown.proxy_download_bytes || 0);
+  this.domainTrafficUnassigned.textContent = unknownProxy ? '域名归属待确认的代理流量 · ' + formatBytes(unknownProxy) + '，已计入本批次合计。' : '';
+  if (batch && batch.traffic_details_trimmed) this.domainTrafficUnassigned.textContent += ' 精简域名明细涉及的流量保留在批次合计中。';
+  this.domainTrafficUnassigned.setAttribute('data-error', String(unknownProxy >= largeProxyBytes));
+  this.domainNavNode.textContent = (data.batches || []).length + ' 个批次 · ' + (observer.state === 'observing' ? '采集中' : '已保存记录');
+  var batchChoices = [{value:'', label:'最近连接批次 · 自动跟随'}].concat((data.batches || []).map(function(item) {
+   return {value:item.id, label:localTime(item.time) + ' · ' + item.domain_count + ' 个域名 / ' + item.failed_count + ' 个失败',
+    detail: (item.state === 'collecting' ? '采集中' : item.state === 'pending' ? '准备采集' : '已归档') +
+     (item.traffic && item.traffic.sampled ? ' · 代理 ' + formatBytes(Number(item.traffic.proxy_upload_bytes || 0) + Number(item.traffic.proxy_download_bytes || 0)) : '')};
+  }));
+  if (data.inventory_count) batchChoices.push({value:'inventory', label:'历史累计清单', detail:'跨批次保存的域名记录'});
+  this.batchSelect.choicePicker.setOptions(batchChoices);
+  this.batchSelect.choicePicker.setValue(this.batchId || '');
+  this.domainAllButton.textContent = '全部域名 ' + allNames.length;
+  this.domainFailedButton.textContent = '失败解析 ' + failedNames.length;
+  this.domainAllButton.setAttribute('aria-pressed', String(!this.domainOnlyProblems.checked));
+  this.domainFailedButton.setAttribute('aria-pressed', String(this.domainOnlyProblems.checked));
+  this.updateDomainControls();
+  var incidentChoices = [{value:'', label:'选择历史失败回溯'}].concat((data.incidents || []).map(function(item) {
    return {value:item.id, label:localTime(item.time) + ' · ' + item.note};
   }));
   this.incidentSelect.choicePicker.setOptions(incidentChoices);
@@ -578,28 +685,75 @@ return view.extend({
   var search = this.domainSearch.value.trim().toLowerCase();
   var filtered = rows.filter(function(row) {
    return (!search || (row.domain || '').indexOf(search) >= 0) &&
-    (!self.domainOnlyProblems.checked || row.last_problem);
+    (!self.domainOnlyProblems.checked || dnsFailed(row)) &&
+    (!self.domainOnlyProxy.checked || proxyRelated(row)) &&
+    (!self.domainOnlyLargeProxy.checked || rowBytes(row, true) >= largeProxyBytes);
+  });
+  filtered.sort(function(a, b) {
+   var sort = self.domainTrafficSort.value;
+   return (sort === 'recent' ? Number(b.last_epoch || 0) - Number(a.last_epoch || 0) :
+    rowBytes(b, sort === 'proxy') - rowBytes(a, sort === 'proxy')) ||
+    Number(b.last_epoch || 0) - Number(a.last_epoch || 0) || a.domain.localeCompare(b.domain);
   });
   var table = E('table', { 'class': 'table' }, [ E('thead', {}, E('tr', { 'class': 'tr' },
-   [ '设备 / 域名', '可见证据', '代理草稿', '最近出现' ].map(function(title) { return E('th', { 'class': 'th' }, title); }))),
-   E('tbody', {}, filtered.slice(0, 100).map(function(row) {
+   [ '设备 / 域名', '解析记录 / 地址', '本批次核心流量', '本批次代理流量', '透明代理清单', '最近出现' ].map(function(title) { return E('th', { 'class': 'th' }, title); }))),
+   E('tbody', {}, filtered.map(function(row) {
     var counts = row.counts || {}, observed = Object.keys(evidenceNames).filter(function(key) {
      return key !== 'new_domain' && counts[key];
     }).map(function(key) { return evidenceNames[key] + ' ' + counts[key]; });
-    var addresses = (row.addresses || []).map(function(item) { return item.address; }).join('、');
+    var addresses = (row.addresses || []).map(function(item) {
+     return item.address + (item.ttl !== undefined ? ' · TTL ' + item.ttl + ' 秒' : '');
+    }).join('\n');
+    var failed = dnsFailed(row);
+    var traffic = row.traffic || {}, proxyBytes = rowBytes(row, true);
+    var qtypes = (row.qtypes || []).map(function(value) { return ({1:'A',28:'AAAA',5:'CNAME',65:'HTTPS'}[value] || 'TYPE' + value); });
     return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td' }, [ E('div', { 'class': 'pa-domain-name', title: addresses },
      [ (row.device === 'ps5' ? 'PS5' : 'Portal') + ' · ' + row.domain,
       row.new_since_tag ? E('span', { 'class': 'pa-domain-new' }, '本轮新增') : E('span') ]),
      E('div', { 'class': 'pa-muted' }, row.category_label || '其他'),
      E('div', { 'class': 'pa-domain-time' }, '首次 ' + localTime(row.first_seen)) ]),
-     E('td', { 'class': 'td ' + (row.last_problem ? 'pa-domain-problem' : '') },
-      (row.last_problem ? evidenceNames[row.last_problem] + '。' : '') + (observed.join(' · ') || '首次可见')),
+     E('td', { 'class': 'td ' + (failed ? 'pa-domain-problem' : '') }, [
+      E('div', {}, (failed ? '本批次解析失败 ' + Number(row.dns_failures || (counts.dns_error || 0) + (counts.dns_timeout || 0) || 1) + ' 次。' : '') +
+       (observed.join(' · ') || '首次可见')),
+      qtypes.length ? E('div', { 'class': 'pa-caption' }, '查询类型 · ' + qtypes.join(' / ')) : E('span'),
+      row.last_rcode ? E('div', { 'class': 'pa-caption' }, '失败响应 · ' +
+       ({2:'SERVFAIL',3:'NXDOMAIN',5:'REFUSED'}[row.last_rcode] || 'DNS ' + row.last_rcode)) : E('span'),
+      addresses ? E('div', { 'class': 'pa-domain-time', style: 'white-space:pre-wrap' }, addresses) : E('span') ]),
+     E('td', { 'class': 'td pa-domain-total', 'data-title': '本批次核心流量' }, [
+      E('div', { 'class': 'pa-traffic-value' }, traffic.sampled ? formatBytes(rowBytes(row, false)) : '等待样本'),
+      traffic.sampled ? E('div', { 'class': 'pa-domain-time' }, '↑ ' + formatBytes(traffic.upload_bytes) + ' · ↓ ' + formatBytes(traffic.download_bytes)) : E('span'),
+      Number(traffic.direct_upload_bytes || 0) + Number(traffic.direct_download_bytes || 0) ? E('div', { 'class': 'pa-domain-time' },
+       '直连累计 · ' + formatBytes(Number(traffic.direct_upload_bytes || 0) + Number(traffic.direct_download_bytes || 0))) : E('span'),
+      traffic.fresh ? E('div', { 'class': 'pa-domain-time' }, '采样 ' + formatBytes(Number(traffic.upload_rate || 0) + Number(traffic.download_rate || 0)) + '/s') : E('span'),
+      traffic.coverage_limited ? E('div', { 'class': 'pa-domain-time' }, '部分采样') : E('span') ]),
+     E('td', { 'class': 'td pa-domain-proxy ' + (proxyBytes >= largeProxyBytes ? 'pa-domain-heavy' : ''), 'data-title': '本批次代理流量' }, [
+      E('div', { 'class': 'pa-traffic-value' }, traffic.sampled ? formatBytes(proxyBytes) : '等待样本'),
+      traffic.has_proxy ? E('div', { 'class': 'pa-domain-time' }, '↑ ' + formatBytes(traffic.proxy_upload_bytes) + ' · ↓ ' + formatBytes(traffic.proxy_download_bytes)) : E('span'),
+      traffic.has_proxy ? E('div', { 'class': 'pa-domain-time' }, '本批次曾走代理') :
+       traffic.proxy_rules_seen ? E('div', { 'class': 'pa-domain-time' }, '本批次曾在代理名单') : E('span'),
+      traffic.last_route && traffic.last_route !== 'unknown' ? E('div', { 'class': 'pa-domain-time' },
+       (traffic.fresh ? '当前出口 · ' : '最近出口 · ') + ({proxy:'PassWall 代理',selected:'代理',previous:'此前代理',other_proxy:'PassWall 代理',direct:'直连',original:'PassWall 默认策略'}[traffic.last_route] || '待确认')) : E('span'),
+      traffic.fresh ? E('div', { 'class': 'pa-domain-time' }, '代理连接 ' + Number(traffic.proxy_active_connections || 0) + ' · ' + formatBytes(traffic.proxy_rate) + '/s') : E('span'),
+      proxyBytes >= largeProxyBytes ? E('strong', {}, '代理大流量 ≥100 MiB') : E('span') ]),
      E('td', { 'class': 'td' }, self.domainRuleActions(row.domain)),
      E('td', { 'class': 'td pa-domain-time' }, localTime(row.last_seen)) ]);
    })) ]);
   this.domainList.replaceChildren(filtered.length ? table : E('div', { 'class': 'pa-domain-empty' },
-   rows.length ? '当前筛选条件下暂无记录。' : '完成设备配对后，由 PS5 或 Portal 发起连接，域名记录会显示在这里。'));
-  this.domainCount.textContent = filtered.length > 100 ? '显示最近 100 项，共 ' + filtered.length + ' 项；输入域名缩小范围。' : '';
+   rows.length ? '当前筛选条件下暂无记录。' : '完成设备配对后，由 PS5 或 Portal 发起本次连接，解析记录会显示在这里。'));
+  this.domainCount.textContent = '显示 ' + filtered.length + ' 项设备域名；复制按当前所选批次去重，覆盖完整清单。';
+  this.domainEvents.textContent = (batch && batch.events || []).filter(function(event) {
+   return (!search || (event.domains || []).some(function(name) { return name.indexOf(search) >= 0; })) &&
+    (!self.domainOnlyProblems.checked || event.kind === 'dns_error' || event.kind === 'dns_timeout' || event.dns_unreachable);
+  }).map(function(event) {
+   return localTime(event.time) + ' ' + (event.device === 'ps5' ? 'PS5' : 'Portal') + ' ' +
+    (evidenceNames[event.kind] || event.kind) + ' ' + (event.domains || []).join(' → ') +
+    (event.qtype ? ' · ' + ({1:'A',28:'AAAA',65:'HTTPS'}[event.qtype] || 'TYPE' + event.qtype) : '') +
+    (event.rcode ? ' · ' + ({2:'SERVFAIL',3:'NXDOMAIN',5:'REFUSED'}[event.rcode] || 'DNS ' + event.rcode) : '') +
+    (event.address ? ' · ' + event.address : '') +
+    ((event.addresses || []).length ? ' · ' + event.addresses.map(function(value) {
+     return value.address + ' (TTL ' + value.ttl + ' 秒)';
+    }).join('、') : '') + (event.retries ? ' · 重试 ' + event.retries + ' 次' : '');
+  }).join('\n') || '本批次暂无当前筛选范围内的解析明细。';
   var selected = data.selected, evidence = selected && selected.evidence;
   this.incidentPanel.hidden = !selected;
   if (selected) {
@@ -629,7 +783,7 @@ return view.extend({
    var coreEvidence = selected.core_evidence || {};
    if ((coreEvidence.connections || []).length) this.incidentEvents.textContent += '\n\n核心连接证据：\n' + coreEvidence.connections.map(function(row) {
     return (row.device === 'ps5' ? 'PS5' : 'Portal') + ' ' + row.domain + ' · ' + row.phase +
-     ' · ' + ({selected:'所选节点',direct:'原有直连',original:'原有出口'}[row.route] || '出口待确认') +
+     ' · ' + ({proxy:'PassWall 代理',selected:'代理',direct:'直连',original:'PassWall 默认策略'}[row.route] || '出口待确认') +
      (row.failure ? ' · 上游响应待检查' : '');
    }).join('\n');
   }
@@ -643,12 +797,8 @@ return view.extend({
    self.connectionError = null;
    self.update(Object.assign({}, self.latest, data));
    if (!self.detailsKnown || self.detailsRevision !== data.details_revision) self.refreshDetails();
-   self.refreshLogs(); self.refreshDevices();
-   var job = data.job || {};
-   if (job.action && job.action.indexOf('psportal_') === 0 && job.action !== 'psportal_probe' && !job.busy && self.policyJob !== job.id) {
-    self.policyJob = job.id; self.policyTouched = {}; self.policyPlan = null;
-    self.refreshPolicy(true);
-   } else self.refreshPolicy();
+   self.refreshLogs(); self.refreshDevices(); self.refreshDomains();
+   self.refreshPolicy();
   }).catch(function(error) {
    self.connectionError = error.message;
    self.update(self.latest);
@@ -718,7 +868,8 @@ return view.extend({
   }, this);
   if (focus) this.mainTabs[name].focus();
   if (name === 'devices') this.refreshDevices(true);
-  if (name === 'proxy') this.refreshPolicy(true);
+  if (name === 'proxy' || name === 'monitor') this.refreshPolicy(true);
+  if (name === 'monitor') this.refreshDomains(true);
   this.refreshLogs();
  },
 
@@ -739,326 +890,159 @@ return view.extend({
 
  policyValues: function() {
   var self = this;
-  var selectors = this.deviceSelectors();
-  return policyFields.map(function(key) { return key === 'portal' || key === 'ps5' ? selectors[key] : self.policyInputs[key].value.trim(); });
+  return policyFields.map(function(key) { return self.policyInputs[key].value; }).concat([this.policyRevision || '']);
+ },
+
+ reloadPolicyLists: function() {
+  var self = this;
+  if (this.policyPending || this.pending || (this.latest.job || {}).busy) return Promise.resolve();
+  if (this.policyRequest) return this.policyRequest.then(function() { return self.reloadPolicyLists(); });
+  this.policyTouched = {}; this.policyConflict = false;
+  this.policyConfigNotice.textContent = this.policyDraftState.textContent = '';
+  return this.refreshPolicy(true);
  },
 
  refreshPolicy: function(force) {
   if (this.policyRequest) return this.policyRequest;
-  if ((!force && this.activeTab !== 'proxy') || this.policyPending) return Promise.resolve();
+  if ((!force && this.activeTab !== 'proxy' && this.activeTab !== 'monitor') || this.policyPending) return Promise.resolve();
   if (!force && Date.now() < (this.nextPolicyRead || 0)) return Promise.resolve();
+  this.nextPolicyRead = Date.now() + 12000;
   var self = this;
-  this.nextPolicyRead = Date.now() + 10000;
   this.policyRequest = rpcRequest(callPolicyStatus).then(function(data) {
    self.policyData = data; self.policyEnvironmentError = false;
-   if (self.deviceData) self.deviceData.proxy_enabled = !!data.enabled;
-   if ((data.blockers || []).length && self.policyPlan) self.invalidatePolicy();
-   var config = data.config || {}, environment = data.environment || {}, active = data.active_config || {};
-   var state = (data.receipt || {}).state === 'recovery_required' ? 'PassWall 恢复待检查' : data.enabled ?
-    (environment.attached_cores ? '规则已载入' : '已启用 · 等待入口加载') : '已停用';
-   self.policyState.textContent = self.proxyNavNode.textContent = state;
-   self.policyEnvironment.textContent = 'PassWall ' + (environment.passwall || '待确认') +
-    ' · Sing-box ' + (environment.singbox || '待确认') + ' · 活动入口 ' + Number(environment.active_cores || 0);
-   self.policyRequirements.textContent = (data.blockers || []).join('；');
-   self.policyBlockers.textContent = data.node_error ? '节点读取失败。请在 PassWall 中确认节点已保存，再点击“刷新节点”。' :
-    (data.blockers || [])[0] || '';
-   self.policyCoverage.textContent = ((data.entry_scope || {}).notices || []).join('；');
-   self.renderProxyTelemetry(data);
-   var selected = self.policyTouched.node ? self.policyInputs.node.value : config.node || '';
-   self.policyNodePicker.setOptions((data.nodes || []).map(function(node) {
-    return {value:node.id, label:node.label, detail:node.reason || node.protocol,
-     available:node.available !== false};
-   }));
-   self.policyNodePicker.setValue(selected);
-   var usable = (data.nodes || []).filter(function(node) { return node.available !== false; }).length;
-   self.policyNodeState.textContent = data.node_error ? '节点读取失败，详情见日志与诊断。' : ((data.nodes || []).length ?
-    '本地 ' + data.nodes.length + ' 个节点 · 可用 ' + usable + ' 个' : '本机 PassWall 节点清单为空，请刷新节点。');
-   self.policyNodeState.setAttribute('data-error', String(!!data.node_error));
-   self.policyAutostart.checked = data.autostart !== false;
-   policyFields.forEach(function(key) {
-    if (key !== 'portal' && key !== 'ps5' && !self.policyTouched[key] && typeof config[key] === 'string')
-     self.policyInputs[key].value = config[key];
-   });
-   var selectors = self.deviceSelectors();
-   self.policyInputs.portal.value = selectors.portal; self.policyInputs.ps5.value = selectors.ps5;
-   var sources = data.sources || {};
-   self.policySourceState.textContent = '当前规则来源 · Portal ' + ((sources.portal || []).join(' / ') || '等待当前地址') +
-    '；PS5 ' + ((sources.ps5 || []).join(' / ') || '等待当前地址');
-   var activeNode = (data.nodes || []).filter(function(node) { return node.id === active.node; })[0];
-   self.policyActiveNode.textContent = data.enabled ? activeNode && activeNode.label || active.node || '待确认' : '等待启用';
-   self.policyActiveDomains.textContent = data.enabled ? policyHosts(active.domains).length + ' 条配置 + ' +
-    self.dynamicDomainRules().length + ' 条动态规则' : '等待启用';
-   self.policyDynamicRules.textContent = '内置动态认证 / 信令规则 · ' + self.dynamicDomainRules().join('、');
-   self.policyAppliedTime.textContent = (data.receipt || {}).time ? localTime(data.receipt.time * 1000) : '等待应用';
-   self.policyRuntimeSummary.textContent = data.enabled ?
-    '透明代理已启用。重新连接 Portal，日志会显示设备使用的节点与连接结果。' :
-    '选择本地节点并启用透明代理，连接记录会显示在这里。';
-   self.policyDraftState.textContent = Object.keys(self.policyTouched).length ? '配置已调整，点击启用或应用修改。' :
-    data.enabled && ['node', 'domains', 'ports', 'exclusions'].some(function(key) { return config[key] !== active[key]; }) ?
-     '新配置已保存，点击应用修改使其生效。' : data.enabled ? '当前配置已生效。' : '选择节点后即可启用。';
-   if (!self.policyPlan) self.policyButtons.apply.textContent = data.enabled ? '更新透明代理' : '启用透明代理';
+   var environment = data.environment || {}, config = data.config || {}, receipt = data.receipt || {};
+   self.policyState.textContent = self.proxyNavNode.textContent = !data.available ? '等待本机 PassWall' :
+    data.running && data.enabled ? 'PassWall 正在运行' : data.enabled ? '运行状态待确认' : 'PassWall 已关闭';
+   self.policyEnvironment.textContent = '当前核心 · ' + ((environment.cores || []).join(' / ') || '由 PassWall 当前配置决定');
+   self.policyRequirements.textContent = (data.warnings || []).join('；');
+   self.policyBlockers.textContent = (data.blockers || []).join('；');
+   self.policyBlockers.hidden = !self.policyBlockers.textContent;
+   var touched = Object.keys(self.policyTouched).length;
+   if (!touched && data.available) {
+    policyFields.forEach(function(key) { self.policyInputs[key].value = typeof config[key] === 'string' ? config[key] : ''; });
+    self.policyRevision = data.revision; self.policyConflict = false;
+   } else if (touched && data.available) {
+    self.policyConflict = self.policyRevision !== data.revision;
+   }
+   if (self.policyConflict) {
+    self.policyConfigNotice.textContent = '本机名单已发生外部修改，当前编辑已保留。点击“重新读取本机名单”后整理并保存。';
+    self.policyConfigNotice.setAttribute('data-error', 'true');
+   }
+   self.policyFileCounts.textContent = '本机名单 · 代理 ' + Number((data.counts || {}).domains || 0) +
+    ' 个域名 · 直连 ' + Number((data.counts || {}).exclusions || 0) + ' 个域名';
+   var switches = data.switches || {};
+   self.policyCoverage.textContent = '名单按 PassWall 当前客户端及 ACL 接管范围生效。代理名单开关 · ' +
+    (switches.proxy_list_enabled ? '开启' : '关闭') + '；直连名单开关 · ' + (switches.direct_list_enabled ? '开启' : '关闭') + '。';
+   self.policyPendingState.textContent = data.config_source === 'migration' ? '旧域名已整理为待保存草稿' :
+    data.pending_apply ? '名单文件存在待加载修改，点击保存并应用。' : '沿用本机 PassWall 的名单与加载状态。';
+   self.policyDraftState.textContent = touched ? '名单草稿正在编辑，保存并应用后生效。' :
+    data.config_source === 'migration' ? '检查迁移后的域名名单，再保存并应用。' : '';
+   self.policyRulesPath.textContent = '名单目录 · ' + (environment.rules_path || '待确认');
+   self.policyAppliedTime.textContent = receipt.applied_at ? '最近应用 · ' + localTime(receipt.applied_at * 1000) : '应用状态由本机 PassWall 管理';
+   var telemetry = data.telemetry || {};
+   self.policyCoreSummary.textContent = telemetry.fresh && telemetry.sampled_cores ?
+    '域名流量正在按批次采样，详情见域名监控。' : telemetry.limit || '域名流量等待本机可用的连接统计接口。';
+   if ((telemetry.errors || []).length) self.policyCoreSummary.textContent += ' ' + telemetry.errors.join('；');
    if (self.domainData) self.renderDomains(self.domainData);
-   self.update(self.latest);
   }).catch(function(error) {
-   self.policyEnvironmentError = true; self.invalidatePolicy();
-   self.policyState.textContent = self.proxyNavNode.textContent = '状态待确认';
-   self.policyBlockers.textContent = '代理环境读取失败：' + error.message; self.policyBlockers.hidden = false;
-   self.policyNodeState.textContent = '节点读取失败：' + error.message;
-   self.updatePolicyControls();
+   self.policyEnvironmentError = true;
+   self.policyState.textContent = self.proxyNavNode.textContent = '名单读取待确认';
+   self.policyBlockers.textContent = '本机名单读取失败：' + error.message; self.policyBlockers.hidden = false;
   }).finally(function() { self.policyRequest = null; self.updatePolicyControls(); });
   return this.policyRequest;
- },
-
- renderProxyTelemetry: function(data) {
-  var telemetry = data.telemetry || {}, probes = data.probes || {};
-  this.policyCoreSummary.textContent = telemetry.fresh && telemetry.sampled_cores ?
-   '当前所选节点正在处理 ' + Number(telemetry.matched_connections || 0) + ' 条设备连接。' :
-   data.enabled ? '等待设备连接。重新连接 Portal 后，可查看使用的节点与连接结果。' : '启用透明代理后，设备连接与异常会显示在日志中。';
-  if ((telemetry.errors || []).length) this.policyCoreSummary.textContent += '。' + telemetry.errors.join('；');
-  var phases = {AUTH:'认证连接',SIGNALING:'信令连接',CONNECTED:'连接传输',DISCONNECTED:'连接结束'};
-  var routes = {selected:'所选节点',previous:'此前节点',direct:'原有直连',original:'原有出口',unknown:'出口待确认'};
-  var rows = (telemetry.connections || []).slice(0, 10).map(function(row) {
-   return E('tr', { 'class': 'tr' }, [
-    E('td', { 'class': 'td' }, [(row.device === 'ps5' ? 'PS5' : 'Portal') + ' · ', E('span', { 'class': 'pa-domain-name' }, row.domain || row.address)]),
-    E('td', { 'class': 'td' }, phases[row.phase] || row.phase),
-    E('td', { 'class': 'td' }, routes[row.route] || '出口待确认'),
-    E('td', { 'class': 'td' }, row.failure ? '上游响应待检查' :
-     '↑ ' + Math.round(Number(row.bytes_up || 0) / 1024) + ' KB / ↓ ' + Math.round(Number(row.bytes_down || 0) / 1024) + ' KB')]);
-  });
-  this.policyConnections.replaceChildren(rows.length ? E('table', { 'class': 'table' }, [
-   E('thead', {}, E('tr', { 'class': 'tr' }, ['设备 / 域名','推断阶段','实际出口','传输 / 异常'].map(function(label) {
-    return E('th', { 'class': 'th' }, label);
-   }))), E('tbody', {}, rows)]) : E('p', { 'class': 'pa-caption' }, '新的设备连接将在这里显示；阶段依据域名与核心记录推断。'));
-  this.policyProbeState.textContent = probes.epoch ? '最近检测 ' + localTime(probes.epoch * 1000) +
-   (probes.cancelled ? ' · 检测已取消' : probes.current_config === false ? ' · 此前配置检测，重新检测当前出口' :
-    probes.healthy ? ' · 节点连接正常' : ' · 部分连接失败，请查看下方检测结果') : '连接异常时可点击“检测连接”，检查节点是否可用。';
-  this.policyProbeResults.replaceChildren.apply(this.policyProbeResults, (probes.targets || []).map(function(row) {
-   var parts = ['路由器 DNS ' + (row.dns && row.dns.ok ? '通过' : '待检查'), '目标 TCP ' + (row.tcp ? '通过' : '待检查')];
-   if (row.tls !== null) parts.push('TLS ' + (row.tls ? '通过' : '待检查'));
-   var failures = {target_connect_failure:'目标连接失败',probe_entry_failure:'检测入口待检查',tls_failure:'TLS 握手失败',certificate_validation:'证书校验失败'};
-   return E('p', { 'class': 'pa-caption' }, [(row.category_label || '') + ' · ', E('span', { 'class': 'pa-domain-name' }, row.domain),
-    ' · ' + (probes.current_config === false ? '此前配置出口' : row.path === 'direct' ? '直连' : '所选节点') + ' · ' + parts.join(' / '),
-    row.failure ? ' · ' + (failures[row.failure] || '检查连接') : '']);
-  }));
  },
 
  updatePolicyControls: function() {
   if (!this.policyButtons) return;
   var job = ((this.latest || {}).job || {});
   var busy = !!this.policyPending || !!this.pending || !!job.busy;
-  var showPrerequisite = !!this.policyBlockers.textContent && !busy && this.policyNotice.dataset.error !== 'true';
-  this.policyBlockers.hidden = !showPrerequisite;
-  this.policyNotice.hidden = showPrerequisite;
-  var selectors = this.deviceSelectors(), ready = !!selectors.portal && !!selectors.ps5 &&
-   this.latest.devices_configured !== false;
-  this.policyButtons.preview.disabled = busy || !ready;
-  var node = ((this.policyData || {}).nodes || []).filter(function(item) { return item.id === this.policyInputs.node.value; }, this)[0];
-  this.policyButtons.enable.disabled = this.readonly || busy || !ready || !node || node.available === false || !!this.policyEnvironmentError;
-  this.policyButtons.enable.textContent = (this.policyData || {}).enabled ? '应用修改' : '启用透明代理';
-  this.policyAutostart.disabled = this.readonly || busy || !!this.policyEnvironmentError;
-  this.policyNodeRefresh.disabled = !!this.policyRequest;
-  this.policyButtons.save.disabled = this.readonly || busy || !ready;
-  this.policyButtons.apply.disabled = this.readonly || busy || !!this.policyEnvironmentError || !this.policyPlan ||
-   !this.policyPlan.can_apply || (this.policyPlan.restart_required && !this.policyConfirm.checked);
-  this.policyButtons.disable.disabled = this.readonly || busy || !(this.policyData || {}).enabled;
-  this.policyButtons.probe.disabled = this.readonly || busy || !(this.policyData || {}).enabled;
-  this.policyButtons.candidates.disabled = this.readonly || busy || !ready;
-  this.policyButtons.disable.hidden = !(this.policyData || {}).enabled;
-  this.policyButtons.cancel.hidden = !job.busy || jobFeature(job.action) !== 'proxy';
-  this.policyButtons.cancel.disabled = this.readonly || this.pendingAction === 'stop' ||
-   !job.busy || jobFeature(job.action) !== 'proxy';
-  policyFields.forEach(function(key) { this.policyInputs[key].disabled = this.readonly || busy; }, this);
-  this.policyNodePicker.sync();
-  this.policyConfirm.disabled = this.readonly || busy;
+  var ready = !!(this.policyData || {}).available && !!this.policyRevision && !this.policyEnvironmentError;
+  this.policyButtons.save.disabled = this.policyButtons.apply.disabled = this.readonly || busy || !ready || !!this.policyConflict;
+  this.policyButtons.reload.disabled = busy || !!this.policyRequest;
+  this.policyButtons.cancel.hidden = !job.busy || job.action !== 'psportal_apply';
+  this.policyButtons.cancel.disabled = this.readonly || this.pendingAction === 'stop' || !job.busy || job.action !== 'psportal_apply';
+  policyFields.forEach(function(key) { this.policyInputs[key].disabled = this.readonly || busy || !ready; }, this);
   (this.domainActionButtons || []).forEach(function(button) {
-   button.disabled = this.readonly || busy || button.dataset.chosen === 'true' || !validHost(button.dataset.domain);
+   button.disabled = this.readonly || busy || !ready || !!this.policyRequest || this.domainSelectionPending ||
+    button.dataset.chosen === 'true' || !validHost(button.dataset.domain);
   }, this);
  },
 
  policyAction: function(name) {
-  if (name === 'cancel') {
-   if (!this.policyButtons.cancel.disabled) return this.run('stop');
-   return Promise.resolve();
-  }
-  if (this.policyPending || (this.readonly && name !== 'preview') || this.pending || !!(this.latest.job || {}).busy)
-   return Promise.resolve();
-  var self = this;
-  if (name === 'enable') {
-   if (this.policyButtons.enable.disabled) return Promise.resolve();
-   if (this.policyPlan && this.policyPlan.can_apply) {
-    if (this.policyPlan.restart_required && !this.policyConfirm.checked) {
-     this.policyNotice.textContent = '勾选重启确认后，再次点击启用。'; return Promise.resolve();
-    }
-    return this.policyAction('apply');
-   }
-   return this.policyAction('preview').then(function() {
-    if (self.policyPlan && self.policyPlan.can_apply) {
-     if (!self.policyPlan.restart_required) return self.policyAction('apply');
-     self.policyNotice.textContent = '本次启用需要重启 PassWall，勾选确认后再次点击启用。';
-    }
-   });
-  }
-  var values = this.policyValues(), operation;
-  if (name === 'autostart') {
-   var autostart = this.policyAutostart.checked ? 1 : 0;
-   operation = function() { return callPolicyAutostart(autostart); };
-  }
-  else
-  if (name === 'preview') operation = function() { return callPolicyPreview.apply(null, values); };
-  else if (name === 'save') operation = function() { return callPolicySave.apply(null, values); };
-  else if (name === 'disable') operation = callPolicyDisable;
-  else if (name === 'probe') operation = callPolicyProbe;
-  else {
-   if (!this.policyPlan || !this.policyPlan.can_apply || this.policyEnvironmentError ||
-       (this.policyPlan.restart_required && !this.policyConfirm.checked)) return Promise.resolve();
-   values = values.concat([ this.policyPlan.token, this.policyConfirm.checked ? 1 : 0 ]);
-   operation = function() { return callPolicyApply.apply(null, values); };
-  }
-  if (name === 'preview') { this.invalidatePolicy(); this.selectStage('proxy', 'runtime'); }
+  if (name === 'cancel') return !this.policyButtons.cancel.disabled ? this.run('stop') : Promise.resolve();
+  if (['save', 'apply'].indexOf(name) < 0 || this.policyButtons[name].disabled || this.policyPending ||
+      this.readonly || this.pending || !!(this.latest.job || {}).busy) return Promise.resolve();
+  var self = this, values = this.policyValues();
   this.policyPending = true; this.update(this.latest);
-  return rpcRequest(operation).then(function(result) {
-   if (name === 'preview') {
-    self.policyPlan = result; self.policyConfirm.checked = false;
-    self.policyConfirmation.hidden = !result.restart_required;
-    var previewSources = result.sources || {};
-    self.policyPreviewSources.textContent = '预览设备范围 · Portal ' + ((previewSources.portal || []).join(' / ') || '等待当前地址') +
-     '；PS5 ' + ((previewSources.ps5 || []).join(' / ') || '等待当前地址');
-    self.policyPreviewNotice.textContent = (result.notice || '') +
-     (result.validation ? '。保留 ' + Number(result.validation.protection_rules || 0) + ' 条原有直连 / 阻断保护条件。' : '') +
-     ' ' + (((result.entry_scope || {}).notices || []).join('；'));
-    self.policyPreviewBody.replaceChildren.apply(self.policyPreviewBody, (result.rules || []).concat((result.direct_rules || []).map(function(rule) {
-     return Object.assign({}, rule, { direct: true });
-    })).map(function(rule) {
-     return E('tr', { 'class': 'tr' }, [ E('td', { 'class': 'td' }, rule.domain + (rule.builtin ? ' · 内置动态' : '')),
-      E('td', { 'class': 'td' }, 'TCP ' + rule.ports),
-      E('td', { 'class': 'td' }, rule.direct ? '设备直连 · 原有阻断优先' : rule.excluded ? '排除清单 · 原有策略' :
-       '所选节点 · 排除 / 直连 / 阻断优先') ]);
-    }));
-    self.policyPreview.hidden = false;
-    self.policyNotice.textContent = (result.blockers || []).join('；') || '预览已生成，核对范围后启用透明代理。';
-    self.policyNotice.setAttribute('data-error', String(!result.can_apply));
-    self.policyButtons.apply.textContent = result.restart_required ? '应用并重启 PassWall' :
-     (self.policyData || {}).enabled ? '热更新配置' : '启用透明代理';
-   } else if (name === 'autostart') {
-    self.policyData = Object.assign({}, self.policyData, {autostart:result.autostart});
-    self.policyBootNotice.textContent = result.autostart ? '开机启用已开启' : '开机启用已关闭';
-    self.invalidatePolicy();
-   } else if (name === 'probe') {
-    self.policyNotice.textContent = '正在检测出口连通性，请等待检测结果。';
-    self.policyNotice.setAttribute('data-error', 'false');
-    self.selectStage('proxy', 'runtime');
-   } else {
-    self.invalidatePolicy();
-    self.policyNotice.textContent = self.policyConfigNotice.textContent = name === 'save' ?
-     '代理配置已保存，可直接启用。' : name === 'disable' ?
-      '正在停用透明代理，新连接将使用原有策略。' : '正在校验并启用透明代理，请等待任务完成。';
-    self.policyNotice.setAttribute('data-error', 'false');
-    self.policyConfigNotice.setAttribute('data-error', 'false');
-    if (name === 'save') self.policyTouched = {};
-    else self.selectStage('proxy', 'runtime');
+  return rpcRequest(function() { return (name === 'save' ? callPolicySave : callPolicyApply).apply(null, values); }).then(function(result) {
+   if (name === 'save') {
+    self.policyTouched = {}; self.policyConflict = false; self.policyRevision = result.revision;
+    policyFields.forEach(function(key) { self.policyInputs[key].value = result.config[key]; });
    }
+   self.policyNotice.textContent = self.policyConfigNotice.textContent = name === 'save' ? result.notice :
+    '正在保存并应用本机 PassWall 名单，请等待任务完成。';
+   self.policyNotice.setAttribute('data-error', 'false'); self.policyConfigNotice.setAttribute('data-error', 'false');
+   if (name === 'apply') self.selectStage('proxy', 'runtime');
   }).catch(function(error) {
    self.policyNotice.textContent = self.policyConfigNotice.textContent = error.message;
-   self.policyNotice.setAttribute('data-error', 'true');
-   self.policyConfigNotice.setAttribute('data-error', 'true');
-   if (name === 'autostart') self.policyAutostart.checked = (self.policyData || {}).autostart !== false;
-   if (name === 'apply') self.invalidatePolicy();
+   self.policyNotice.setAttribute('data-error', 'true'); self.policyConfigNotice.setAttribute('data-error', 'true');
   }).finally(function() {
    self.policyPending = false; self.update(self.latest);
-   if (name !== 'preview') { self.refreshPolicy(true); self.refresh(); }
+   self.refreshPolicy(true); self.refresh();
   });
  },
 
  renderPolicy: function() {
   var self = this;
   this.policyInputs = {}; this.policyButtons = {}; this.policyTouched = {};
-  this.policyInputs.portal = luciControl('input', { type: 'hidden' });
-  this.policyInputs.ps5 = luciControl('input', { type: 'hidden' });
   this.policyState = E('strong', { 'class': 'pa-status-pill' }, '正在读取');
   this.policyEnvironment = E('p', { 'class': 'pa-caption' });
-  this.policyRequirements = E('p', { 'class': 'pa-caption pa-domain-problem' });
-  this.policyBlockers = E('div', { 'class': 'pa-notice alert-message notice', role: 'status', 'data-error': 'true' });
-  this.policyNodeState = E('p', { 'class': 'pa-caption', role: 'status' });
-  this.policySourceState = E('p', { 'class': 'pa-caption' });
+  this.policyRequirements = E('p', { 'class': 'pa-caption', role: 'status' });
+  this.policyBlockers = E('div', { 'class': 'pa-notice alert-message notice', role: 'status', 'data-error': 'true', hidden: '' });
   this.policyCoverage = E('p', { 'class': 'pa-caption' });
   this.policyCoreSummary = E('p', { 'class': 'pa-caption', role: 'status' });
-  this.policyConnections = E('div', { 'class': 'pa-domain-table' });
-  this.policyProbeState = E('p', { 'class': 'pa-caption', role: 'status' });
-  this.policyProbeResults = E('div');
-  this.policyCandidateSummary = E('p', { 'class': 'pa-caption', role: 'status' });
-  this.policyRuntimeSummary = E('p', { 'class': 'pa-caption' });
+  this.policyFileCounts = E('p', { 'class': 'pa-caption' });
+  this.policyPendingState = E('p', { 'class': 'pa-caption' });
+  this.policyRulesPath = E('p', { 'class': 'pa-caption' });
+  this.policyAppliedTime = E('p', { 'class': 'pa-caption' });
   this.policyDraftState = E('p', { 'class': 'pa-caption' });
   this.policyConfigNotice = E('p', { 'class': 'pa-caption', role: 'status', 'aria-live': 'polite' });
-  this.policyNotice = E('div', { 'class': 'pa-notice alert-message notice', role: 'status', 'aria-live': 'polite' },
-   '选择节点后启用透明代理。');
-  this.policyActiveNode = E('span'); this.policyActiveDomains = E('span'); this.policyAppliedTime = E('span');
-  function field(key, label, input, help) {
+  this.policyNotice = E('div', { 'class': 'pa-notice alert-message notice', role: 'status', 'aria-live': 'polite' });
+  function field(key, label) {
+   var input = luciControl('textarea', { rows: 8, maxlength: 262144, spellcheck: 'false' });
    input.id = 'psa-policy-' + key; self.policyInputs[key] = input;
    function changed() {
-    self.policyTouched[key] = true; self.invalidatePolicy();
-    self.policyNotice.textContent = self.policyConfigNotice.textContent = self.policyDraftState.textContent =
-     '配置已调整，点击启用应用。';
+    self.policyTouched[key] = true;
+    self.policyConfigNotice.textContent = self.policyDraftState.textContent = '名单草稿已调整，保存并应用后生效。';
     self.policyConfigNotice.setAttribute('data-error', 'false');
+    self.updatePolicyControls();
     if (self.domainData) self.renderDomains(self.domainData);
    }
-   input.addEventListener('input', changed); input.addEventListener('change', changed); input.choiceChanged = changed;
-   return formField(input, label, help);
+   input.addEventListener('input', changed); input.addEventListener('change', changed);
+   return formField(input, label, '每行一个域名；保留现有注释及 geosite: 规则。');
   }
   function button(name, label, kind) {
-   var node = E('button', { type: 'button', 'class': buttonClass(kind),
-    click: function() { return self.policyAction(name); } }, label);
+   var node = E('button', { type: 'button', 'class': buttonClass(kind), click: function() {
+    return name === 'reload' ? self.reloadPolicyLists() : self.policyAction(name);
+   } }, label);
    self.policyButtons[name] = node; return node;
   }
-  var nodeInput = choiceControl(luciControl('input', { type: 'hidden' }), '选择代理节点', false);
-  this.policyNodePicker = nodeInput.choicePicker;
-  this.policyNodeRefresh = E('button', { type: 'button', 'class': buttonClass(),
-   click: function() { return self.refreshPolicy(true); } }, '刷新节点');
-  this.policyAutostart = luciControl('input', { type: 'checkbox', id: 'psa-policy-autostart',
-   change: function() { return self.policyAction('autostart'); } });
-  this.policyAutostart.checked = true;
-  this.policyBootNotice = E('p', { 'class': 'pa-caption', role: 'status' });
-  this.policyDynamicRules = E('p', { 'class': 'pa-caption' });
-  this.policyButtons.candidates = E('button', { type: 'button', 'class': buttonClass(),
-   click: function() { return self.addSuggestedDomains(); } }, '补齐必要域名');
-  this.policyConfirm = luciControl('input', { type: 'checkbox', id: 'psa-policy-confirm',
-   change: function() { self.updatePolicyControls(); } });
-  this.policyConfirmation = E('label', { 'class': 'pa-toggle', 'for': 'psa-policy-confirm', hidden: '' },
-   [ this.policyConfirm, '确认重启 PassWall，当前网络连接可能重连' ]);
-  this.policyPreviewSources = E('p', { 'class': 'pa-caption' });
-  this.policyPreviewNotice = E('p', { 'class': 'pa-caption' }); this.policyPreviewBody = E('tbody');
-  this.policyPreview = E('div', { hidden: '' }, [this.policyPreviewSources,
-   E('div', { 'class': 'pa-domain-table pa-policy-table' }, E('table', { 'class': 'table' }, [
-    E('thead', {}, E('tr', { 'class': 'tr' }, ['域名 / 匹配规则', '端口', '路径'].map(function(label) {
-     return E('th', { 'class': 'th' }, label);
-    }))), this.policyPreviewBody ])), this.policyPreviewNotice, button('apply', '应用已检查的配置') ]);
-  this.policyRules = E('details', { 'class': 'pa-disclosure' }, [E('summary', {}, '域名与端口'),
-   field('ports', 'TCP 端口', luciControl('input', { type: 'text', maxlength: 128, placeholder: '443' }), '默认 443'),
-   E('div', { 'class': 'pa-form' }, [
-    field('domains', '代理域名', luciControl('textarea', { rows: 5, maxlength: 8192, spellcheck: 'false' }), '每行一个域名或 *.example.com'),
-    field('exclusions', '排除域名', luciControl('textarea', { rows: 5, maxlength: 8192, spellcheck: 'false' })) ]),
-   E('p', { 'class': 'pa-caption' }, '已自动补充 PlayStation 认证、信令与连接域名。'),
-   this.policyCandidateSummary, this.policyButtons.candidates ]);
-  this.policyRules.open = true;
-  var config = this.panel('透明代理配置', [
-   E('div', { 'class': 'pa-node-row' }, [field('node', '代理节点', nodeInput), this.policyNodeRefresh]), this.policyNodeState,
-   this.policyRules, E('div', { 'class': 'pa-actions' }, button('save', '保存配置')), this.policyConfigNotice,
-   this.policyInputs.portal, this.policyInputs.ps5
+  var config = this.panel('PassWall 域名名单', [
+   E('div', { 'class': 'pa-form' }, [field('domains', '代理域名'), field('exclusions', '直连域名')]),
+   E('p', { 'class': 'pa-caption' }, '按 PassWall 的主域及子域语义匹配。节点、DNS、端口和接管范围由本机 PassWall 管理。'),
+   E('div', { 'class': 'pa-actions' }, [button('save', '保存名单'), button('apply', '保存并应用', 'primary'),
+    button('reload', '重新读取本机名单')]),
+   E('p', { 'class': 'pa-caption' }, '保存并应用会调用 PassWall 重新加载，当前连接可能重连。PassWall 已停止时，名单在下次启动加载。'),
+   this.policyDraftState, this.policyConfigNotice
   ]);
-  var runtime = this.panel('运行状态', [
-   E('p', { 'class': 'pa-caption' }, [E('b', {}, '当前节点：'), this.policyActiveNode]),
+  var runtime = this.panel('本机 PassWall', [
+   this.policyEnvironment, this.policyFileCounts, this.policyPendingState, this.policyCoverage, this.policyRequirements,
    this.policyNotice, this.policyBlockers,
-   E('div', { 'class': 'pa-actions' }, [button('enable', '启用透明代理', 'primary'),
-    button('disable', '停用代理', 'danger'), button('cancel', '取消任务')]),
-   E('label', { 'class': 'pa-toggle', 'for': 'psa-policy-autostart' }, [this.policyAutostart, '开机启用']),
-   this.policyBootNotice, this.policyConfirmation
+   E('div', { 'class': 'pa-actions' }, [E('a', { 'class': buttonClass(),
+    href: L.url ? L.url('admin', 'services', 'passwall') : '/cgi-bin/luci/admin/services/passwall' }, '打开 PassWall'),
+    button('cancel', '取消应用任务')])
   ], this.policyState);
-  var diagnostics = E('div', {}, [this.policyCoreSummary, this.policyProbeState, this.policyProbeResults,
-   E('div', { 'class': 'pa-actions' }, button('probe', '检测连接')),
-   E('details', { 'class': 'pa-disclosure' }, [E('summary', {}, '诊断详情'),
-    this.policyRuntimeSummary, this.policySourceState,
-    E('p', { 'class': 'pa-caption' }, [this.policyActiveDomains, ' · ', this.policyAppliedTime]),
-    this.policyConnections, this.policyEnvironment, this.policyCoverage, this.policyRequirements,
-    this.policyDynamicRules, this.policyDraftState, button('preview', '查看规则'), this.policyPreview ])]);
+  var diagnostics = E('div', {}, [this.policyCoreSummary, this.policyRulesPath, this.policyAppliedTime]);
   return {config: config, runtime: runtime, diagnostics: diagnostics};
  },
 
@@ -1198,40 +1182,22 @@ return view.extend({
    this.selectedProfile = job.applied_profile;
    this.appliedJob = job.id;
   }
-  var oldSelectors = (this.latest || {}).device_selectors || {};
-  var changedDevices = ['portal_ip', 'ps5_ip', 'bridge'].some(function(key) { return previousConfig[key] !== config[key]; }) ||
-   ['portal', 'ps5'].some(function(key) { return oldSelectors[key] !== (data.device_selectors || {})[key]; });
   this.latest = data;
-  if (changedDevices) this.invalidatePolicy();
-  var selectors = this.deviceSelectors();
-  this.policyInputs.portal.value = selectors.portal; this.policyInputs.ps5.value = selectors.ps5;
   this.scopeNodes.forEach(function(nodes) {
    nodes.portal.textContent = config.portal_ip || '等待配置'; nodes.ps5.textContent = config.ps5_ip || '等待配置';
   });
   this.updatePolicyControls();
-  if (proxyJob.action === 'psportal_apply' || proxyJob.action === 'psportal_disable') {
-   if (proxyJob.busy) this.policyConfigNotice.textContent = this.policyNotice.textContent =
-    actionNames[proxyJob.action] + '中，请等待完成。';
+  this.updateDomainControls();
+  if (proxyJob.action === 'psportal_apply') {
+   if (proxyJob.busy) this.policyConfigNotice.textContent = this.policyNotice.textContent = '正在应用 PassWall 名单，请等待完成。';
    else if (proxyJob.id !== this.policyJob) {
-    this.policyJob = proxyJob.id; this.invalidatePolicy();
-    if (proxyJob.action === 'psportal_apply' && proxyJob.state === 'complete') {
-     this.policyTouched = {};
-     this.domainActionNotice.hidden = true;
-    }
-    this.policyConfigNotice.textContent = this.policyNotice.textContent = proxyJob.state === 'failed' ? proxyJob.error || '操作失败，请查看任务日志。' :
-     proxyJob.state === 'cancelled' ? '透明代理任务已取消，规则恢复完成。' :
-     proxyJob.action === 'psportal_disable' ? '透明代理已停用，新连接继续执行原有策略。' : '透明代理已启用，可重新连接 Portal 验证。';
+    this.policyJob = proxyJob.id;
+    if (proxyJob.state === 'complete') { this.policyTouched = {}; this.policyConflict = false; this.domainActionNotice.hidden = true; }
+    this.policyConfigNotice.textContent = this.policyNotice.textContent = proxyJob.state === 'failed' ? proxyJob.error || '名单应用失败，请查看任务日志。' :
+     proxyJob.state === 'cancelled' ? '名单应用已取消，原名单已恢复。' :
+     proxyJob.pending_apply ? '名单已保存，PassWall 下次启动将加载。' : '名单已保存并调用 PassWall 重新加载。';
     this.policyNotice.setAttribute('data-error', String(proxyJob.state === 'failed'));
     this.policyConfigNotice.setAttribute('data-error', String(proxyJob.state === 'failed'));
-    this.nextPolicyRead = 0; this.refreshPolicy(true);
-   }
-  } else if (proxyJob.action === 'psportal_probe') {
-   if (proxyJob.busy) this.policyNotice.textContent = '正在检测出口连通性，请等待检测结果。';
-   else if (proxyJob.id !== this.policyProbeJob) {
-    this.policyProbeJob = proxyJob.id;
-    this.policyNotice.textContent = proxyJob.state === 'failed' ? proxyJob.error || '出口检测失败，请查看启用日志。' :
-     proxyJob.state === 'cancelled' ? '连接检测已取消，代理规则继续运行。' : '连接检测完成，结果见日志与诊断。';
-    this.policyNotice.setAttribute('data-error', String(proxyJob.state === 'failed'));
     this.nextPolicyRead = 0; this.refreshPolicy(true);
    }
   }
@@ -1327,13 +1293,13 @@ return view.extend({
    if (deviceJob.busy) {
     this.deviceState.textContent = this.deviceNavNode.textContent = '正在确认设备';
     deviceMessage = '正在确认内网地址与 MAC，请保持两台设备开机。';
-   } else if (deviceJob.state === 'complete') deviceMessage = '设备配置已保存，两项功能与域名日志共用已确认的地址。';
+   } else if (deviceJob.state === 'complete') deviceMessage = '设备配置已保存，码率增强与域名监控共用已确认的地址。';
    else if (deviceJob.state === 'failed') deviceMessage = deviceJob.error || '设备确认失败，请刷新设备并查看配置日志。';
   }
   if (!deviceJob.busy && (data.running || data.engine_alive))
    deviceMessage += ' 码率增强运行中，停止并完成网络恢复后可保存设备配置。';
   if (!deviceJob.busy && (this.deviceData || {}).proxy_enabled)
-   deviceMessage += ' 透明代理已启用，停用后可保存设备配置。';
+   deviceMessage += ' 旧版透明代理规则待迁移，请完成插件升级后保存设备配置。';
   this.deviceNotice.textContent = deviceMessage;
   this.deviceNotice.setAttribute('data-error', String(this.pendingAction !== 'device_save' &&
    (!!this.deviceSaveError || deviceJob.action === 'device_save' && deviceJob.state === 'failed')));
@@ -1416,9 +1382,9 @@ return view.extend({
  render: function(data) {
   var self = this, config = data.config || {};
   this.latest = data; this.fields = {}; this.fieldTouched = {}; this.buttons = {};
-  this.history = []; this.bars = []; this.logTab = 'bitrate'; this.proxyLogTab = 'domains';
+  this.history = []; this.bars = []; this.logTab = 'bitrate'; this.proxyLogTab = 'proxy';
   this.logRequests = {}; this.logContent = {}; this.nextLogRead = {}; this.logTabs = {}; this.proxyLogTabs = {};
-  this.incidentId = ''; this.mainTabs = {}; this.mainPanels = {}; this.stageTabs = {}; this.stagePanels = {};
+  this.incidentId = ''; this.batchId = ''; this.mainTabs = {}; this.mainPanels = {}; this.stageTabs = {}; this.stagePanels = {};
   this.activeStages = { bitrate: data.configured ? 'runtime' : 'config', proxy: 'config' };
   this.scopeNodes = []; this.domainActionButtons = [];
   this.deviceSaveError = null;
@@ -1426,6 +1392,7 @@ return view.extend({
   this.deviceNavNode = E('span', { 'class': 'pa-nav-state' }, '等待确认地址');
   this.bitrateNavNode = E('span', { 'class': 'pa-nav-state' }, '等待运行');
   this.proxyNavNode = E('span', { 'class': 'pa-nav-state' }, '点击查看状态');
+  this.domainNavNode = E('span', { 'class': 'pa-nav-state' }, '点击查看批次');
   this.stateNode = E('span', {}, '正在读取'); this.profileNode = E('span'); this.countNode = E('span');
   this.rateNode = E('span'); this.uptimeNode = E('div', { 'class': 'pa-detail' });
   this.qualityNode = E('span'); this.qualityDetail = E('div', { 'class': 'pa-detail' });
@@ -1450,7 +1417,7 @@ return view.extend({
   this.logNode = E('pre', { 'class': 'pa-log', id: 'psa-bitrate-log-content', role: 'tabpanel',
    'aria-label': '码率增强日志' }, '正在读取日志…');
   this.proxyLogNode = E('pre', { 'class': 'pa-log', id: 'psa-proxy-log-pane-proxy', role: 'tabpanel',
-   'aria-labelledby': 'psa-proxy-log-tab-proxy', 'aria-label': '透明代理启用日志' }, '正在读取日志…');
+   'aria-labelledby': 'psa-proxy-log-tab-proxy', 'aria-label': '透明代理名单应用日志' }, '正在读取日志…');
   function logMode(id) {
    var input = choiceControl(luciControl('input', { type: 'hidden', id: id }), '选择日志模式', false);
    input.choicePicker.setOptions([{value:'compact', label:'简洁'}, {value:'verbose', label:'详细'}]);
@@ -1472,13 +1439,50 @@ return view.extend({
   this.incidentNote = luciControl('input', { id: 'psa-incident-note', type: 'text', maxlength: 300,
    value: 'Portal 连接失败', placeholder: '设备提示、错误码或复现步骤' });
   this.incidentNotice = E('p', { 'class': 'pa-caption', role: 'status', 'aria-live': 'polite' });
-  this.domainState = E('p', { 'class': 'pa-caption', role: 'status' }, '正在读取域名访问日志…');
+  this.domainState = E('p', { 'class': 'pa-caption', role: 'status' }, '正在读取域名监控记录…');
   this.domainHealth = E('p', { 'class': 'pa-caption' });
+  this.batchSelect = choiceControl(luciControl('input', { type: 'hidden', id: 'psa-domain-batch' }), '选择连接批次', false);
+  this.batchSelect.choiceChanged = function() { self.selectBatch(self.batchSelect.value); };
+  this.batchSelect.addEventListener('change', this.batchSelect.choiceChanged);
+  this.batchStartButton = E('button', { type: 'button', 'class': buttonClass(), click: function() {
+   return self.startDomainBatch();
+  } }, '新建连接批次');
+  this.batchTitle = E('h4'); this.batchSummary = E('p', { 'class': 'pa-caption' });
+  this.batchTrafficSummary = E('div', { 'class': 'pa-traffic-summary' });
+  this.domainTrafficNotice = E('p', { 'class': 'pa-caption' });
+  this.domainTrafficUnassigned = E('p', { 'class': 'pa-caption', role: 'status' });
+  this.batchNotice = E('p', { 'class': 'pa-caption', role: 'status', 'aria-live': 'polite' });
   this.domainSearch = luciControl('input', { type: 'text', maxlength: 253, placeholder: '筛选域名',
    'aria-label': '筛选域名', input: function() { if (self.domainData) self.renderDomains(self.domainData); } });
   this.domainOnlyProblems = luciControl('input', { type: 'checkbox', change: function() {
    if (self.domainData) self.renderDomains(self.domainData);
   } });
+  this.domainOnlyProxy = luciControl('input', { type: 'checkbox', change: function() {
+   if (self.domainData) self.renderDomains(self.domainData);
+  } });
+  this.domainOnlyLargeProxy = luciControl('input', { type: 'checkbox', change: function() {
+   if (self.domainData) self.renderDomains(self.domainData);
+  } });
+  this.domainTrafficSort = choiceControl(luciControl('input', { type: 'hidden', id: 'psa-domain-traffic-sort' }), '流量排序', false);
+  this.domainTrafficSort.choicePicker.setOptions([{value:'proxy',label:'代理流量从高到低'},
+   {value:'total',label:'核心总流量从高到低'}, {value:'recent',label:'最近出现优先'}]);
+  this.domainTrafficSort.choicePicker.setValue('proxy');
+  this.domainTrafficSort.choiceChanged = function() { if (self.domainData) self.renderDomains(self.domainData); };
+  this.domainTrafficSort.addEventListener('change', this.domainTrafficSort.choiceChanged);
+  this.domainAllButton = E('button', { type: 'button', 'class': buttonClass(), 'aria-pressed': 'true', click: function() {
+   self.domainOnlyProblems.checked = self.domainOnlyProxy.checked = self.domainOnlyLargeProxy.checked = false;
+   self.domainSearch.value = ''; if (self.domainData) self.renderDomains(self.domainData);
+  } }, '全部域名 0');
+  this.domainFailedButton = E('button', { type: 'button', 'class': buttonClass(), 'aria-pressed': 'false', click: function() {
+   self.domainOnlyProblems.checked = true; self.domainOnlyProxy.checked = self.domainOnlyLargeProxy.checked = false;
+   self.domainSearch.value = ''; if (self.domainData) self.renderDomains(self.domainData);
+  } }, '失败解析 0');
+  this.copyAllDomains = E('button', { type: 'button', 'class': buttonClass(), click: function() { return self.copyDomainRules(false); } }, '复制全部域名规则');
+  this.copyFailedDomains = E('button', { type: 'button', 'class': buttonClass(), click: function() { return self.copyDomainRules(true); } }, '复制失败域名规则');
+  this.domainCopyNotice = E('p', { 'class': 'pa-caption', role: 'status', 'aria-live': 'polite' });
+  this.domainRuleText = luciControl('textarea', { rows: 6, readonly: '', 'aria-label': '域名复制规则', style: 'width:100%;box-sizing:border-box' });
+  this.domainRulePreview = E('div', { hidden: '' }, this.domainRuleText);
+  this.domainEvents = E('pre', { 'class': 'pa-log', 'aria-label': '本批次解析明细' });
   this.incidentSelect = choiceControl(luciControl('input', { type: 'hidden' }), '选择失败记录', false);
   this.incidentSelect.choiceChanged = function() { self.incidentId = self.incidentSelect.value; self.refreshDomains(true); };
   this.incidentSelect.addEventListener('change', this.incidentSelect.choiceChanged);
@@ -1493,14 +1497,19 @@ return view.extend({
   this.incidentCandidates = E('div'); this.incidentEvents = E('pre', { 'class': 'pa-log', 'aria-label': '失败窗口域名事件' });
   this.incidentPanel = E('div', { 'class': 'pa-incident', hidden: '' },
    [ this.incidentTitle, this.incidentSummary, this.incidentCandidates, this.incidentEvents ]);
-  this.domainPanel = E('div', { id: 'psa-proxy-log-pane-domains', role: 'tabpanel',
-   'aria-labelledby': 'psa-proxy-log-tab-domains' }, [
-   this.domainState,
+  this.domainPanel = E('div', { id: 'psa-domain-records' }, [
+   E('div', { 'class': 'pa-domain-tools' }, [this.domainAllButton, this.domainFailedButton,
+    this.copyAllDomains, this.copyFailedDomains]),
    E('div', { 'class': 'pa-domain-tools' }, [ this.domainSearch,
-    E('label', { 'class': 'pa-toggle' }, [ this.domainOnlyProblems, '仅看最近异常' ]),
+    E('label', { 'class': 'pa-toggle' }, [ this.domainOnlyProblems, '仅看本批次失败解析' ]),
     E('button', { type: 'button', 'class': buttonClass(), click: function() { self.refreshDomains(true); } }, '刷新域名') ]),
+   E('div', { 'class': 'pa-domain-tools' }, [this.domainTrafficSort.choicePicker.root,
+    E('label', { 'class': 'pa-toggle' }, [this.domainOnlyProxy, '仅看本批次代理相关']),
+    E('label', { 'class': 'pa-toggle' }, [this.domainOnlyLargeProxy, '代理累计 ≥100 MiB'])]),
+   this.domainCopyNotice, this.domainRulePreview,
    this.domainActionNotice, this.domainList, this.domainCount,
-   E('div', { 'class': 'pa-domain-tools' }, this.incidentSelect.choicePicker.root), this.incidentPanel,
+   E('p', { 'class': 'pa-caption' }, '复制内容每行一个完整域名，可粘贴到 PassWall 普通规则列表或透明代理清单。批次内曾出现解析错误或观测超时的域名保留在失败清单。'),
+   E('details', { 'class': 'pa-disclosure' }, [E('summary', {}, '查看本批次解析明细'), this.domainEvents]),
    E('details', { 'class': 'pa-disclosure' }, [ E('summary', {}, '采集状态与证据范围'), this.domainHealth,
     E('p', { 'class': 'pa-caption' }, '配置归属以当前草稿为准，调整后通过预览应用。域名记录提供可见 DNS、TCP 与 TLS 证据。'),
     E('p', { 'class': 'pa-caption' }, '观测超时表示窗口内缺少响应；共享 IP、加密 DNS、TLS ECH 和硬件加速会影响覆盖。HTTPS 业务错误结合设备提示判断。') ]) ]);
@@ -1609,32 +1618,31 @@ return view.extend({
    ])
   ]);
   var policy = this.renderPolicy();
-  var proxyLogTabs = this.navigation([['domains', '域名访问'], ['proxy', '启用日志']],
+  var proxyLogTabs = this.navigation([['proxy', '名单应用日志']],
    this.proxyLogTabs, 'psa-proxy-log', 'pa-log-tab', this.selectLogTab);
-  var proxyLogs = E('div', { 'class': 'pa-grid' }, [
+  var proxyLogs = E('div', { 'class': 'pa-stack' }, [
    panel('透明代理日志', [
     E('div', { 'class': 'pa-log-tools' }, [
      E('ul', { 'class': 'cbi-tabmenu pa-log-tabs', role: 'tablist', 'aria-label': '透明代理日志类型' }, proxyLogTabs),
      E('button', { type: 'button', 'class': 'pa-link btn cbi-button cbi-button-neutral', click: function() { self.refreshLogs(true); } }, '刷新日志')]),
-    policy.diagnostics, this.proxyLogNode, this.domainPanel
-   ], this.button('proxy_diagnostics', '导出代理诊断'), 'pa-log-panel'),
-   E('div', { 'class': 'pa-stack' }, [
-    panel('域名日志设置', [
+    policy.diagnostics, this.proxyLogNode
+   ], this.button('proxy_diagnostics', '导出代理诊断'), 'pa-log-panel')
+  ]);
+  var monitorSettings = panel('域名采集设置', [
      E('label', { 'class': 'pa-toggle', 'for': 'psa-domain-enabled', style: 'margin-top:0' },
-      [this.domainEnabled, '记录 Portal / PS5 域名访问']),
-     E('p', { 'class': 'pa-caption' }, '透明代理停用期间也可采集，便于连接前后比较。关闭后保留已有记录。'),
+      [this.domainEnabled, '记录 Portal / PS5 域名解析与连接批次']),
+     E('p', { 'class': 'pa-caption' }, '域名采集独立运行，便于连接前后比较。关闭后保留已有记录。'),
      formField(this.proxyLogMode, '日志详细程度'),
      formField(this.logTag, '本轮排查标记'),
      E('p', { 'class': 'pa-caption' }, '升级或调整配置前保存新标记，随后首次出现的域名标为“本轮新增”。'),
-     E('div', { 'class': 'pa-actions', style: 'margin-top:16px' }, this.button('proxy_logging', '保存域名日志设置')),
-     this.proxyLoggingNotice]),
-    panel('连接失败回溯', [
+     E('div', { 'class': 'pa-actions', style: 'margin-top:16px' }, this.button('proxy_logging', '保存采集设置')),
+     this.proxyLoggingNotice]);
+  var monitorFailures = panel('连接失败回溯', [
      formField(this.incidentNote, '设备提示或失败描述'),
      E('div', { 'class': 'pa-actions', style: 'margin-top:14px' }, this.button('incident', '记录这次失败')),
      this.incidentNotice,
-     E('p', { 'class': 'pa-caption' }, '回溯前 180 秒、后 15 秒。结合异常域名调整代理清单，保留最近 32 次记录。')])
-   ])
-  ]);
+     E('p', { 'class': 'pa-caption' }, '回溯前 180 秒、后 15 秒。结合异常域名调整代理清单，保留最近 32 次记录。'),
+     formField(this.incidentSelect, '历史失败记录'), this.incidentPanel]);
   function heading(title, caption) {
    return E('div', { 'class': 'pa-feature-head' }, [E('div', {}, [
     E('h3', {}, title), E('p', { 'class': 'pa-caption' }, caption)])]);
@@ -1656,31 +1664,42 @@ return view.extend({
    } }, [E('summary', {}, '日志与诊断'), panels.logs]); logs.open = true;
    self.stagePanels[name] = {config:config, runtime:runtime, logs:logs};
    return E('div', { id: 'psa-pane-' + name, 'class': 'pa-tab-panel pa-basic', role: 'tabpanel',
-    'aria-labelledby': 'psa-tab-' + name }, [scope(), runtime, config, logs]);
+    'aria-labelledby': 'psa-tab-' + name }, [name === 'proxy' ? E('span') : scope(), runtime, config, logs]);
   }
   this.mainPanels.devices = E('div', { id: 'psa-pane-devices', 'class': 'pa-tab-panel', role: 'tabpanel',
    'aria-labelledby': 'psa-tab-devices' }, [
     deviceLayout]);
   this.mainPanels.bitrate = feature('bitrate', {config: bitrateConfig, runtime: bitrateRuntime, logs: bitrateLogs});
   this.mainPanels.proxy = feature('proxy', {config: policy.config, runtime: policy.runtime, logs: proxyLogs});
+  this.mainPanels.monitor = E('div', { id: 'psa-pane-monitor', 'class': 'pa-tab-panel pa-basic pa-domain-monitor', role: 'tabpanel',
+   'aria-labelledby': 'psa-tab-monitor' }, [scope(),
+   panel('连接批次', [this.domainState,
+    formField(this.batchSelect, '选择本次连接记录'),
+    E('div', { 'class': 'pa-actions' }, [this.batchStartButton,
+     E('button', { type: 'button', 'class': buttonClass(), click: function() { self.selectBatch(''); } }, '查看最近批次')]),
+    this.batchTitle, this.batchSummary, this.batchTrafficSummary, this.domainTrafficNotice, this.domainTrafficUnassigned, this.batchNotice,
+    E('p', { 'class': 'pa-caption' }, '首次域名活动自动创建批次，串流连接标记用于区分连接与重连。连续 60 秒无可见活动后归档，连续重试可新建批次。保留最近 32 批记录。')]),
+   panel('域名解析记录', [this.domainPanel]),
+   E('div', { 'class': 'pa-grid' }, [monitorSettings, monitorFailures])]);
   var mainItems = [
    ['devices', [E('span', {}, '设备配置'), this.deviceNavNode]],
    ['bitrate', [E('span', {}, '码率增强'), this.bitrateNavNode]],
-   ['proxy', [E('span', {}, '透明代理'), this.proxyNavNode]]
+   ['proxy', [E('span', {}, '透明代理'), this.proxyNavNode]],
+   ['monitor', [E('span', {}, '域名监控'), this.domainNavNode]]
   ];
   var mainTabs = this.navigation(mainItems, this.mainTabs, 'psa', 'pa-main-tab', this.selectTab);
   this.root = E('div', { 'class': 'cbi-map ps-accel' }, [
    E('style', {}, styles),
    E('h2', {}, 'PS Accel'),
-   this.readonly ? E('div', { 'class': 'pa-readonly alert-message notice' }, '当前为只读权限，可查看状态、日志与代理预览。') : E('span'),
+   this.readonly ? E('div', { 'class': 'pa-readonly alert-message notice' }, '当前为只读权限，可查看状态、日志、域名名单并复制域名规则。') : E('span'),
    E('ul', { 'class': 'cbi-tabmenu pa-main-tabs', role: 'tablist', 'aria-label': '一级功能' }, mainTabs),
-   this.mainPanels.devices, this.mainPanels.bitrate, this.mainPanels.proxy,
+   this.mainPanels.devices, this.mainPanels.bitrate, this.mainPanels.proxy, this.mainPanels.monitor,
    E('footer', { 'class': 'pa-foot' }, this.versionNode)
   ]);
-  this.selectLogTab('bitrate'); this.selectLogTab('domains');
+  this.selectLogTab('bitrate'); this.selectLogTab('proxy');
   this.update(data);
   var hash = (window.location && window.location.hash || '').replace(/^#/, '').split('/');
-  var initial = {stream: 'bitrate', psportal: 'proxy'}[hash[0]] || hash[0];
+  var initial = {stream: 'bitrate', psportal: 'proxy', domains: 'monitor'}[hash[0]] || hash[0];
   this.selectTab(this.mainTabs[initial] ? initial : (data.devices_configured || data.configured ? 'bitrate' : 'devices'));
   if (hash[1] && this.stagePanels[this.activeTab]) this.selectStage(this.activeTab, hash[1]);
   if (hash[2]) this.selectLogTab(hash[2]);

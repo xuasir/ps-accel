@@ -1,2 +1,2 @@
 #!/bin/sh
-exec /usr/bin/python3 /usr/lib/ps-accel/portal_policy.py "$@"
+exec /usr/bin/python3 /usr/lib/ps-accel/passwall_rules.py "$@"

@@ -55,14 +55,15 @@ class LuCITests(unittest.TestCase):
                     api.dispatch('configure', request)
                 spawn.assert_not_called()
 
-    def test_proxy_autostart_accepts_only_boolean_integers_and_waits_for_jobs(self):
-        for value in (True, '1', None, 2, -1):
+    def test_native_list_save_validates_revision_and_waits_for_jobs(self):
+        request = {'domains': 'example.com', 'exclusions': '', 'revision': 'a' * 64}
+        for value in (True, 'forged', None, 2):
             with self.subTest(value=value), self.assertRaises(ValueError):
-                api.validate('psportal_autostart', {'autostart': value})
+                api.validate('psportal_save', dict(request, revision=value))
         self.job('psportal_apply')
-        with patch.object(api, 'alive', return_value=True), patch.object(api.policy, 'set_autostart') as save:
-            with self.assertRaisesRegex(RuntimeError, '代理任务进行中'):
-                api.dispatch('psportal_autostart', {'autostart': 0})
+        with patch.object(api, 'alive', return_value=True), patch.object(api.rules, 'save') as save:
+            with self.assertRaisesRegex(RuntimeError, '管理任务进行中'):
+                api.dispatch('psportal_save', request)
             save.assert_not_called()
 
     def test_async_job_has_only_fixed_executable_arguments(self):
@@ -213,7 +214,7 @@ class LuCITests(unittest.TestCase):
     def test_rpc_acl_has_no_arbitrary_file_or_command_access(self):
         acl = json.loads((SOURCE / 'luci/root/usr/share/rpcd/acl.d/luci-app-ps-accel.json').read_text())
         rights = acl['luci-app-ps-accel']
-        readable = ['status', 'details', 'devices', 'logs', 'diagnostics', 'proxy_diagnostics', 'domains', 'psportal_status', 'psportal_preview']
+        readable = ['status', 'details', 'devices', 'logs', 'diagnostics', 'proxy_diagnostics', 'domains', 'domain_monitor', 'psportal_status']
         self.assertEqual(rights['read'], {'ubus': {'ps-accel': readable}})
         self.assertEqual(set(rights['write']), {'ubus'})
         self.assertEqual(set(rights['write']['ubus']['ps-accel']), set(api.METHODS) - set(readable))

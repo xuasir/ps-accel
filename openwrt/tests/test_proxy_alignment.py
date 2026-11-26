@@ -205,7 +205,7 @@ class AlignmentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             api.validate('psportal_probe', {'target': 'custom.example'})
         acl = json.loads((Path(__file__).resolve().parents[1] / 'luci/root/usr/share/rpcd/acl.d/luci-app-ps-accel.json').read_text())['luci-app-ps-accel']
-        self.assertIn('psportal_probe', acl['write']['ubus']['ps-accel'])
+        self.assertNotIn('psportal_probe', acl['write']['ubus']['ps-accel'])
         self.assertNotIn('psportal_probe', acl['read']['ubus']['ps-accel'])
 
 
@@ -253,15 +253,11 @@ class AlignmentPolicyTests(unittest.TestCase):
         self.assertIn('.custom.example.com', clauses[1]['domain_suffix'])
         self.assertEqual(clauses[-1], {'domain_suffix': ['.np.communication.playstation.net'], 'invert': True})
 
-    def test_cancelled_probe_keeps_bitrate_and_original_rules_running(self):
-        job_id = 'b' * 32
-        port.atomic(self.root / 'jobs/job.json', dict(id=job_id, action='psportal_probe', request={}, state='queued'))
-        with patch.object(api, 'JOBS', self.root / 'jobs'), patch.object(api, 'cancelled', return_value=True), \
-             patch.object(policy, 'probe_connections', return_value={'targets': [], 'errors': [], 'healthy': False, 'cancelled': True}), \
-             patch.object(api, 'stop_service') as stop:
-            api.worker(job_id)
+    def test_retired_probe_rpc_keeps_bitrate_and_original_rules_running(self):
+        with patch.object(api, 'stop_service') as stop:
+            with self.assertRaises(ValueError):
+                api.dispatch('psportal_probe', {})
         stop.assert_not_called()
-        self.assertEqual(api.optional(self.root / 'jobs/job.json')['state'], 'cancelled')
 
     def test_current_status_requires_matching_configuration_device_and_age(self):
         self.active()

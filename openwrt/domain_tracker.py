@@ -9,6 +9,7 @@ import time
 
 from observability import OBSERVATION_LIMIT, event_context, event_key, utc
 from sony_domains import domain_info
+from domain_monitor import DomainMonitor
 
 MAX_DOMAINS = 512
 MAX_PENDING = 128
@@ -238,9 +239,12 @@ def tls_name(payload):
 
 
 class DomainTracker:
-    def __init__(self, devices, emit, preferences, inventory=None, epoch=None):
+    def __init__(self, devices, emit, preferences, inventory=None, epoch=None, batches=None):
         self.devices, self.emit, self.preferences = devices, emit, preferences
         self.started = time.time() if epoch is None else epoch
+        self.monitor = DomainMonitor(devices, batches, epoch=self.started)
+        self.batch_request_id = None
+        self.traffic_dirty = False
         self.domains = OrderedDict()
         self.pending_dns, self.pending_tcp, self.bindings, self.streams = (OrderedDict() for _ in range(4))
         self.repeats = OrderedDict()
@@ -325,6 +329,7 @@ class DomainTracker:
                 elif kind == 'tcp_ok':
                     item['tcp_problem'] = ''
                 item['last_problem'] = item['tcp_problem'] or item['dns_problem']
+        self.monitor.record(event)
         if len(self.recent) >= self.recent.maxlen:
             self.health['history_drops'] += 1
         self.recent.append(event)
@@ -369,10 +374,13 @@ class DomainTracker:
             previous = self.pending_dns.get(key)
             if previous and (previous['name'], previous['qtype']) == (message['name'], message['qtype']):
                 previous['retries'] += 1
+                self.monitor.touch(epoch)
                 return
+            batch_id = self.monitor.ensure(epoch, self.preferences.tag)
             self.bounded(self.pending_dns, key, {'name': message['name'], 'qtype': message['qtype'],
-                                                 'epoch': epoch, 'retries': 0, 'address': packet['dst']})
-            self.record(device, 'dns_query', [message['name']], epoch, qtype=message['qtype'], address=packet['dst'])
+                                                 'epoch': epoch, 'retries': 0, 'address': packet['dst'], 'batch_id': batch_id})
+            self.record(device, 'dns_query', [message['name']], epoch, qtype=message['qtype'],
+                        address=packet['dst'], batch_id=batch_id)
             return
         previous = self.pending_dns.get(key)
         if (not previous or (previous['name'], previous['qtype']) != (message['name'], message['qtype'])
@@ -381,11 +389,12 @@ class DomainTracker:
         del self.pending_dns[key]
         if message['truncated']:
             self.record(device, 'dns_truncated', [message['name']], epoch, qtype=message['qtype'],
-                        address=packet['src'])
+                        address=packet['src'], batch_id=previous['batch_id'])
             return
         if message['rcode']:
             self.record(device, 'dns_error', [message['name']], epoch, rcode=message['rcode'],
-                        qtype=message['qtype'], address=packet['src'], retries=previous['retries'])
+                        qtype=message['qtype'], address=packet['src'], retries=previous['retries'],
+                        batch_id=previous['batch_id'])
             return
         names, addresses = dns_bindings(message)
         for name in names:
@@ -398,7 +407,8 @@ class DomainTracker:
                 bindings[name] = epoch + value['ttl']
             self.bounded(self.bindings, mapping_key, dict(list(bindings.items())[-8:]), MAX_DOMAINS)
         self.record(device, 'dns_ok' if addresses else 'dns_empty', names, epoch,
-                    addresses=addresses, qtype=message['qtype'], retries=previous['retries'])
+                    addresses=addresses, qtype=message['qtype'], retries=previous['retries'],
+                    batch_id=previous['batch_id'])
 
     def dns_tcp(self, device, outgoing, packet, epoch):
         data = packet['payload']
@@ -452,13 +462,15 @@ class DomainTracker:
                 previous['retries'] += 1
                 return
             self.bounded(self.pending_tcp, key, {'seq': packet['seq'], 'epoch': epoch, 'retries': 0,
-                                                'domains': self.mapped(device, packet['dst'], epoch)})
+                                                'domains': self.mapped(device, packet['dst'], epoch),
+                                                'batch_id': self.monitor.current_id})
         elif not outgoing and previous and flags & 0x10 and packet['ack'] == (previous['seq'] + 1) & 0xffffffff:
             if flags & 4 or flags & 0x12 == 0x12:
                 del self.pending_tcp[key]
                 self.record(device, 'tcp_reset' if flags & 4 else 'tcp_ok',
                             previous['domains'] or self.mapped(device, packet['src'], epoch), epoch,
-                            address=packet['src'], port=packet['sport'], retries=previous['retries'])
+                            address=packet['src'], port=packet['sport'], retries=previous['retries'],
+                            batch_id=previous.get('batch_id'))
         if outgoing and packet['dport'] == 443 and packet['payload']:
             name = tls_name(packet['payload'])
             if name:
@@ -485,7 +497,30 @@ class DomainTracker:
                 pending = value
         if pending is not None:
             self.record(device, 'unreachable', names, epoch, address=quoted['dst'],
-                        port=quoted['dport'], code=data[1])
+                        port=quoted['dport'], code=data[1], batch_id=pending.get('batch_id'),
+                        dns_unreachable=quoted['proto'] == 17 or quoted['dport'] == 53,
+                        qtype=pending.get('qtype'))
+
+    def observe_traffic(self, report, epoch=None):
+        epoch = time.time() if epoch is None else epoch
+        changed = self.monitor.observe_connections(report, epoch, self.preferences.tag, self.mapped)
+        self.traffic_dirty = self.traffic_dirty or changed
+        self.dirty = self.dirty or changed
+        self.new_names = self.new_names or self.monitor.new_domains
+
+    def start_batch(self, request):
+        if (not isinstance(request, dict) or not isinstance(request.get('id'), str) or
+                not re.fullmatch('[0-9a-f]{32}', request['id']) or request['id'] == self.batch_request_id or
+                request.get('device_macs') != {role: info['mac'] for role, info in self.devices.items()} or
+                type(request.get('epoch')) not in (int, float) or not math.isfinite(request['epoch']) or
+                not self.started <= request['epoch'] <= time.time()):
+            return False
+        self.batch_request_id = request['id']
+        if request['id'] in self.monitor.batches:
+            return False
+        self.monitor.begin(request['epoch'], self.preferences.tag, 'manual', request['id'])
+        self.dirty = True
+        return True
 
     def feed(self, frame, epoch=None):
         epoch = time.time() if epoch is None else epoch
@@ -493,6 +528,9 @@ class DomainTracker:
         try:
             packet = parse_frame(frame)
             if packet is None:
+                return
+            if self.monitor.stream(packet, epoch, self.preferences.tag):
+                self.dirty = self.dirty or self.monitor.changed
                 return
             device, outgoing = self.role(packet)
             if device is None:
@@ -516,12 +554,14 @@ class DomainTracker:
             if epoch - value['epoch'] >= DNS_TIMEOUT:
                 del self.pending_dns[key]
                 self.record(key[0], 'dns_timeout', [value['name']], epoch, address=value['address'],
-                            qtype=value['qtype'], retries=value['retries'], observation_only=True)
+                            qtype=value['qtype'], retries=value['retries'], observation_only=True,
+                            batch_id=value.get('batch_id'))
         for key, value in list(self.pending_tcp.items()) if not closing else ():
             if epoch - value['epoch'] >= TCP_TIMEOUT:
                 del self.pending_tcp[key]
                 self.record(key[0], 'tcp_timeout', value['domains'], epoch,
-                            address=key[3], port=key[4], retries=value['retries'], observation_only=True)
+                            address=key[3], port=key[4], retries=value['retries'], observation_only=True,
+                            batch_id=value.get('batch_id'))
         for key, value in list(self.streams.items()):
             if epoch - value['epoch'] >= DNS_TIMEOUT:
                 del self.streams[key]
@@ -531,6 +571,8 @@ class DomainTracker:
         for key, value in list(self.repeats.items()):
             if closing or epoch - value['first_epoch'] >= 60 or self.preferences.mode == 'verbose':
                 self.flush_repeat(key)
+        self.monitor.tick(epoch, closing)
+        self.dirty = self.dirty or self.monitor.changed
 
     def report(self, epoch=None):
         epoch = time.time() if epoch is None else epoch
@@ -546,11 +588,14 @@ class DomainTracker:
                 'recent': event_context(list(self.recent)), 'health': dict(self.health),
                 'pending_dns': len(self.pending_dns), 'pending_tcp': len(self.pending_tcp),
                 'mode': self.preferences.mode, 'tag': self.preferences.tag, 'limit': OBSERVATION_LIMIT,
+                'traffic': {'state': self.monitor.traffic_state, 'source': 'passwall_core', 'sample_interval': 2,
+                            'core_types': self.monitor.traffic_core_types, 'limit': self.monitor.traffic_limit},
                 'coverage_start': (self.recent[0]['epoch'] if self.health['history_drops'] and self.recent
                                    else self.started)}
 
     def inventory(self):
         # TTL bindings belong to the current capture session. Persist the durable
         # domain inventory; failure files retain the relevant resolution evidence.
-        return {'version': 1, 'domains': [dict(item, counts=dict(item['counts']), addresses=[])
+        return {'version': 1, '_batches': self.monitor.snapshot(),
+                'domains': [dict(item, counts=dict(item['counts']), addresses=[])
                                           for item in self.domains.values()]}

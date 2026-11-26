@@ -13,7 +13,7 @@ command -v uci >/dev/null 2>&1 || fail '系统需要 UCI。'
 [ ! -e /etc/init.d/ps-accel ] || fail '系统已有 PS Accel 服务，请先停止并卸载。'
 [ ! -e /usr/sbin/ps-accel ] || fail '系统已有 PS Accel 命令，请先停止并卸载。'
 [ ! -e /etc/init.d/ps-accel-observe ] || fail '系统已有设备域名观察服务，请先停止并卸载。'
-[ ! -e /etc/init.d/ps-accel-policy ] || fail '系统已有精确分流管理服务，请先停止并卸载。'
+[ ! -e /etc/init.d/ps-accel-policy ] || fail '系统已有域名流量观察服务，请先停止并卸载。'
 [ ! -e /var/run/netns/ps-accel ] || fail '请先完成已有中继的网络恢复。'
 [ ! -e /var/run/portal-lab-capture.lock ] || fail '请先停止原提码率插件并完成网络恢复。'
 
@@ -84,7 +84,9 @@ uci commit ps_accel
 /etc/init.d/ps-accel disable
 if ! /etc/init.d/ps-accel-observe enable; then echo '域名观察开机启动设置待检查。' >&2; fi
 if ! /etc/init.d/ps-accel-observe start; then echo '域名观察启动待检查，串流管理界面可继续使用。' >&2; fi
-if [ -f /etc/ps-accel/psportal/manifest.json ]; then /usr/sbin/ps-accel-policy resume; fi
+/usr/sbin/ps-accel-policy migrate
+if ! /etc/init.d/ps-accel-policy enable; then echo '域名流量观察开机启动设置待检查。' >&2; fi
+if ! /etc/init.d/ps-accel-policy start; then echo '域名流量观察启动待检查。' >&2; fi
 rm -f /tmp/luci-indexcache*
 if /etc/init.d/rpcd running >/dev/null 2>&1; then /etc/init.d/rpcd reload; fi
 echo '安装完成。进入 服务 → PS Accel，检测设备并完成连接测试。'
